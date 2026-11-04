@@ -1,0 +1,35 @@
+; Vertex shader for the PS2 GS path. Vertices arrive in GS pixels:
+;   v0 = x, y, z (GS screen position) and w (1/Q, used for perspective)
+;   v1 = colour, v2 = texture coordinates, v3 = GS fog value as a coordinate into the fog ramp
+; scale and offset turn x, y, z into clip space for the current render target. x, y and z are then multiplied by w, so the
+; GPU's perspective divide gives back the same screen position while interpolating the colour and coordinates with perspective.
+
+.fvec scale
+.fvec offset
+
+.constf ones(1.0, 1.0, 1.0, 1.0)
+; Byte attributes arrive as 0 to 255, not 0 to 1.
+.constf bytes_to_unit(0.00392156862745098, 0.00392156862745098, 0.00392156862745098, 0.00392156862745098)
+
+.out outpos position
+.out outclr color
+.out outtc0 texcoord0
+.out outtc1 texcoord1
+
+.alias inpos v0
+.alias inclr v1
+.alias intc0 v2
+.alias infog v3
+
+.proc main
+    mul r0.xyz, scale.xyz, inpos.xyz
+    add r0.xyz, offset.xyz, r0.xyz
+    mov r0.w, inpos.w
+    mul r1, ones, inpos.wwww
+    mul outpos.xyz, r1.xyz, r0.xyz
+    mov outpos.w, r0.w
+    mul outclr, bytes_to_unit, inclr
+    mov outtc0, intc0
+    mul outtc1, bytes_to_unit, infog
+    end
+.end

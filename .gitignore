@@ -29,3 +29,8 @@ textures_*/
 *_png/
 *_text/
 *_audio/
+
+# don't commit, local only
+azahar-macos-universal-2126.2/
+ghidra_12.2_PUBLIC/
+.DS_Store
