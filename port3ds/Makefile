@@ -24,7 +24,7 @@ GAME      := $(filter-out /w/generated/p3fes/vu1_%,$(wildcard /w/generated/p3fes
 ifeq ($(VU),1)
 GAME      += $(wildcard /w/generated/p3fes-vu3ds/vu1_*.cpp)
 endif
-HOST      := /p/port3ds/main3ds.cpp /p/port3ds/pica.cpp /p/port3ds/native3ds.cpp /p/port3ds/memcpy3ds.cpp /p/port3ds/remote3ds.cpp
+HOST      := /p/port3ds/main3ds.cpp /p/port3ds/pica.cpp /p/port3ds/native3ds.cpp /p/port3ds/memcpy3ds.cpp /p/port3ds/remote3ds.cpp /p/port3ds/iop3ds.cpp
 OBJS      := $(patsubst /%.cpp,$(OUT)/obj/%.o,$(RUNTIME) $(GAME) $(HOST)) $(OUT)/shader/gs_v_shbin.o
 
 all: $(OUT)/p3fes.3dsx

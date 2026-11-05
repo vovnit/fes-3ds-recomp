@@ -129,6 +129,7 @@ std::uint32_t g_stat_reused = 0, g_stat_missing = 0;
 std::uint32_t g_stat_draws = 0, g_stat_shapes = 0, g_stat_state = 0, g_stat_decoded = 0, g_stat_decode_texels = 0, g_stat_splits = 0;
 std::uint32_t g_shapes_since_present = 0;
 std::uint32_t g_setup_seen = 0;
+std::uint32_t g_last_triangle_serial = 0, g_last_triangle_setup = 0, g_last_triangle_end = 0;
 constexpr std::uint32_t kSkip = 1, kSkipping = 2, kDrawNothing = 4;
 std::uint32_t g_next_picture = 0, g_game_vblanks = 0;
 std::uint32_t g_draw_every = 0, g_picture = 0, g_skipped_in_row = 0, g_skip_run = 0, g_stat_skipped = 0;
@@ -812,12 +813,33 @@ inline void write_vertex(DrawVertex *o, float x, float y, const Vertex &z_from, 
     }
 }
 
-void add_triangle(const Vertex *v) {
+void add_triangle(const Vertex *v, unsigned type, std::uint32_t serial) {
     if (kRingVertices - g_ring_used < 3) return;
     DrawVertex *o = g_ring + g_ring_used;
-    for (int i = 0; i < 3; ++i) write_vertex(o + i, gs_x(v[i]), gs_y(v[i]), v[i], g_iip ? v[i] : v[2], v[i]);
-    if (!g_textured) o[0].s = o[1].s = o[2].s = o[0].t = o[1].t = o[2].t = 0.0f;
+    // The GS retains two vertices in strips and fans. When no intervening
+    // vertex or state write changed them, their transformed positions and
+    // interpolants already exist in the preceding triangle.
+    const bool reuse = type >= 4 && g_ring_used >= 3 && g_last_triangle_end == g_ring_used &&
+        g_last_triangle_setup == g_setup_seen && g_last_triangle_serial + 1u == serial;
+    if (reuse) {
+        const DrawVertex *previous = o - 3;
+        std::memcpy(o + 0, previous + (type == 4 ? 1 : 0), sizeof(DrawVertex));
+        std::memcpy(o + 1, previous + 2, sizeof(DrawVertex));
+        if (!g_iip) {
+            // Flat shaded triangles take the colour from their last vertex.
+            std::memcpy(&o[0].r, &v[2].r, 4);
+            std::memcpy(&o[1].r, &v[2].r, 4);
+        }
+        write_vertex(o + 2, gs_x(v[2]), gs_y(v[2]), v[2], v[2], v[2]);
+        if (!g_textured) o[2].s = o[2].t = 0.0f;
+    } else {
+        for (int i = 0; i < 3; ++i) write_vertex(o + i, gs_x(v[i]), gs_y(v[i]), v[i], g_iip ? v[i] : v[2], v[i]);
+        if (!g_textured) o[0].s = o[1].s = o[2].s = o[0].t = o[1].t = o[2].t = 0.0f;
+    }
     g_ring_used += 3;
+    g_last_triangle_end = g_ring_used;
+    g_last_triangle_serial = serial;
+    g_last_triangle_setup = g_setup_seen;
 }
 
 void add_quad(float x0, float y0, float x1, float y1, const Vertex &a, const Vertex &b) {
@@ -827,12 +849,16 @@ void add_quad(float x0, float y0, float x1, float y1, const Vertex &a, const Ver
     Vertex tl = a, br = b;
     tl.q = br.q = b.q;
     write_vertex(o + 0, x0, y0, b, b, tl);
-    write_vertex(o + 3, x0, y0, b, b, tl);
     write_vertex(o + 2, x1, y1, b, b, br);
-    write_vertex(o + 4, x1, y1, b, b, br);
-    write_vertex(o + 1, x0, y1, b, b, tl);
+    // All six vertices use the same depth, colour and Q. Reuse the two
+    // transformed corners and only substitute the other corners' Y and T.
+    std::memcpy(o + 1, o + 0, sizeof(DrawVertex));
+    o[1].y = y1;
     o[1].t = o[2].t;
-    write_vertex(o + 5, x1, y0, b, b, br);
+    std::memcpy(o + 3, o + 0, sizeof(DrawVertex));
+    std::memcpy(o + 4, o + 2, sizeof(DrawVertex));
+    std::memcpy(o + 5, o + 2, sizeof(DrawVertex));
+    o[5].y = y0;
     o[5].t = o[0].t;
     g_ring_used += 6;
 }
@@ -909,6 +935,7 @@ void save_shot() {
 // The GPU starts on a picture only when C3D_FrameEnd runs, and C3D_FrameBegin then waits until it has finished. So the next frame
 // opens when something is next drawn: until then the skipped pictures carry on while the GPU works, and nothing waits for a vblank.
 void begin_frame() {
+    g_last_triangle_end = 0;
     C3D_FrameBegin(0);
     g_frame_open = true;
     GPUCMD_GetBuffer(&g_frame_commands, nullptr, nullptr);
@@ -999,7 +1026,7 @@ void shutdown() {
     C3D_Fini();
 }
 
-void draw(const State &st, const Vertex *v, int count) {
+void draw(const State &st, const Vertex *v, int count, std::uint32_t serial) {
     if (g_draw_nothing || queue::g_quiet) return;
     if (!g_frame_open) begin_frame();
     // Every register that can change the batch moves g_setup_generation, so a run of shapes checks just this one number.
@@ -1030,7 +1057,7 @@ void draw(const State &st, const Vertex *v, int count) {
         break;
     }
     case 3: case 4: case 5:
-        if (count >= 3) add_triangle(v);
+        if (count >= 3) add_triangle(v, static_cast<unsigned>(st.prim & 7u), serial);
         break;
     case 6:
         add_quad(gs_x(v[0]), gs_y(v[0]), gs_x(v[1]), gs_y(v[1]), v[0], v[1]);
@@ -1085,7 +1112,7 @@ namespace {
 // skipped ones after it make a round: when the game had to wait, the next round skips one more, up to one drawn in four, and when
 // the drawing side sat idle it skips one fewer.
 void choose_next_picture() {
-    constexpr std::uint32_t kMostSkipped = 3;
+    constexpr std::uint32_t kMostSkipped = 5;
     ++g_picture;
     bool skip = false;
     if (g_draw_every > 1) {
@@ -1093,9 +1120,9 @@ void choose_next_picture() {
     } else if (!g_draw_every && queue::vu_active()) {
         if (g_skipped_in_row >= g_skip_now) {
             const u64 now = svcGetSystemTick();
-            const u64 round = now - g_round_start, tick_share = round / 8;
+            const u64 round = now - g_round_start, tick_share = round / 16;
             if (g_round_blocked > tick_share && g_skip_run < kMostSkipped) ++g_skip_run;
-            else if (g_round_idle > tick_share * 2 && g_skip_run) --g_skip_run;
+            else if (g_round_idle > tick_share * 8 && g_skip_run) --g_skip_run;
             g_round_start = now;
             g_round_blocked = g_round_idle = 0;
             g_skipped_in_row = 0;

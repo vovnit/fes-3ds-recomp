@@ -4,6 +4,7 @@
 // The video routines were compared with the game's own code on every call for about 2,000 frames of the opening movie.
 #include "ps2/generated.hpp"
 
+#include <bit>
 #include <cstring>
 
 namespace gen {
@@ -276,6 +277,293 @@ bool native_find_code(Cpu &c) {
     c.r[2].sd[0] = static_cast<std::int32_t>(result);
     c.budget -= 30 + static_cast<std::int32_t>(n >> 2);
     return true;
+}
+
+namespace {
+
+using Float [[gnu::may_alias]] = float;
+
+constexpr float from_bits(u32 x) { return std::bit_cast<float>(x); }
+
+// A 16-bit float from an animation key: sign, 4 bits of exponent starting at 2^-15, 11 bits of mantissa.
+inline u32 half_float(const u8 *p, std::int32_t &spent) {
+    std::uint16_t u;
+    std::memcpy(&u, p, 2);
+    const u32 sign = static_cast<u32>(u & 0x8000u) << 16;
+    if (!(u & 0x7FFFu)) {
+        spent += 6;
+        return sign;
+    }
+    spent += 15;
+    return sign | (((u & 0x7800u) << 12) + 0x38000000u) | ((u & 0x7FFu) << 12);
+}
+
+// a / b as the FPU does it. A denormal b counts as zero.
+inline float divide(Cpu &c, float a, float b) {
+    if (fp::exponent(std::bit_cast<u32>(b))) [[likely]] return a / b;
+    const fp::Result r = fp::div(std::bit_cast<u32>(a), std::bit_cast<u32>(b));
+    if (r.invalid) c.fcr31 |= 0x30000u;
+    return std::bit_cast<float>(r.value);
+}
+
+// The sine series the game uses, for an angle whose square is known.
+inline float sine(float a, float a2) {
+    float s = from_bits(0xB2D72F34u) + from_bits(0x2F2EC9D3u) * a2;
+    s = from_bits(0x3638EF1Bu) + a2 * s;
+    s = from_bits(0xB9500D01u) + a2 * s;
+    s = from_bits(0x3C088889u) + a2 * s;
+    s = from_bits(0xBE2AAAABu) + a2 * s;
+    return a + (a2 * a) * s;
+}
+
+// The two halves of the rational approximation in the game's arc cosine.
+inline float acos_top(float z) {
+    float p = from_bits(0x3A4F7F04u) + from_bits(0x3811EF08u) * z;
+    p = from_bits(0xBD241146u) + z * p;
+    p = from_bits(0x3E4E0AA8u) + z * p;
+    p = from_bits(0xBEA6B090u) + z * p;
+    return z * (from_bits(0x3E2AAAABu) + z * p);
+}
+
+inline float acos_bottom(float z) {
+    float q = from_bits(0xBF303361u) + from_bits(0x3D9DC62Eu) * z;
+    q = from_bits(0x4001572Du) + z * q;
+    q = from_bits(0xC019D139u) + z * q;
+    return 1.0f + z * q;
+}
+
+}
+
+// Blends two animation keys, once for each bone of each character in every game frame: rotations by spherical interpolation, with
+// the arc cosine and three sines inlined by the game's compiler, positions in a straight line. It was the most expensive function
+// in the lobby, about a tenth of the game's code. Same operations in the same order, except that a zero the game adds to a constant
+// before a multiply and accumulate is left out. The registers the game's version changes are all caller-saved, so these stay as they are.
+bool native_pose_blend(Cpu &c) {
+    const u32 to_at = c.r[4].w[0], from_at = c.r[5].w[0], next_at = c.r[6].w[0], base_at = c.r[7].w[0];
+    if ((to_at | from_at | next_at | base_at) & 3u) return false;
+    if (to_at + 36u > base_at && base_at + 24u > to_at) return false;
+    u8 *to = range(to_at, 36);
+    const u8 *from = range(from_at, 22), *next = range(next_at, 22), *base = range(base_at, 24);
+    if (!to || !from || !next || !base) return false;
+
+    std::int32_t spent = 4 + 4;   // the stack frame and four register loads along the way
+    u32 q0[4], q1[4], p0[3], p1[3];
+    for (int i = 0; i < 4; ++i) q0[i] = half_float(from + 8 + 2 * i, spent);
+    for (int i = 0; i < 3; ++i) p0[i] = half_float(from + 16 + 2 * i, spent);
+    for (int i = 0; i < 4; ++i) q1[i] = half_float(next + 8 + 2 * i, spent);
+    for (int i = 0; i < 3; ++i) p1[i] = half_float(next + 16 + 2 * i, spent);
+
+    const auto f = [](u32 x) { return std::bit_cast<float>(x); };
+    const float t0 = *reinterpret_cast<const Float *>(from + 4);
+    float t = divide(c, f(c.f[12]) - t0, *reinterpret_cast<const Float *>(next + 4) - t0);
+    float dot = f(q0[1]) * f(q1[1]) + f(q0[0]) * f(q1[0]);
+    dot += f(q0[2]) * f(q1[2]);
+    dot += f(q0[3]) * f(q1[3]);
+
+    const auto *b = reinterpret_cast<const Float *>(base);
+    const float x = (0.0f + f(p0[0]) + t * (f(p1[0]) - f(p0[0]))) * b[3] + b[0];
+    const float y = (0.0f + f(p0[1]) + t * (f(p1[1]) - f(p0[1]))) * b[4] + b[1];
+    const float z = (0.0f + f(p0[2]) + t * (f(p1[2]) - f(p0[2]))) * b[5] + b[2];
+    spent += 62 + 9;
+
+    bool close = false;
+    {
+        u32 bits = std::bit_cast<u32>(dot);
+        if (fp::key(bits) < 0) {
+            for (u32 &q : q1) q ^= fp::kSign;
+            dot = -dot;
+            bits ^= fp::kSign;
+            spent += 5;
+        }
+        close = !(fp::key(bits) < static_cast<std::int32_t>(0x3F7FBE77u));
+    }
+
+    float w0 = 1.0f - t, w1 = t;
+    if (!close) {
+        const u32 bits = std::bit_cast<u32>(dot), magnitude = bits & fp::kAbs;
+        if (static_cast<std::int32_t>(bits) < 0 || static_cast<std::int32_t>(magnitude) >= 0x3F800000) return false;   // not after the sign flip above
+        float angle;
+        spent += 8 + 4;
+        if (static_cast<std::int32_t>(magnitude) >= 0x3F000000) {
+            const float a = 0.5f * (1.0f - dot);
+            const float s = __builtin_sqrtf(a);
+            const float r = divide(c, acos_top(a), acos_bottom(a));
+            const float high = from_bits(std::bit_cast<u32>(s) & 0xFFFFF000u);
+            const float low = divide(c, a - high * high, s + high);
+            angle = 2.0f * (high + (low + r * s));
+            spent += 2 + 75 + 1;
+        } else if (static_cast<std::int32_t>(magnitude) < 0x23000001) {
+            angle = from_bits(0x3FC90FDBu);
+            spent += 5 + 5;
+        } else {
+            const float a = dot * dot;
+            const float r = divide(c, acos_top(a), acos_bottom(a));
+            angle = from_bits(0x3FC90FDAu) - (dot - (from_bits(0x33A22168u) - dot * r));
+            spent += 5 + 63 + 1;
+        }
+        const float over_sine = divide(c, 1.0f, sine(angle, angle * angle));
+        const float a0 = w0 * angle, a1 = t * angle;
+        w0 = sine(a0, a0 * a0) * over_sine;
+        w1 = sine(a1, a1 * a1) * over_sine;
+        spent += 68;
+    }
+
+    auto *out = reinterpret_cast<Float *>(to);
+    out[2] = w1 * f(q1[0]) + w0 * f(q0[0]);
+    out[3] = w1 * f(q1[1]) + w0 * f(q0[1]);
+    out[4] = w1 * f(q1[2]) + w0 * f(q0[2]);
+    out[5] = w1 * f(q1[3]) + w0 * f(q0[3]);
+    out[6] = x;
+    out[7] = y;
+    out[8] = z;
+    c.fcr31 = close ? (c.fcr31 & ~kFpuCondition) : (c.fcr31 | kFpuCondition);
+    c.budget -= spent + 17 + 5;
+    return true;
+}
+
+namespace {
+
+// One row of the game's matrix products: basis 0, 1 and 2 scaled by a row's x, y and z, and basis 3 added to the last row. The
+// lanes are kept apart so that the FPU, which takes 8 cycles for a result but starts one each cycle, works on all four at once.
+template <int Lanes, bool Last>
+[[gnu::always_inline]] inline void product_row(Float *to, const Float *row, const Float *basis) {
+    const float x = row[0], y = row[1], z = row[2];
+    float a = basis[0] * x, b = basis[1] * x, d = basis[2] * x, e = Lanes == 4 ? basis[3] * x : 0.0f;
+    a += basis[4] * y;
+    b += basis[5] * y;
+    d += basis[6] * y;
+    if (Lanes == 4) e += basis[7] * y;
+    a += basis[8] * z;
+    b += basis[9] * z;
+    d += basis[10] * z;
+    if (Lanes == 4) e += basis[11] * z;
+    if (Last) {
+        a += basis[12];
+        b += basis[13];
+        d += basis[14];
+        if (Lanes == 4) e += basis[15];
+    }
+    to[0] = a;
+    to[1] = b;
+    to[2] = d;
+    if (Lanes == 4) to[3] = e;
+}
+
+}
+
+// The matrix product the game calls most. x, y and z of each row only: the w values it writes out are whatever vf9 to vf12 held.
+bool native_matrix_product(Cpu &c) {
+    const u32 to_at = c.r[4].w[0], rows_at = c.r[5].w[0], basis_at = c.r[6].w[0];
+    if ((to_at | rows_at | basis_at) & 15u) return false;
+    u8 *to = range(to_at, 64);
+    const u8 *rows = range(rows_at, 64), *basis = range(basis_at, 64);
+    if (!to || !rows || !basis || c.vu0.vf[0].w[3] != fp::kOne) return false;
+
+    std::memcpy(&c.vu0.vf[1], rows, 64);
+    std::memcpy(&c.vu0.vf[5], basis, 64);
+    const auto *a = reinterpret_cast<const Float *>(&c.vu0.vf[1]);
+    const auto *b = reinterpret_cast<const Float *>(&c.vu0.vf[5]);
+    auto *r = reinterpret_cast<Float *>(&c.vu0.vf[9]);
+    product_row<3, false>(r, a, b);
+    product_row<3, false>(r + 4, a + 4, b);
+    product_row<3, false>(r + 8, a + 8, b);
+    product_row<3, false>(reinterpret_cast<Float *>(&c.vu0.acc), a + 12, b);
+    auto *acc = reinterpret_cast<const Float *>(&c.vu0.acc);
+    r[12] = acc[0] + b[12];
+    r[13] = acc[1] + b[13];
+    r[14] = acc[2] + b[14];
+    const u32 flags_a = c.vu0.vf[1].w[3], flags_b = c.vu0.vf[5].w[3];
+    std::memcpy(to, &c.vu0.vf[9], 64);
+    const u32 flags = flags_a & flags_b;
+    std::memcpy(to + 12, &flags, 4);
+    c.r[3].d[0] = flags_a;
+    c.r[2].d[0] = c.r[4].d[0];
+    c.budget -= 31;
+    return true;
+}
+
+// The rotation matrix of a quaternion, with the position after it. It belongs to the same animation step as native_pose_blend.
+bool native_pose_matrix(Cpu &c) {
+    const u32 to_at = c.r[4].w[0], from_at = c.r[5].w[0];
+    if ((to_at | from_at) & 3u) return false;
+    u8 *to_bytes = range(to_at, 64);
+    const u8 *from_bytes = range(from_at, 36);
+    if (!to_bytes || !from_bytes) return false;
+    auto *to = reinterpret_cast<Float *>(to_bytes);
+    const auto *from = reinterpret_cast<const Float *>(from_bytes);
+    const float x = from[2], y = from[3], z = from[4], w = from[5];
+    const float xx = x * x, yy = y * y, zz = z * z, yz = y * z, zx = z * x, xy = x * y, wz = w * z, wx = w * x, wy = w * y;
+    to[0] = 1.0f - 2.0f * (yy + zz);
+    to[1] = 2.0f * (xy + wz);
+    to[2] = 2.0f * (zx - wy);
+    to[4] = 2.0f * (xy - wz);
+    to[5] = 1.0f - 2.0f * (xx + zz);
+    to[6] = 2.0f * (yz + wx);
+    to[8] = 2.0f * (zx + wy);
+    to[9] = 2.0f * (yz - wx);
+    to[10] = 1.0f - 2.0f * (xx + yy);
+    to[12] = 0.0f;
+    to[13] = 0.0f;
+    to[14] = 0.0f;
+    const u32 three = 3;
+    std::memcpy(to_bytes + 12, &three, 4);
+    to[12] = from[6];   // read after the writes above, as the game does
+    to[13] = from[7];
+    to[14] = from[8];
+    c.budget -= 60;
+    return true;
+}
+
+// Functions named native_loop_ run at the top of a loop in the game and do all of its passes but the last. The game's own code then
+// does that one, which leaves every register as the game would, and they need not fit the whole loop's exit.
+
+// A bone's final matrix: its two local matrices multiplied together, then by the model's matrix already in vf13 to vf16.
+void native_loop_bone_matrices(Cpu &c) {
+    const u32 to_at = c.r[4].w[0], end = c.r[1].w[0], basis_at = c.r[5].w[0], rows_at = c.r[6].w[0], stride = c.r[2].w[0];
+    const u32 passes = (end - to_at) >> 6;
+    if (end <= to_at || ((end - to_at) & 63u) || passes < 2 || stride > 0x1000u) return;
+    if (((to_at | basis_at | rows_at | stride) & 15u) || c.vu0.vf[0].w[3] != fp::kOne) return;
+    const u32 count = passes - 1, reach = (count - 1) * stride + 64;
+    u8 *to = range(to_at, count * 64);
+    const u8 *rows = range(rows_at, reach), *basis = range(basis_at, reach);
+    if (!to || !rows || !basis) return;
+    alignas(16) float model[16], part[16];
+    std::memcpy(model, &c.vu0.vf[13], 64);
+    const auto *m = reinterpret_cast<const Float *>(model);
+    for (u32 i = 0; i < count; ++i, to += 64, rows += stride, basis += stride) {
+        const auto *b = reinterpret_cast<const Float *>(basis);
+        const auto *a = reinterpret_cast<const Float *>(rows);
+        auto *p = reinterpret_cast<Float *>(part);
+        auto *t = reinterpret_cast<Float *>(to);
+        product_row<4, false>(p, a, b);
+        product_row<4, false>(p + 4, a + 4, b);
+        product_row<4, false>(p + 8, a + 8, b);
+        product_row<4, true>(p + 12, a + 12, b);
+        product_row<4, false>(t, p, m);
+        product_row<4, false>(t + 4, p + 4, m);
+        product_row<4, false>(t + 8, p + 8, m);
+        product_row<4, true>(t + 12, p + 12, m);
+    }
+    set32(c.r[4], to_at + count * 64);
+    set32(c.r[5], basis_at + count * stride);
+    set32(c.r[6], rows_at + count * stride);
+    c.budget -= static_cast<std::int32_t>(count) * 43;
+}
+
+// The copy loop of a structure assignment: two words each pass, counted in r4, from r6 to r5.
+void native_loop_copy_pairs(Cpu &c) {
+    const auto count = c.r[4].w[0];
+    if (static_cast<std::int32_t>(count) < 2 || count > 0x10000u) return;
+    const u32 to_at = c.r[5].w[0], from_at = c.r[6].w[0], bytes = (count - 1) * 8;
+    if (((to_at | from_at) & 3u) || to_at - from_at < bytes) return;   // copying forward over itself repeats words
+    u8 *to = range(to_at, bytes);
+    const u8 *from = range(from_at, bytes);
+    if (!to || !from) return;
+    std::memmove(to, from, bytes);
+    set32(c.r[4], 1u);
+    set32(c.r[5], to_at + bytes);
+    set32(c.r[6], from_at + bytes);
+    c.budget -= static_cast<std::int32_t>(count - 1) * 9;
 }
 
 }

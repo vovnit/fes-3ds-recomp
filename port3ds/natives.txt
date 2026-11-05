@@ -1,3 +1,9 @@
+00312AE4 loop_copy_pairs
+00312B60 loop_copy_pairs
+0046B790 loop_bone_matrices
+004C2F30 matrix_product
+004F7470 pose_matrix
+004F7560 pose_blend
 004FD968 add_block
 004FDA58 put_block
 004FDC98 put_luma

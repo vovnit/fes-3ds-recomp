@@ -5,12 +5,13 @@
 //   sdmc:/p3fes/disc.iso        the disc image, or disc.00, disc.01, ... parts for FAT32 cards (see port3ds/README.md)
 //   sdmc:/p3fes/args.txt        optional test settings, one per line: "frames N", "press 300:start", "every N", "shots N",
 //                               "soft 1" (software renderer), "stats 1" (GPU counters in the log),
-//                               "load name.state" (start from a saved state in this folder; test runs only),
+//                               "load name.state" (start from a saved state in this folder, or from the beginning if it is missing),
 //                               "interp 1" (vector unit interpreter), "dump N" (log every GPU batch of game frame N),
 //                               "record sdmc:/p3fes/vu1" (save vector programs that are not compiled yet),
 //                               "vuthread 0" (run the vector programs and drawing on the same core as the game),
 //                               "draw N" (draw one picture in N; the default 0 draws what keeps up with the game),
 //                               "hide A-B" (leave out batches A up to B of each picture, to find which one draws something),
+//                               "pmu 0 8" (hardware counters of the game's core in perf.txt, by event number, see below),
 //                               "link 0" (no wireless test link)
 //   sdmc:/p3fes/log.txt         everything the runtime prints
 //   sdmc:/p3fes/perf.txt        one line of timing every 30 game frames
@@ -105,6 +106,7 @@ bool g_vu_thread = true;
 std::uint32_t g_draw_every = 0;
 bool g_link = true;
 s32 g_priority = 0x30;
+bool g_iop_thread = true;
 volatile bool g_vu_ready = false, g_vu_go = false, g_vu_failed = false;
 Thread g_vu_handle = nullptr;
 std::FILE *g_perf = nullptr;
@@ -199,6 +201,51 @@ std::uint8_t stick_axis(int value) {
     return static_cast<std::uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
 }
 
+// "pmu A B": ARM11 events, for example 0 instruction cache misses, 1 cycles stalled for instructions, 2 cycles stalled on data,
+// 7 branches mispredicted, 8 instructions, 11 and 13 data cache read and write misses, 16 main TLB misses, 18 cycles the load
+// store unit was full. perf.txt then gives the game core's busy cycles per 30 frames, and how long the I/O processor kept it waiting.
+}
+
+namespace ps2 {
+void iop_timing(bool on);
+u64 iop_waited_ticks();
+u64 iop_worked_ticks();
+}
+
+namespace {
+
+int g_pmu_a = -1, g_pmu_b = -1;
+u64 g_pmu_last[5];
+
+u64 pmu_read(PerfCounterRegister r) {
+    u64 v = 0;
+    svcControlPerformanceCounter(&v, PERFCOUNTEROP_GET_VALUE, r, 0);
+    return v;
+}
+
+void pmu_start() {
+    if (g_pmu_a < 0) return;
+    u64 v = 0;
+    Result rc = svcControlPerformanceCounter(&v, PERFCOUNTEROP_ENABLE, 0, 0);
+    std::fprintf(stderr, "[pmu] enable %08lX\n", static_cast<unsigned long>(rc));
+    rc = svcControlPerformanceCounter(&v, PERFCOUNTEROP_SET_VIRTUAL_COUNTER_ENABLED, 1, 0);
+    rc |= svcControlPerformanceCounter(&v, PERFCOUNTEROP_SET_EVENT, PERFCOUNTERREG_CORE_COUNT_REG_0, g_pmu_a);
+    rc |= svcControlPerformanceCounter(&v, PERFCOUNTEROP_SET_EVENT, PERFCOUNTERREG_CORE_COUNT_REG_1, g_pmu_b);
+    rc |= svcControlPerformanceCounter(&v, PERFCOUNTEROP_RESET, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    std::fprintf(stderr, "[pmu] events %d %d, setup %08lX\n", g_pmu_a, g_pmu_b, static_cast<unsigned long>(rc));
+    ps2::iop_timing(true);
+}
+
+void pmu_line() {
+    const u64 now[5] = {pmu_read(PERFCOUNTERREG_CORE_CYCLE_COUNTER), pmu_read(PERFCOUNTERREG_CORE_COUNT_REG_0),
+                        pmu_read(PERFCOUNTERREG_CORE_COUNT_REG_1), ps2::iop_waited_ticks(), ps2::iop_worked_ticks()};
+    std::fprintf(g_perf, " cycles %llu pmu%d %llu pmu%d %llu iop_wait_ms %llu iop_work_ms %llu", static_cast<unsigned long long>(now[0] - g_pmu_last[0]),
+                 g_pmu_a, static_cast<unsigned long long>(now[1] - g_pmu_last[1]), g_pmu_b, static_cast<unsigned long long>(now[2] - g_pmu_last[2]),
+                 static_cast<unsigned long long>((now[3] - g_pmu_last[3]) / static_cast<u64>(CPU_TICKS_PER_MSEC)),
+                 static_cast<unsigned long long>((now[4] - g_pmu_last[4]) / static_cast<u64>(CPU_TICKS_PER_MSEC)));
+    std::memcpy(g_pmu_last, now, sizeof now);
+}
+
 void on_vblank() {
     if (g_quit) {
         ps2::halt("closed from the 3DS");
@@ -220,10 +267,12 @@ void on_vblank() {
     if (frame % 30 == 0 && g_perf) {
         const u64 now = svcGetSystemTick();
         const std::uint64_t prims = ps2::primitives_drawn();
-        std::fprintf(g_perf, "frame %llu ms_total %llu ms_30frames %llu prims_30frames %llu\n", static_cast<unsigned long long>(frame),
+        std::fprintf(g_perf, "frame %llu ms_total %llu ms_30frames %llu prims_30frames %llu", static_cast<unsigned long long>(frame),
                      static_cast<unsigned long long>((now - g_start_ticks) / static_cast<u64>(CPU_TICKS_PER_MSEC)),
                      static_cast<unsigned long long>((now - g_last_ticks) / static_cast<u64>(CPU_TICKS_PER_MSEC)),
                      static_cast<unsigned long long>(prims - g_last_prims));
+        if (g_pmu_a >= 0) pmu_line();
+        std::fputc('\n', g_perf);
         std::fflush(g_perf);
         g_last_ticks = now;
         g_last_prims = prims;
@@ -251,9 +300,17 @@ void read_settings() {
             g_hide_from = static_cast<std::uint32_t>(std::strtoul(value, &end, 10));
             g_hide_to = *end ? static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10)) : g_hide_from + 1;
         }
+        else if (!std::strcmp(key, "pmu")) {
+            char *end = nullptr;
+            g_pmu_a = static_cast<int>(std::strtol(value, &end, 0));
+            g_pmu_b = g_pmu_a + 1;
+            char second[32];
+            if (std::sscanf(line, "%*s %*s %31s", second) == 1) g_pmu_b = static_cast<int>(std::strtol(second, nullptr, 0));
+        }
         else if (!std::strcmp(key, "soft")) g_software = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "stats")) g_stats = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "vuthread")) g_vu_thread = std::strtoul(value, nullptr, 10) != 0;
+        else if (!std::strcmp(key, "iopthread")) g_iop_thread = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "draw")) g_draw_every = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         else if (!std::strcmp(key, "shots")) {
             mkdir("sdmc:/p3fes/shots", 0777);
@@ -292,6 +349,8 @@ void vu_main(void *) {
     ps2::gs::pica::shutdown();
 }
 
+int g_vu_core = 0;
+
 Thread start_vu_thread() {
     // Core 2 exists only on the New 3DS and is free for applications. Core 1 is shared with the system, which needs a limit set.
     Thread thread = threadCreate(vu_main, nullptr, kVuStack, g_priority + 1, 2, false);
@@ -306,6 +365,7 @@ Thread start_vu_thread() {
         return nullptr;
     }
     g_vu_handle = thread;
+    g_vu_core = core;
     while (!g_vu_ready) svcSleepThread(1000000);
     if (g_vu_failed) {
         threadJoin(thread, U64_MAX);
@@ -333,6 +393,14 @@ void emulate(void *) {
             return;
         }
     }
+    if (!g_state_path.empty()) {   // a setting left over from a test must not end the game, which would take the wireless link with it
+        if (std::FILE *state = std::fopen(g_state_path.c_str(), "rb")) {
+            std::fclose(state);
+        } else {
+            std::fprintf(stderr, "[state] no file %s, starting from the beginning\n", g_state_path.c_str());
+            g_state_path.clear();
+        }
+    }
     std::uint32_t entry = 0;
     if (!open_disc()) {
         std::fprintf(stderr, "cannot open the disc image in sdmc:/p3fes\n");
@@ -342,10 +410,17 @@ void emulate(void *) {
     if (!ps2::load_elf("sdmc:/p3fes/SLUS_216.21", entry)) {
         std::fprintf(stderr, "cannot load sdmc:/p3fes/SLUS_216.21\n");
     } else {
+        // Core 1 is the system's too, so with the vector programs there as well, the I/O processor stays on the game's core.
+        if (g_iop_thread && g_vu_core != 1) {
+            const bool started = ps2::start_iop_thread(g_priority + 1, 1);
+            std::fprintf(stderr, "[3ds] I/O processor %s\n", started ? "on core 1" : "stays on the game's core");
+        }
         std::fprintf(stderr, "[3ds] booting, entry 0x%08lX\n", static_cast<unsigned long>(entry));
+        pmu_start();
         g_start_ticks = g_last_ticks = svcGetSystemTick();
         ps2::boot(entry, {"SLUS_216.21"});
         if (g_state_path.empty() || ps2::load_state(g_state_path)) ps2::run();
+        ps2::stop_iop_thread();
     }
     {
         const struct mallinfo m = mallinfo();
