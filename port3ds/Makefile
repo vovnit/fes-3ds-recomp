@@ -24,6 +24,18 @@ GAME      := $(filter-out /w/generated/p3fes/vu1_%,$(wildcard /w/generated/p3fes
 ifeq ($(VU),1)
 GAME      += $(wildcard /w/generated/p3fes-vu3ds/vu1_*.cpp)
 endif
+# The I/O processor code from tools/p3fes_iopgen.py, if you made it. Without it all of that code runs in the interpreter.
+# IOPRECORD=1 makes a slow build that records what ran, for that tool; it leaves iopseen.bin and iopram.bin in sdmc:/p3fes.
+IOPRECORD ?= 0
+ifeq ($(IOPRECORD),1)
+CXXFLAGS  += -DPS2_IOP_RECORD
+else
+IOP       := $(wildcard /w/generated/p3fes-iop/*.cpp)
+ifneq ($(IOP),)
+GAME      += $(IOP)
+CXXFLAGS  += -DPS2_IOP_BLOCKS
+endif
+endif
 HOST      := /p/port3ds/main3ds.cpp /p/port3ds/pica.cpp /p/port3ds/native3ds.cpp /p/port3ds/memcpy3ds.cpp /p/port3ds/remote3ds.cpp /p/port3ds/iop3ds.cpp
 OBJS      := $(patsubst /%.cpp,$(OUT)/obj/%.o,$(RUNTIME) $(GAME) $(HOST)) $(OUT)/shader/gs_v_shbin.o
 

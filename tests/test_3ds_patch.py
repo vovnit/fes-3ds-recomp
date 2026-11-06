@@ -36,6 +36,11 @@ FILES['runtime/src/system.cpp'] = FILES.get('runtime/src/system.cpp', "") + '   
 FILES['runtime/src/iop/sif.hpp'] = FILES.get('runtime/src/iop/sif.hpp', "") + 'void pump();\nvoid dump();\n'
 FILES['runtime/src/iop/sif.cpp'] = FILES.get('runtime/src/iop/sif.cpp', "") + 'std::uint64_t g_ee_dma_done = 0;\n#include "ps2/state.hpp"\n    g_outgoing.emplace_back(bytes, bytes + size);\n    pump();\n}\n    g_binds[server] = PendingBind{r, now() + kEeClock * 4};\nstd::uint32_t get_reg(std::uint32_t reg) {\n    switch (reg) {\nvoid set_reg(std::uint32_t reg, std::uint32_t value) {\n    if (reg == 1) g_mainaddr = value;\nstd::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count) {\n    if (!count) count = 1;\nvoid packet_processed() {\n    g_processed = true;\n    pump();\n}\n\nvoid pump() {\n    const std::uint64_t t = now();\n'
 
+# So do the edits that hand translated I/O processor code to the interpreter.
+FILES['runtime/src/iop/cpu.cpp'] = FILES['runtime/src/iop/cpu.cpp'].replace('    while (budget-- > 0) {\n', '    while (budget-- > 0) {\n        const std::uint32_t pc = c.pc;\n', 1)
+FILES['runtime/src/iop/iop.hpp'] = 'void set_trace(bool modules, bool hle);\n'
+FILES['runtime/src/iop/kernel.cpp'] = '    link_imports(base, total);\n\n    const int id = g_next_module++;\n    hw::reset();\n    kernel::boot();\n    s.bytes(g_ram, kRamSize);\n    kernel::state(s);\n'
+
 # So do the vector program speed edits, which change text the earlier edits leave in place.
 with open(tool) as f:
     source = f.read()

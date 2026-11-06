@@ -2159,6 +2159,59 @@ void process(int unit) {
 
 # These edits build on the existing port and can also upgrade a previously patched tree.
 PERF_EDITS = {
+    # The I/O processor code tools/p3fes_iopgen.py translated. Build with PS2_IOP_BLOCKS if it is there, which the Makefile sees to;
+    # blocks are checked against what is in memory whenever that changes, so anything else stays with the interpreter.
+    'runtime/src/iop/iop.hpp': [
+        ('void set_trace(bool modules, bool hle);\n', '''void set_trace(bool modules, bool hle);
+
+#ifdef PS2_IOP_BLOCKS
+inline constexpr std::int32_t kNoBlock = INT32_MIN;
+void blocks_refresh();
+std::int32_t blocks_run(Cpu &c, std::int32_t left);
+#else
+inline void blocks_refresh() {}
+#endif
+'''),
+    ],
+    'runtime/src/iop/cpu.cpp': [
+        ('''    while (left-- > 0) {
+        const std::uint32_t pc = c.pc;
+''', '''    while (left-- > 0) {
+#ifdef PS2_IOP_BLOCKS
+        if (const std::int32_t rest = blocks_run(c, left + 1); rest != kNoBlock) {
+            left = rest;
+            if (kernel::switch_pending()) return;
+            continue;
+        }
+#endif
+        const std::uint32_t pc = c.pc;
+#ifdef PS2_IOP_RECORD
+        record(pc);
+#endif
+'''),
+        ('void execute(Cpu &c, std::int64_t &budget) {\n', '''#ifdef PS2_IOP_RECORD
+// One bit per word that ran, and the memory it ran from, which is what tools/p3fes_iopgen.py works from.
+void record(std::uint32_t pc) {
+    static std::uint8_t seen[kRamSize / 32];
+    static std::uint32_t count;
+    const std::uint32_t word = (pc & (kRamSize - 1)) >> 2;
+    seen[word >> 3] |= static_cast<std::uint8_t>(1u << (word & 7u));
+    if (++count >> 25) {
+        count = 0;
+        if (std::FILE *f = std::fopen("sdmc:/p3fes/iopseen.bin", "wb")) { std::fwrite(seen, 1, sizeof seen, f); std::fclose(f); }
+        if (std::FILE *f = std::fopen("sdmc:/p3fes/iopram.bin", "wb")) { std::fwrite(g_ram, 1, kRamSize, f); std::fclose(f); }
+    }
+}
+#endif
+
+void execute(Cpu &c, std::int64_t &budget) {
+'''),
+    ],
+    'runtime/src/iop/kernel.cpp': [
+        ('    link_imports(base, total);\n\n    const int id = g_next_module++;\n', '    link_imports(base, total);\n    blocks_refresh();\n\n    const int id = g_next_module++;\n'),
+        ('    hw::reset();\n    kernel::boot();\n', '    hw::reset();\n    kernel::boot();\n    blocks_refresh();\n'),
+        ('    s.bytes(g_ram, kRamSize);\n    kernel::state(s);\n', '    s.bytes(g_ram, kRamSize);\n    blocks_refresh();\n    kernel::state(s);\n'),
+    ],
     'runtime/include/ps2/system.hpp': [
         ('''void sync_iop();
 ''', '''void sync_iop();

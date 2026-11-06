@@ -158,9 +158,17 @@ void start_get(const char *path) {
     g_sending = true;
 }
 
+// A saved state may go straight into the game's folder, under a plain name.
+bool may_put_state(const char *path) {
+    constexpr std::size_t kFolder = 7, kEnding = 6;   // "/p3fes/" and ".state"
+    const std::size_t length = std::strlen(path);
+    return length > kFolder + kEnding && !std::strncmp(path, "/p3fes/", kFolder) && !std::strcmp(path + length - kEnding, ".state") &&
+           !std::strchr(path + kFolder, '/') && !std::strstr(path, "..");
+}
+
 void start_put(const char *path, std::uint64_t size, std::uint32_t crc) {
     g_is_program = !std::strcmp(path, kProgram);
-    if (!g_is_program && std::strcmp(path, kSettings)) return say("ERR not allowed\n");
+    if (!g_is_program && std::strcmp(path, kSettings) && !may_put_state(path)) return say("ERR not allowed\n");
     if (size > kMostBytes || (g_is_program && size < 4)) return say("ERR wrong size\n");
     std::snprintf(g_target, sizeof g_target, "sdmc:%s", path);
     std::snprintf(g_partial, sizeof g_partial, "%s.part", g_target);

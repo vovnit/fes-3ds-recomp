@@ -10,6 +10,7 @@
 //                               "record sdmc:/p3fes/vu1" (save vector programs that are not compiled yet),
 //                               "vuthread 0" (run the vector programs and drawing on the same core as the game),
 //                               "draw N" (draw one picture in N; the default 0 draws what keeps up with the game),
+//                               "uncapped 1" (let a light scene run faster than the PS2, to measure how much room is left),
 //                               "hide A-B" (leave out batches A up to B of each picture, to find which one draws something),
 //                               "pmu 0 8" (hardware counters of the game's core in perf.txt, by event number, see below),
 //                               "link 0" (no wireless test link)
@@ -25,6 +26,7 @@
 
 #include <cstdint>
 #include <malloc.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -107,6 +109,7 @@ std::uint32_t g_draw_every = 0;
 bool g_link = true;
 s32 g_priority = 0x30;
 bool g_iop_thread = true;
+bool g_hold_speed = true;
 volatile bool g_vu_ready = false, g_vu_go = false, g_vu_failed = false;
 Thread g_vu_handle = nullptr;
 std::FILE *g_perf = nullptr;
@@ -246,7 +249,17 @@ void pmu_line() {
     std::memcpy(g_pmu_last, now, sizeof now);
 }
 
+// The game counts vblanks, so without this a scene lighter than one vblank of work plays fast. Two frames of credit even out a slow one.
+void hold_speed() {
+    constexpr u64 kClock = SYSCLOCK_ARM11, kFrame = kClock * 1001 / 60000;
+    static u64 due = 0;
+    const u64 now = svcGetSystemTick();
+    due = std::max(due, now - std::min(now, 2 * kFrame)) + kFrame;
+    if (due > now) svcSleepThread(static_cast<s64>((due - now) * 1000000 / kClock * 1000));
+}
+
 void on_vblank() {
+    if (g_hold_speed) hold_speed();
     if (g_quit) {
         ps2::halt("closed from the 3DS");
         return;
@@ -311,6 +324,7 @@ void read_settings() {
         else if (!std::strcmp(key, "stats")) g_stats = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "vuthread")) g_vu_thread = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "iopthread")) g_iop_thread = std::strtoul(value, nullptr, 10) != 0;
+        else if (!std::strcmp(key, "uncapped")) g_hold_speed = std::strtoul(value, nullptr, 10) == 0;
         else if (!std::strcmp(key, "draw")) g_draw_every = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         else if (!std::strcmp(key, "shots")) {
             mkdir("sdmc:/p3fes/shots", 0777);
