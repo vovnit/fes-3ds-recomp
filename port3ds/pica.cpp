@@ -82,13 +82,18 @@ C3D_BufInfo g_buf;
 int g_uniform_scale = -1, g_uniform_offset = -1;
 
 DrawVertex *g_ring = nullptr;
-std::uint32_t g_ring_used = 0, g_batch_first = 0, g_flushed_to = 0;
+std::uint16_t *g_indices = nullptr;
+std::uint32_t g_ring_used = 0, g_flushed_to = 0;
+std::uint32_t g_index_used = 0, g_index_first = 0, g_index_flushed = 0;
+std::uint32_t g_index_base = 0, g_bound_base = 0;
 
 C3D_RenderTarget *g_screen = nullptr;
 void *g_depth = nullptr;
 Target g_targets[kMaxTargets];
 Target *g_current = nullptr;
 Texture g_textures[kMaxTextures];
+constexpr unsigned kTextureHashBuckets = 256;
+std::uint16_t g_texture_hash_head[kTextureHashBuckets], g_texture_hash_next[kMaxTextures];
 
 std::uint8_t g_morton_x[64], g_morton_y[64];
 std::uint32_t g_page_stamp[512];
@@ -130,6 +135,7 @@ std::uint32_t g_stat_draws = 0, g_stat_shapes = 0, g_stat_state = 0, g_stat_deco
 std::uint32_t g_shapes_since_present = 0;
 std::uint32_t g_setup_seen = 0;
 std::uint32_t g_last_triangle_serial = 0, g_last_triangle_setup = 0, g_last_triangle_end = 0;
+std::uint32_t g_last_triangle_colour = 0;
 constexpr std::uint32_t kSkip = 1, kSkipping = 2, kDrawNothing = 4;
 std::uint32_t g_next_picture = 0, g_game_vblanks = 0;
 std::uint32_t g_draw_every = 0, g_picture = 0, g_skipped_in_row = 0, g_skip_run = 0, g_stat_skipped = 0;
@@ -167,20 +173,31 @@ void flush_ring() {
         GSPGPU_FlushDataCache(g_ring + g_flushed_to, (g_ring_used - g_flushed_to) * sizeof(DrawVertex));
         g_flushed_to = g_ring_used;
     }
+    if (g_index_used > g_index_flushed) {
+        GSPGPU_FlushDataCache(g_indices + g_index_flushed, (g_index_used - g_index_flushed) * sizeof(*g_indices));
+        g_index_flushed = g_index_used;
+    }
 }
 
 void flush_batch() {
-    const std::uint32_t count = g_ring_used - g_batch_first;
+    const std::uint32_t count = g_index_used - g_index_first;
     if (!count) return;
+    if (g_bound_base != g_index_base) {
+        BufInfo_Init(&g_buf);
+        BufInfo_Add(&g_buf, g_ring + g_index_base, sizeof(DrawVertex), 4, 0x3210);
+        C3D_SetBufInfo(&g_buf);
+        g_bound_base = g_index_base;
+    }
+    const auto *indices = g_indices + g_index_first;
     if (g_split.on) {
         C3D_AlphaTest(true, g_split.pass, g_split.reference);
         C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.pass_writes));
-        C3D_DrawArrays(GPU_TRIANGLES, static_cast<int>(g_batch_first), static_cast<int>(count));
+        C3D_DrawElements(GPU_TRIANGLES, static_cast<int>(count), C3D_UNSIGNED_SHORT, indices);
         C3D_AlphaTest(true, g_split.fail, g_split.reference);
         C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.fail_writes));
     }
-    C3D_DrawArrays(GPU_TRIANGLES, static_cast<int>(g_batch_first), static_cast<int>(count));
-    g_batch_first = g_ring_used;
+    C3D_DrawElements(GPU_TRIANGLES, static_cast<int>(count), C3D_UNSIGNED_SHORT, indices);
+    g_index_first = g_index_used;
     ++g_stat_draws;
     if (C3D_GetCmdBufUsage() > 0.75f) {
         flush_ring();
@@ -303,7 +320,27 @@ std::uint32_t pages_hash(PageRange r) {
     return h;
 }
 
+unsigned texture_hash_bucket(std::uint32_t hash) {
+    return (hash ^ (hash >> 16)) & (kTextureHashBuckets - 1);
+}
+
+void index_texture(Texture &e) {
+    if (!e.hash) return;
+    const auto slot = static_cast<std::uint16_t>(&e - g_textures + 1);
+    auto *link = &g_texture_hash_head[texture_hash_bucket(e.hash)];
+    // Keep slot order so collisions and stale samples are tried as before.
+    while (*link && *link < slot) link = &g_texture_hash_next[*link - 1];
+    g_texture_hash_next[slot - 1] = *link;
+    *link = slot;
+}
+
 void free_texture(Texture &e) {
+    if (e.hash) {
+        const auto slot = static_cast<std::uint16_t>(&e - g_textures + 1);
+        auto *link = &g_texture_hash_head[texture_hash_bucket(e.hash)];
+        while (*link && *link != slot) link = &g_texture_hash_next[*link - 1];
+        if (*link) *link = g_texture_hash_next[slot - 1];
+    }
     C3D_TexDelete(&e.tex);
     e.used = false;
 }
@@ -348,10 +385,9 @@ Texture *find_texture(const State &st, const Context &c, bool three_d) {
     // the bytes uploaded to this address are known, they identify the picture wherever it is.
     std::uint32_t hash = g_upload_hash[tbp];
     if (hash) {
-        for (Texture &e : g_textures) {
-            if (!e.used) {
-                if (!slot) slot = &e;
-            } else if (e.hash == hash && same_picture(e)) {
+        for (auto i = g_texture_hash_head[texture_hash_bucket(hash)]; i; i = g_texture_hash_next[i - 1]) {
+            Texture &e = g_textures[i - 1];
+            if (e.hash == hash && same_picture(e)) {
                 // The hash can be stale or shared, so a small texture is checked against GS memory: a wrong one showed as black letters.
                 if (tw <= 6 && th <= 6 && e.sample != sample_texels(tbp, tbw, psm, tw, th)) {
                     static int reports = 0;
@@ -366,6 +402,12 @@ Texture *find_texture(const State &st, const Context &c, bool three_d) {
                 e.last_used = g_frame;
                 ++g_stat_reused;
                 return &e;
+            }
+        }
+        for (Texture &e : g_textures) {
+            if (!e.used) {
+                slot = &e;
+                break;
             }
         }
     } else {
@@ -417,6 +459,7 @@ Texture *find_texture(const State &st, const Context &c, bool three_d) {
     slot->stamp = g_stamp;
     slot->hash = hash;
     slot->last_used = g_frame;
+    index_texture(*slot);
     decode(*slot, st, cpsm, csa, ta0, ta1, aem);
     return slot;
 }
@@ -655,8 +698,8 @@ void dump_batch(const State &st, const Context &c, std::uint64_t attr, std::uint
     if (verts) {
         float lo[6] = {1e9f, 1e9f, 1e9f, 1e9f, 1e9f, 1e9f}, hi[6] = {-1e9f, -1e9f, -1e9f, -1e9f, -1e9f, -1e9f};
         int alpha_max = 0;
-        for (std::uint32_t i = g_batch_first; i < g_ring_used; ++i) {
-            const DrawVertex &v = g_ring[i];
+        for (std::uint32_t i = g_index_first; i < g_index_used; ++i) {
+            const DrawVertex &v = g_ring[g_index_base + g_indices[i]];
             const float f[6] = {v.x, v.y, v.z, v.w, v.s, v.t};
             for (int k = 0; k < 6; ++k) {
                 lo[k] = std::min(lo[k], f[k]);
@@ -691,7 +734,7 @@ float z_scale_of(std::uint64_t zbuf) {
 float g_z_scale = 1.0f;
 
 void apply_state(const State &st, const Context &c, std::uint64_t attr) {
-    if (g_dump_frame && ps2::frame_count() >= g_dump_frame && ps2::frame_count() < g_dump_frame + 2) dump_batch(st, c, attr, g_ring_used - g_batch_first);
+    if (g_dump_frame && ps2::frame_count() >= g_dump_frame && ps2::frame_count() < g_dump_frame + 2) dump_batch(st, c, attr, g_index_used - g_index_first);
     flush_batch();
     ++g_stat_state;
     ++g_batch_number;
@@ -788,79 +831,95 @@ bool ensure_state(const State &st, const Context &c, std::uint64_t attr) {
     return !g_skip_batch;
 }
 
-inline float gs_x(const Vertex &v) { return (static_cast<float>(v.x) - static_cast<float>(g_ofx)) / 16.0f; }
-inline float gs_y(const Vertex &v) { return (static_cast<float>(v.y) - static_cast<float>(g_ofy)) / 16.0f; }
+inline float gs_x(const Vertex &v) { return static_cast<float>(static_cast<int>(v.x) - g_ofx) * (1.0f / 16.0f); }
+inline float gs_y(const Vertex &v) { return static_cast<float>(static_cast<int>(v.y) - g_ofy) * (1.0f / 16.0f); }
 
-inline void write_vertex(DrawVertex *o, float x, float y, const Vertex &z_from, const Vertex &colour, const Vertex &tex) {
+template <bool triangle>
+inline void write_vertex(DrawVertex *o, float x, float y, const Vertex &z_from, const Vertex &colour, const Vertex &tex, float q) {
     o->x = x;
     o->y = y;
     o->z = std::max(-static_cast<float>(z_from.z) * g_z_scale, -1.0f);   // the GS clamps at the top of the buffer's range
-    o->r = colour.r;
-    o->g = colour.g;
-    o->b = colour.b;
-    o->a = colour.a;
+    std::memcpy(&o->r, &colour.r, sizeof(std::uint32_t));
     o->fog = z_from.f;
-    if (g_fst) {
-        o->w = 1.0f;
+    const float iq = g_fst ? 1.0f : 1.0f / (q > 1e-6f ? q : 1e-6f);
+    o->w = iq;
+    if (triangle && !g_textured) {
+        o->s = o->t = 0.0f;
+    } else if (g_fst) {
         o->s = (static_cast<float>(tex.u) / 16.0f) * g_u_scale;
         o->t = g_v_offset + (static_cast<float>(tex.v) / 16.0f) * g_v_scale;
     } else {
-        const float q = tex.q > 1e-6f ? tex.q : 1e-6f;
-        const float iq = 1.0f / q;
-        o->w = iq;
         o->s = tex.s * iq * g_s_scale;
         o->t = g_v_offset - tex.t * iq * g_t_scale;
     }
 }
 
+// Indices are relative to one span of the vertex ring. A full span ends the current batch.
+void reserve_indices(unsigned vertices) {
+    if (g_ring_used - g_index_base + vertices <= 65536u) return;
+    flush_batch();
+    g_index_base = g_ring_used;
+    g_last_triangle_end = 0;
+}
+
+std::uint16_t vertex_index(std::uint32_t vertex) {
+    return static_cast<std::uint16_t>(vertex - g_index_base);
+}
+
 void add_triangle(const Vertex *v, unsigned type, std::uint32_t serial) {
-    if (kRingVertices - g_ring_used < 3) return;
-    DrawVertex *o = g_ring + g_ring_used;
-    // The GS retains two vertices in strips and fans. When no intervening
-    // vertex or state write changed them, their transformed positions and
-    // interpolants already exist in the preceding triangle.
-    const bool reuse = type >= 4 && g_ring_used >= 3 && g_last_triangle_end == g_ring_used &&
+    reserve_indices(3);
+    const bool reuse = type >= 4 && g_index_used >= 3 && g_last_triangle_end == g_index_used &&
         g_last_triangle_setup == g_setup_seen && g_last_triangle_serial + 1u == serial;
+    auto *indices = g_indices + g_index_used;
+    std::uint32_t colour = 0;
+    if (!g_iip) std::memcpy(&colour, &v[2].r, sizeof colour);
     if (reuse) {
-        const DrawVertex *previous = o - 3;
-        std::memcpy(o + 0, previous + (type == 4 ? 1 : 0), sizeof(DrawVertex));
-        std::memcpy(o + 1, previous + 2, sizeof(DrawVertex));
-        if (!g_iip) {
-            // Flat shaded triangles take the colour from their last vertex.
-            std::memcpy(&o[0].r, &v[2].r, 4);
-            std::memcpy(&o[1].r, &v[2].r, 4);
+        const auto *previous = indices - 3;
+        indices[0] = previous[type == 4 ? 1 : 0];
+        indices[1] = previous[2];
+        if (!g_iip && colour != g_last_triangle_colour) {
+            // A flat triangle takes the colour of its last vertex.
+            for (unsigned i = 0; i < 2; ++i) {
+                DrawVertex &vertex = g_ring[g_ring_used];
+                std::memcpy(&vertex, g_ring + g_index_base + indices[i], sizeof vertex);
+                std::memcpy(&vertex.r, &colour, sizeof colour);
+                indices[i] = vertex_index(g_ring_used++);
+            }
         }
-        write_vertex(o + 2, gs_x(v[2]), gs_y(v[2]), v[2], v[2], v[2]);
-        if (!g_textured) o[2].s = o[2].t = 0.0f;
+        DrawVertex *vertex = g_ring + g_ring_used;
+        write_vertex<true>(vertex, gs_x(v[2]), gs_y(v[2]), v[2], v[2], v[2], v[2].q);
+        indices[2] = vertex_index(g_ring_used++);
     } else {
-        for (int i = 0; i < 3; ++i) write_vertex(o + i, gs_x(v[i]), gs_y(v[i]), v[i], g_iip ? v[i] : v[2], v[i]);
-        if (!g_textured) o[0].s = o[1].s = o[2].s = o[0].t = o[1].t = o[2].t = 0.0f;
+        DrawVertex *o = g_ring + g_ring_used;
+        const std::uint16_t first = vertex_index(g_ring_used);
+        for (unsigned i = 0; i < 3; ++i) {
+            write_vertex<true>(o + i, gs_x(v[i]), gs_y(v[i]), v[i], g_iip ? v[i] : v[2], v[i], v[i].q);
+            indices[i] = static_cast<std::uint16_t>(first + i);
+        }
+        g_ring_used += 3;
     }
-    g_ring_used += 3;
-    g_last_triangle_end = g_ring_used;
+    g_index_used += 3;
+    g_last_triangle_end = g_index_used;
     g_last_triangle_serial = serial;
     g_last_triangle_setup = g_setup_seen;
+    g_last_triangle_colour = colour;
 }
 
 void add_quad(float x0, float y0, float x1, float y1, const Vertex &a, const Vertex &b) {
-    if (kRingVertices - g_ring_used < 6) return;
+    reserve_indices(4);
     DrawVertex *o = g_ring + g_ring_used;
-    // Top left, bottom left, bottom right, top left, bottom right, top right. Texture coordinates follow the two corners.
-    Vertex tl = a, br = b;
-    tl.q = br.q = b.q;
-    write_vertex(o + 0, x0, y0, b, b, tl);
-    write_vertex(o + 2, x1, y1, b, b, br);
-    // All six vertices use the same depth, colour and Q. Reuse the two
-    // transformed corners and only substitute the other corners' Y and T.
+    write_vertex<false>(o + 0, x0, y0, b, b, a, b.q);
+    write_vertex<false>(o + 2, x1, y1, b, b, b, b.q);
     std::memcpy(o + 1, o + 0, sizeof(DrawVertex));
     o[1].y = y1;
     o[1].t = o[2].t;
-    std::memcpy(o + 3, o + 0, sizeof(DrawVertex));
-    std::memcpy(o + 4, o + 2, sizeof(DrawVertex));
-    std::memcpy(o + 5, o + 2, sizeof(DrawVertex));
-    o[5].y = y0;
-    o[5].t = o[0].t;
-    g_ring_used += 6;
+    std::memcpy(o + 3, o + 2, sizeof(DrawVertex));
+    o[3].y = y0;
+    o[3].t = o[0].t;
+    constexpr unsigned order[] = {0, 1, 2, 0, 2, 3};
+    for (unsigned corner : order)
+        g_indices[g_index_used++] = vertex_index(g_ring_used + corner);
+    g_ring_used += 4;
 }
 
 void show_target(Target *t, const DisplayRegs &r, int circuit) {
@@ -886,7 +945,8 @@ void show_target(Target *t, const DisplayRegs &r, int circuit) {
     C3D_TexEnvInit(C3D_GetTexEnv(1));
     set_fog(false, 0);
 
-    if (kRingVertices - g_ring_used < 6) return;
+    if (kRingVertices - g_index_used < 6) return;
+    reserve_indices(4);
     const float u1 = dw * t->sx / t->tex.width, v1 = 1.0f - dh * t->sy / t->tex.height;
     // The top screen is mounted sideways: the screen's left edge is the buffer's top.
     const float px[4] = {1.0f, 1.0f, -1.0f, -1.0f};    // screen top left, top right, bottom left, bottom right
@@ -895,12 +955,11 @@ void show_target(Target *t, const DisplayRegs &r, int circuit) {
     const float sv[4] = {1.0f, 1.0f, v1, v1};
     const int order[6] = {0, 1, 2, 2, 1, 3};
     DrawVertex *o = g_ring + g_ring_used;
-    for (int i = 0; i < 6; ++i) {
-        const int k = order[i];
-        o[i] = DrawVertex{px[k], py[k], -0.5f, 1.0f, 255, 255, 255, 255, su[k], sv[k], 255, {0, 0, 0}};
-    }
-    g_batch_first = g_ring_used;
-    g_ring_used += 6;
+    for (int i = 0; i < 4; ++i)
+        o[i] = DrawVertex{px[i], py[i], -0.5f, 1.0f, 255, 255, 255, 255, su[i], sv[i], 255, {0, 0, 0}};
+    for (int corner : order)
+        g_indices[g_index_used++] = vertex_index(g_ring_used + corner);
+    g_ring_used += 4;
     flush_batch();
 }
 
@@ -939,7 +998,8 @@ void begin_frame() {
     C3D_FrameBegin(0);
     g_frame_open = true;
     GPUCMD_GetBuffer(&g_frame_commands, nullptr, nullptr);
-    g_ring_used = g_batch_first = g_flushed_to = 0;
+    g_ring_used = g_flushed_to = 0;
+    g_index_used = g_index_first = g_index_flushed = g_index_base = 0;
     g_current = nullptr;
     g_key_valid = false;
     ++g_frame;
@@ -977,8 +1037,9 @@ bool init() {
     C3D_SetAttrInfo(&g_attr);
 
     g_ring = static_cast<DrawVertex *>(linearAlloc(kRingBytes));
-    if (!g_ring) {
-        std::fprintf(stderr, "[pica] no memory for vertices\n");
+    g_indices = static_cast<std::uint16_t *>(linearAlloc(kRingVertices * sizeof(*g_indices)));
+    if (!g_ring || !g_indices) {
+        std::fprintf(stderr, "[pica] no memory for vertex or index data\n");
         return false;
     }
     g_shot_pixels = static_cast<u8 *>(linearAlloc(240 * 400 * 3));
@@ -1026,7 +1087,7 @@ void shutdown() {
     C3D_Fini();
 }
 
-void draw(const State &st, const Vertex *v, int count, std::uint32_t serial) {
+void draw(const State &st, std::uint32_t serial, std::uint64_t clamp) {
     if (g_draw_nothing || queue::g_quiet) return;
     if (!g_frame_open) begin_frame();
     // Every register that can change the batch moves g_setup_generation, so a run of shapes checks just this one number.
@@ -1034,17 +1095,26 @@ void draw(const State &st, const Vertex *v, int count, std::uint32_t serial) {
         g_setup_seen = g_setup_generation;
         std::uint64_t attr = st.prim;
         if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
-        ensure_state(st, st.ctx[(attr >> 9) & 1u], attr);
+        const unsigned context = (attr >> 9) & 1u;
+        const Context &c = st.ctx[context];
+        if (context == ((st.prim >> 9) & 1u) && c.clamp != clamp) {
+            Context adjusted = c;
+            adjusted.clamp = clamp;
+            ensure_state(st, adjusted, attr);
+        } else {
+            ensure_state(st, c, attr);
+        }
     }
     if (g_skip_batch) return;
     ++g_stat_shapes;
     ++g_stat_prim[st.prim & 7u];
     ++g_shapes_since_present;
-    if (kRingVertices - g_ring_used < 8) {
+    if (kRingVertices - g_index_used < 8) {
         if (!g_ring_warned) std::fprintf(stderr, "[pica] vertex ring full, dropping shapes\n");
         g_ring_warned = true;
         return;
     }
+    const Vertex *v = st.queue;
     switch (st.prim & 7u) {
     case 0: {
         const float x = gs_x(v[0]), y = gs_y(v[0]);
@@ -1057,7 +1127,7 @@ void draw(const State &st, const Vertex *v, int count, std::uint32_t serial) {
         break;
     }
     case 3: case 4: case 5:
-        if (count >= 3) add_triangle(v, static_cast<unsigned>(st.prim & 7u), serial);
+        if (st.count >= 3) add_triangle(v, static_cast<unsigned>(st.prim & 7u), serial);
         break;
     case 6:
         add_quad(gs_x(v[0]), gs_y(v[0]), gs_x(v[1]), gs_y(v[1]), v[0], v[1]);
@@ -1148,6 +1218,8 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r);
 
 // The game thread decides, as it starts each picture, so it can leave out what a skipped picture will not use.
 std::uint32_t next_picture() {
+    // Split mode draws every picture, even if a live DRAW command asks to skip.
+    if (queue::g_split_pica) return 0;
     if (!g_present_every || ++g_game_vblanks % g_present_every) return g_next_picture;
     using namespace ps2::prof;
     const u64 blocked = g_ticks[Full], idle = g_ticks[Wait];   // the stats line clears these
@@ -1166,7 +1238,7 @@ void vblank(std::uint32_t frame, const DisplayRegs &r, std::uint32_t picture) {
     if (g_shapes_since_present) show_picture(frame, r);
     g_skipping = picture & kSkipping;
     g_draw_nothing = picture & kDrawNothing;
-    queue::g_skip_picture = picture & kSkip;
+    if (!queue::g_split_pica) queue::g_skip_picture = picture & kSkip;
 }
 
 namespace {

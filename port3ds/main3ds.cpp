@@ -9,6 +9,7 @@
 //                               "interp 1" (vector unit interpreter), "dump N" (log every GPU batch of game frame N),
 //                               "record sdmc:/p3fes/vu1" (save vector programs that are not compiled yet),
 //                               "vuthread 0" (run the vector programs and drawing on the same core as the game),
+//                               "splitgs 1" or "splitgs 2" (run drawing on core 0 or core 1 with "draw 1"),
 //                               "draw N" (draw one picture in N; the default 0 draws what keeps up with the game),
 //                               "uncapped 1" (let a light scene run faster than the PS2, to measure how much room is left),
 //                               "hide A-B" (leave out batches A up to B of each picture, to find which one draws something),
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <malloc.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -105,17 +107,24 @@ std::uint64_t g_dump_frame = 0;
 std::uint32_t g_skip_attr = 0, g_debug = 0, g_hide_from = 0, g_hide_to = 0;
 bool g_stats = false;
 bool g_vu_thread = true;
+bool g_split_gs = false;
+int g_gs_core = 0;
 std::uint32_t g_draw_every = 0;
 bool g_link = true;
 s32 g_priority = 0x30;
 bool g_iop_thread = true;
 bool g_hold_speed = true;
-volatile bool g_vu_ready = false, g_vu_go = false, g_vu_failed = false;
+enum class WorkerState { Waiting, Ready, Failed };
+std::atomic<WorkerState> g_worker_start{WorkerState::Waiting};
+std::atomic<WorkerState> g_vu_ready{WorkerState::Waiting}, g_gs_ready{WorkerState::Waiting};
 Thread g_vu_handle = nullptr;
+Thread g_gs_handle = nullptr;
 std::FILE *g_perf = nullptr;
 u64 g_start_ticks = 0;
 u64 g_last_ticks = 0;
 std::uint64_t g_last_prims = 0;
+u64 g_last_frame_ticks = 0, g_peak_frame_ticks = 0;
+unsigned g_frame_samples = 0, g_frames_over_budget = 0;
 
 struct DiscPart {
     Handle file = 0;
@@ -277,14 +286,35 @@ void on_vblank() {
     }
     const std::uint64_t frame = ps2::frame_count();
     if (g_software && g_show_every && frame % g_show_every == 0) show_frame();
-    if (frame % 30 == 0 && g_perf) {
-        const u64 now = svcGetSystemTick();
+    if (!g_perf) return;
+    u64 now = 0;
+    if (!g_hold_speed) {
+        now = svcGetSystemTick();
+        if (g_last_frame_ticks) {
+            constexpr u64 kFrameBudget = static_cast<u64>(SYSCLOCK_ARM11) * 16 / 1000;
+            const u64 elapsed = now - g_last_frame_ticks;
+            g_peak_frame_ticks = std::max(g_peak_frame_ticks, elapsed);
+            ++g_frame_samples;
+            g_frames_over_budget += elapsed > kFrameBudget;
+        }
+        g_last_frame_ticks = now;
+    }
+    if (frame % 30 == 0) {
+        if (g_hold_speed) now = svcGetSystemTick();
         const std::uint64_t prims = ps2::primitives_drawn();
         std::fprintf(g_perf, "frame %llu ms_total %llu ms_30frames %llu prims_30frames %llu", static_cast<unsigned long long>(frame),
                      static_cast<unsigned long long>((now - g_start_ticks) / static_cast<u64>(CPU_TICKS_PER_MSEC)),
                      static_cast<unsigned long long>((now - g_last_ticks) / static_cast<u64>(CPU_TICKS_PER_MSEC)),
                      static_cast<unsigned long long>(prims - g_last_prims));
         if (g_pmu_a >= 0) pmu_line();
+        if (!g_hold_speed) {
+            constexpr u64 kClock = SYSCLOCK_ARM11;
+            const u64 peak_us = (g_peak_frame_ticks * 1000000 + kClock - 1) / kClock;
+            std::fprintf(g_perf, " sampled_frames %u peak_frame_us %llu frames_over_16ms %u",
+                         g_frame_samples, static_cast<unsigned long long>(peak_us), g_frames_over_budget);
+            g_peak_frame_ticks = 0;
+            g_frame_samples = g_frames_over_budget = 0;
+        }
         std::fputc('\n', g_perf);
         std::fflush(g_perf);
         g_last_ticks = now;
@@ -323,6 +353,11 @@ void read_settings() {
         else if (!std::strcmp(key, "soft")) g_software = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "stats")) g_stats = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "vuthread")) g_vu_thread = std::strtoul(value, nullptr, 10) != 0;
+        else if (!std::strcmp(key, "splitgs")) {
+            const auto mode = std::strtoul(value, nullptr, 10);
+            g_split_gs = mode != 0;
+            g_gs_core = mode == 2 ? 1 : 0;
+        }
         else if (!std::strcmp(key, "iopthread")) g_iop_thread = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "uncapped")) g_hold_speed = std::strtoul(value, nullptr, 10) == 0;
         else if (!std::strcmp(key, "draw")) g_draw_every = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
@@ -352,15 +387,28 @@ bool start_gpu() {
     return true;
 }
 
-// The vector programs and all drawing, on a core of their own. The game thread only follows the VIF's registers and queues the
-// data for here.
-void vu_main(void *) {
-    g_vu_failed = !start_gpu();
-    g_vu_ready = true;
-    if (g_vu_failed) return;
-    while (!g_vu_go) svcSleepThread(1000000);
-    ps2::run_vu_thread();
+WorkerState wait_worker(const std::atomic<WorkerState> &state) {
+    WorkerState value;
+    while ((value = state.load()) == WorkerState::Waiting) svcSleepThread(1000000);
+    return value;
+}
+
+void gs_main(void *) {
+    const bool ready = start_gpu();
+    g_gs_ready.store(ready ? WorkerState::Ready : WorkerState::Failed);
+    if (!ready) return;
+    if (wait_worker(g_worker_start) == WorkerState::Ready) ps2::run_pica_thread();
     ps2::gs::pica::shutdown();
+}
+
+// The VU worker owns the vector programs, and also draws when there is no separate GS worker.
+void vu_main(void *) {
+    if (wait_worker(g_worker_start) != WorkerState::Ready) return;
+    const bool ready = g_split_gs || start_gpu();
+    g_vu_ready.store(ready ? WorkerState::Ready : WorkerState::Failed);
+    if (!ready) return;
+    ps2::run_vu_thread();
+    if (!g_split_gs) ps2::gs::pica::shutdown();
 }
 
 int g_vu_core = 0;
@@ -380,22 +428,48 @@ Thread start_vu_thread() {
     }
     g_vu_handle = thread;
     g_vu_core = core;
-    while (!g_vu_ready) svcSleepThread(1000000);
-    if (g_vu_failed) {
+    if (core != 2) g_split_gs = false;
+    if (g_split_gs) {
+        if (g_gs_core == 1 && R_FAILED(APT_SetAppCpuTimeLimit(80))) g_gs_core = 0;
+        g_gs_handle = threadCreate(gs_main, nullptr, kVuStack, g_priority + 2, g_gs_core, false);
+        if (!g_gs_handle && g_gs_core == 1) {
+            std::fprintf(stderr, "[3ds] core 1 unavailable for drawing, trying core 0\n");
+            g_gs_core = 0;
+            g_gs_handle = threadCreate(gs_main, nullptr, kVuStack, g_priority + 2, 0, false);
+        }
+        if (!g_gs_handle) {
+            std::fprintf(stderr, "[3ds] no GS thread, drawing on the VU thread\n");
+            g_split_gs = false;
+        } else if (wait_worker(g_gs_ready) == WorkerState::Failed) {
+            g_worker_start.store(WorkerState::Failed);
+            threadJoin(g_gs_handle, U64_MAX);
+            threadFree(g_gs_handle);
+            g_gs_handle = nullptr;
+            threadJoin(thread, U64_MAX);
+            threadFree(thread);
+            g_finished = true;
+            return nullptr;
+        } else {
+            std::fprintf(stderr, "[3ds] GS thread on core %d\n", g_gs_core);
+        }
+    }
+    ps2::enable_split_pica(g_split_gs);
+    ps2::start_render_thread();
+    ps2::start_vu_thread();
+    g_worker_start.store(WorkerState::Ready);
+    if (wait_worker(g_vu_ready) == WorkerState::Failed) {
         threadJoin(thread, U64_MAX);
         threadFree(thread);
         g_finished = true;
         return nullptr;
     }
-    ps2::start_render_thread();
-    ps2::start_vu_thread();
-    g_vu_go = true;
     std::fprintf(stderr, "[3ds] VU thread on core %d\n", core);
     return thread;
 }
 
 void emulate(void *) {
     Thread vu_thread = nullptr;
+    g_split_gs = g_split_gs && g_vu_thread && !g_software && g_draw_every == 1;
     if (g_software) {
         ps2::g_options.frames_dir = g_shots_every ? "sdmc:/p3fes/shots" : "";
         ps2::g_options.frame_every = g_shots_every;
@@ -418,10 +492,7 @@ void emulate(void *) {
     std::uint32_t entry = 0;
     if (!open_disc()) {
         std::fprintf(stderr, "cannot open the disc image in sdmc:/p3fes\n");
-        g_finished = true;
-        return;
-    }
-    if (!ps2::load_elf("sdmc:/p3fes/SLUS_216.21", entry)) {
+    } else if (!ps2::load_elf("sdmc:/p3fes/SLUS_216.21", entry)) {
         std::fprintf(stderr, "cannot load sdmc:/p3fes/SLUS_216.21\n");
     } else {
         // Core 1 is the system's too, so with the vector programs there as well, the I/O processor stays on the game's core.
@@ -444,6 +515,10 @@ void emulate(void *) {
         ps2::stop_vu_thread();
         threadJoin(vu_thread, U64_MAX);
         threadFree(vu_thread);
+        if (g_gs_handle) {
+            threadJoin(g_gs_handle, U64_MAX);
+            threadFree(g_gs_handle);
+        }
     } else {
         ps2::gs::pica::shutdown();
     }

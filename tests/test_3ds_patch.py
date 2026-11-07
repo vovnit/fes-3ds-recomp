@@ -61,7 +61,28 @@ for rel, first in (("runtime/src/gs/queue.hpp", 1), ("runtime/src/vif.hpp", 0), 
         if old not in FILES.get(rel, ""):
             FILES[rel] = FILES.get(rel, "") + old
 FILES["runtime/src/vif.cpp"] = FILES["runtime/src/vif.cpp"].replace('#include "ps2/state.hpp"\n', '#include "ps2/state.hpp"\n#include "ps2/system.hpp"\n', 1)
+FILES["runtime/src/vif.cpp"] = FILES["runtime/src/vif.cpp"].replace(
+    'std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {\n    Unit &u = state(unit);\n',
+    'std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {\n    Unit &u = state(unit);\n'
+    '    std::size_t pos = 0;\n    while (pos < count && !u.stalled) {\n')
+FILES["runtime/src/vif.cpp"] = FILES["runtime/src/vif.cpp"].replace(
+    '        execute(unit, cmd, words + start);\nvoid process(int unit) {',
+    '        execute(unit, cmd, words + start);\n        pos = start + need;\n'
+    '    }\n    return pos;\n}\nvoid process(int unit) {')
+FILES["runtime/src/vif.cpp"] = FILES["runtime/src/vif.cpp"].replace(
+    '    Unit &u = state(unit);\n        const std::size_t pos = run(unit, words, count);\n    process(unit);',
+    '    Unit &u = state(unit);\n    if (u.pending.empty() && !u.stalled) {\n'
+    '        const auto *words = reinterpret_cast<const std::uint32_t *>(data);\n'
+    '        const std::size_t count = static_cast<std::size_t>(qwc) * 4;\n'
+    '        const std::size_t pos = run(unit, words, count);\n'
+    '        if (pos < count) u.pending.assign(words + pos, words + count);\n'
+    '        return;\n    }\n    process(unit);')
 FILES["runtime/src/vif.cpp"] += '    bool dbf = false, stalled = false;\n    std::vector<std::uint32_t> pending;\n};\nbool stalled(int unit) { return state(unit).stalled; }\n'
+FILES["runtime/src/dmac.hpp"] += 'bool ipu_pull(std::uint8_t *qword);\n'
+FILES["runtime/src/dmac.cpp"] += 'bool ipu_push(const std::uint8_t *qword) {\n'
+FILES["runtime/src/system.cpp"] += ('void run_vu_thread() {\n    gs::stats();\n'
+                                   '            case gs::queue::kVuFence:\n                g_vu_fence.fetch_add(1);\n')
+FILES["runtime/src/gs/gif.cpp"] += '    GsSink sink{path};\n    walk(g_paths[path], data, qwc, sink);\n'
 
 
 def run(folder):
@@ -113,7 +134,7 @@ with tempfile.TemporaryDirectory() as d:
     assert '"--scalar"' in vur and "fixed_to_float(r.vf" in vur and "#ifdef PS2_VU_FAST" in vu
     # The GPU path only exists in a 3DS build; the desktop draw call is still there.
     gs = read("runtime/src/gs/gs.cpp")
-    assert "#ifdef PS2_PICA\n#include \"pica.hpp\"\n#endif" in gs and "if (pica::active()) pica::draw(s, s.queue, needed, g_vertex_serial);" in gs
+    assert "#ifdef PS2_PICA\n#include \"pica.hpp\"\n#endif" in gs and "pica::draw(s, g_vertex_serial, clamp);" in gs
     assert "if (cpu_raster()) raster::draw(s, s.queue, needed);" in gs
     assert "#else\n#define PS2_PROF(counter)\n#endif" in read("runtime/include/ps2/system.hpp")
     assert "PS2_PROF(ps2::prof::Upload);" in gs
@@ -135,4 +156,18 @@ with tempfile.TemporaryDirectory() as d:
     assert "iop_advance(t - g_iop_synced);" in system_cpp and "    iop::run(t - g_iop_synced);" in system_cpp
     assert "IopGuard guard;" in read("runtime/src/iop/sif.cpp") and "inline void iop_wait() {}" in read("runtime/include/ps2/system.hpp")
     assert "already patched" in run(d).stdout
+    # Upgrade a tree that already has the original 3DS movie decoder.
+    ipu = "runtime/src/ipu/ipu.cpp"
+    ipu_edits = perf["PERF_EDITS"][ipu]
+    old_reader, new_reader = next(edit for edit in ipu_edits if "bits_at(g_bit, 32)" in edit[0])
+    old_prefix, new_prefix = next(edit for edit in ipu_edits if "const DctEntry &short_code" in edit[1])
+    patched_ipu = read(ipu)
+    assert new_prefix in patched_ipu
+    before_prefix = patched_ipu.replace(new_prefix, old_prefix)
+    assert new_reader in before_prefix
+    with open(os.path.join(d, ipu), "w") as f:
+        f.write(before_prefix.replace(new_reader, old_reader))
+    upgraded = run(d)
+    assert upgraded.returncode == 0 and upgraded.stdout.startswith("patched"), upgraded.stdout
+    assert read(ipu) == patched_ipu
 print("ok   3DS patch applies once, is idempotent, refuses unknown source and leaves desktop paths alone")

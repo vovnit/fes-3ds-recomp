@@ -38,25 +38,41 @@ endif
 endif
 HOST      := /p/port3ds/main3ds.cpp /p/port3ds/pica.cpp /p/port3ds/native3ds.cpp /p/port3ds/memcpy3ds.cpp /p/port3ds/remote3ds.cpp /p/port3ds/iop3ds.cpp
 OBJS      := $(patsubst /%.cpp,$(OUT)/obj/%.o,$(RUNTIME) $(GAME) $(HOST)) $(OUT)/shader/gs_v_shbin.o
+CONFIG    := $(OUT)/build-config
+CONFIG_FLAGS := $(CXXFLAGS)
 
 all: $(OUT)/p3fes.3dsx
+
+.PHONY: FORCE
+FORCE:
+
+# Recheck the flags and input list on each run, but only invalidate outputs when they change.
+$(CONFIG): FORCE
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(subst ','"'"',$(CONFIG_FLAGS))' $(OBJS) > $@.tmp
+	@if cmp -s $@.tmp $@; then rm $@.tmp; else mv $@.tmp $@; fi
 
 $(OUT)/p3fes.3dsx: $(OUT)/p3fes.elf
 	$(TOOLS)/3dsxtool $< $@
 
-$(OUT)/p3fes.elf: $(OBJS)
+$(OUT)/p3fes.elf: $(OBJS) $(CONFIG)
 	$(PREFIX)g++ -specs=3dsx.specs $(ARCH) -Wl,--gc-sections -Wl,-Map,$(OUT)/p3fes.map $(OBJS) -L$(CTRU)/lib -lcitro3d -lctru -lm -o $@
 	$(PREFIX)size $@
 
 # Translated game code: exceptions never pass through it, and leaving them out makes it smaller.
-$(OUT)/obj/w/generated/%.o: /w/generated/%.cpp
+$(OUT)/obj/w/generated/%.o: /w/generated/%.cpp $(CONFIG)
 	@mkdir -p $(dir $@)
 	$(PREFIX)g++ $(CXXFLAGS) -DPS2_VU_FAST -fno-exceptions -fno-rtti -I/w/generated/p3fes -Wno-unused-label -Wno-unused-variable -c $< -o $@
 
 # Vector programs copy registers with "add 0", which is a real addition unless the sign of zero can be ignored.
-$(OUT)/obj/w/generated/p3fes-vu3ds/%.o: CXXFLAGS += -fno-signed-zeros
+# Loop peeling reduces repeated work in the compiled vector loops.
+$(OUT)/obj/w/generated/p3fes-vu3ds/%.o: CXXFLAGS += -fno-signed-zeros -fpeel-loops
+VU_OBJS := $(filter $(OUT)/obj/w/generated/p3fes-vu3ds/%,$(OBJS))
+ifneq ($(VU_OBJS),)
+$(VU_OBJS): /p/port3ds/Makefile
+endif
 
-$(OUT)/obj/%.o: /%.cpp
+$(OUT)/obj/%.o: /%.cpp $(CONFIG)
 	@mkdir -p $(dir $@)
 	$(PREFIX)g++ $(CXXFLAGS) -c $< -o $@
 

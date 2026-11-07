@@ -2159,6 +2159,232 @@ void process(int unit) {
 
 # These edits build on the existing port and can also upgrade a previously patched tree.
 PERF_EDITS = {
+    'runtime/src/dmac.hpp': [
+        ('bool ipu_pull(std::uint8_t *qword);\n', '''bool ipu_pull(std::uint8_t *qword);
+#ifdef __3DS__
+std::size_t ipu_pull_many(std::uint8_t *data, std::size_t qwords);
+#endif
+'''),
+    ],
+    'runtime/src/dmac.cpp': [
+        ('''bool ipu_push(const std::uint8_t *qword) {
+''', '''#ifdef __3DS__
+std::size_t ipu_pull_many(std::uint8_t *data, std::size_t qwords) {
+    if (!qwords) return 0;
+    Channel &c = g_ch[4];
+    // Let the single-word path read the next tag, end the transfer or handle unaligned input.
+    if (!(c.chcr & 0x100u) || !c.qwc || (c.madr & 15u))
+        return ipu_pull(data) ? 1 : 0;
+    const std::uint32_t room = (c.madr & 0x80000000u)
+        ? kScratchpadSize - (c.madr & (kScratchpadSize - 1))
+        : kRamSize - (c.madr & (kRamSize - 16));
+    const std::size_t n = std::min<std::size_t>({qwords, c.qwc, room / 16});
+    std::memcpy(data, source(c.madr), n * 16);
+    c.madr += static_cast<std::uint32_t>(n * 16);
+    c.qwc -= static_cast<std::uint32_t>(n);
+    if (!c.qwc && (((c.chcr >> 2) & 3u) != 1 || c.tag_end)) finish(4);
+    return n;
+}
+#endif
+
+bool ipu_push(const std::uint8_t *qword) {
+'''),
+    ],
+    'runtime/src/ipu/ipu.cpp': [
+        ('''void convert_fast(const std::uint8_t *raw) {   // 32-bit pixels, no alpha thresholds
+''', '''bool have_csc_input() {
+    const std::size_t end = g_bit + 384 * 8;
+    while (g_in.size() * 8 < end) {
+        std::uint8_t data[384];
+        const std::size_t missing = end - g_in.size() * 8;
+        const std::size_t qwords = std::min<std::size_t>((missing + 127) / 128, sizeof data / 16);
+        const std::size_t n = dmac::ipu_pull_many(data, qwords);
+        if (!n) return false;
+        g_in.insert(g_in.end(), data, data + n * 16);
+    }
+    return true;
+}
+
+void convert_fast(const std::uint8_t *raw) {   // 32-bit pixels, no alpha thresholds
+'''),
+        ('''            if (!(g_bit & 7u) && !((cmd >> 27) & 1u) && !g_th0 && !g_th1 && have(384 * 8)) {
+''', '''            if (!(g_bit & 7u) && !((cmd >> 27) & 1u) && !g_th0 && !g_th1 && have_csc_input()) {
+'''),
+        ('''        if (have(32)) {   // nearly always: one read of the stream for the end test, the code and its sign
+            const std::uint32_t w = bits_at(g_bit, 32);
+            if (index && (table_one ? w >> 28 == 6u : w >> 30 == 2u)) {
+''', '''        if (have(32)) {   // keep the existing DMA refill threshold
+            // A coefficient needs at most 16 code bits and one sign bit. Three bytes suffice at any bit offset.
+            const std::uint8_t *p = g_in.data() + (g_bit >> 3);
+            const std::uint32_t packed = (std::uint32_t{p[0]} << 24) | (std::uint32_t{p[1]} << 16) | (std::uint32_t{p[2]} << 8);
+            const std::uint32_t w = packed << (g_bit & 7u);
+            if (index && (table_one ? w >> 28 == 6u : w >> 30 == 2u)) {
+'''),
+        ('''inline void idct_column(const int *b, std::int16_t *o, int stride) {
+    int x1 = b[32] * 256, x2 = b[48], x3 = b[16], x4 = b[8], x5 = b[56], x6 = b[40], x7 = b[24];
+    if (!(x1 | x2 | x3 | x4 | x5 | x6 | x7)) {
+        const std::int16_t v = static_cast<std::int16_t>(clip9((b[0] + 32) >> 6));
+        for (int i = 0; i < 8; ++i) o[i * stride] = v;
+        return;
+    }
+''', '''template <bool one_ac>
+inline void idct_column(const int *b, std::int16_t *o, int stride) {
+    int x1 = one_ac ? 0 : b[32] * 256, x2 = one_ac ? 0 : b[48], x3 = one_ac ? 0 : b[16], x4 = b[8];
+    int x5 = one_ac ? 0 : b[56], x6 = one_ac ? 0 : b[40], x7 = one_ac ? 0 : b[24];
+'''),
+        ('''// Writes one block into a macroblock that is already zero, stride samples between its lines.
+void decode_block(std::int16_t *out, int stride, int channel, bool intra, std::uint32_t qsc) {
+''', '''// Writes all 64 samples of a block, with stride samples between output lines.
+template <bool intra>
+void decode_block(std::int16_t *out, int stride, int channel, std::uint32_t qsc) {
+'''),
+        ('''    for (int y = 0; y < 8; ++y)
+        if (rows & (1u << y)) idct_row(f + y * 8);
+    for (int x = 0; x < 8; ++x) idct_column(f + x, out + x, stride);
+}
+
+void decode_macroblock(std::int16_t *raw, bool intra, bool field, bool dc_reset, std::uint32_t qsc) {
+    const unsigned cbp = intra ? 0x3Fu : decode(tables().cbp) & 0xFFu;
+    if (dc_reset) g_dc[0] = g_dc[1] = g_dc[2] = static_cast<std::int16_t>(128 << dc_precision());
+    std::memset(raw, 0, 768);
+    const int stride = field ? 32 : 16;
+    std::int16_t *lower = raw + (field ? 16 : 128);
+    if (cbp & 32u) decode_block(raw, stride, 0, intra, qsc);
+    if (cbp & 16u) decode_block(raw + 8, stride, 0, intra, qsc);
+    if (cbp & 8u) decode_block(lower, stride, 0, intra, qsc);
+    if (cbp & 4u) decode_block(lower + 8, stride, 0, intra, qsc);
+    if (cbp & 2u) decode_block(raw + 256, 8, 1, intra, qsc);
+    if (cbp & 1u) decode_block(raw + 320, 8, 2, intra, qsc);
+}
+''', '''    // With no vertical frequencies, the column pass gives the same output on every line.
+    if (rows == 1u) {
+        idct_row(f);
+        std::int16_t line[8];
+        for (int x = 0; x < 8; ++x) line[x] = static_cast<std::int16_t>(clip9((f[x] + 32) >> 6));
+        for (int y = 0; y < 8; ++y, out += stride) std::memcpy(out, line, sizeof line);
+        return;
+    }
+    for (int y = 0; y < 8; ++y)
+        if (rows & (1u << y)) idct_row(f + y * 8);
+    if (rows & ~3u) {
+        for (int x = 0; x < 8; ++x) idct_column<false>(f + x, out + x, stride);
+    } else {
+        for (int x = 0; x < 8; ++x) idct_column<true>(f + x, out + x, stride);
+    }
+}
+
+template <bool intra>
+void decode_macroblock_type(std::int16_t *raw, bool field, bool dc_reset, std::uint32_t qsc) {
+    const unsigned cbp = intra ? 0x3Fu : decode(tables().cbp) & 0xFFu;
+    if (dc_reset) g_dc[0] = g_dc[1] = g_dc[2] = static_cast<std::int16_t>(128 << dc_precision());
+    if (cbp != 0x3Fu) std::memset(raw, 0, 768);
+    const int stride = field ? 32 : 16;
+    std::int16_t *lower = raw + (field ? 16 : 128);
+    if (cbp & 32u) decode_block<intra>(raw, stride, 0, qsc);
+    if (cbp & 16u) decode_block<intra>(raw + 8, stride, 0, qsc);
+    if (cbp & 8u) decode_block<intra>(lower, stride, 0, qsc);
+    if (cbp & 4u) decode_block<intra>(lower + 8, stride, 0, qsc);
+    if (cbp & 2u) decode_block<intra>(raw + 256, 8, 1, qsc);
+    if (cbp & 1u) decode_block<intra>(raw + 320, 8, 2, qsc);
+}
+
+void decode_macroblock(std::int16_t *raw, bool intra, bool field, bool dc_reset, std::uint32_t qsc) {
+    if (intra) decode_macroblock_type<true>(raw, field, dc_reset, qsc);
+    else decode_macroblock_type<false>(raw, field, dc_reset, qsc);
+}
+'''),
+        ('''    DctEntry head[1024], tail[1024];
+''', '''    DctEntry head[1024], tail[1024];
+    DctEntry signed_prefix[256];   // Up to seven code bits followed by the sign.
+'''),
+        ('''            (v >> 10 ? l.head[v >> 6] : l.tail[v]) = {e.length, e.run, e.level};
+        }
+    }
+''', '''            (v >> 10 ? l.head[v >> 6] : l.tail[v]) = {e.length, e.run, e.level};
+        }
+        if (e.run != kEscape && e.length < 8) {
+            const unsigned suffix = 7u - e.length;
+            for (unsigned sign = 0; sign < 2; ++sign) {
+                const auto level = static_cast<std::int16_t>(sign ? -e.level : e.level);
+                const unsigned first = ((static_cast<unsigned>(e.code) << 1) | sign) << suffix;
+                for (unsigned i = 0; i < (1u << suffix); ++i)
+                    l.signed_prefix[first + i] = {static_cast<std::uint8_t>(e.length + 1), e.run, level};
+            }
+        }
+    }
+'''),
+        ('''inline std::uint32_t sat8(int v) {   // v >> 7, to 0..255
+    std::uint32_t r;
+    __asm__("usat %0, #8, %1, asr #7" : "=r"(r) : "r"(v));
+    return r;
+}
+
+''', '''inline int clip12(int v) {
+    int r;
+    __asm__("ssat %0, #12, %1" : "=r"(r) : "r"(v));
+    return r;
+}
+
+inline std::uint32_t sat8(int v) {   // v >> 7, to 0..255
+    std::uint32_t r;
+    __asm__("usat %0, #8, %1, asr #7" : "=r"(r) : "r"(v));
+    return r;
+}
+
+'''),
+        ('''        f[r] = x < -2048 ? -2048 : x > 2047 ? 2047 : x;
+''', '''        f[r] = clip12(x);
+'''),
+        ('''        f[0] = x < -2048 ? -2048 : x > 2047 ? 2047 : x;
+''', '''        f[0] = clip12(x);
+'''),
+        ('''        if (have(32)) {   // keep the existing DMA refill threshold
+            // A coefficient needs at most 16 code bits and one sign bit. Three bytes suffice at any bit offset.
+            const std::uint8_t *p = g_in.data() + (g_bit >> 3);
+            const std::uint32_t packed = (std::uint32_t{p[0]} << 24) | (std::uint32_t{p[1]} << 16) | (std::uint32_t{p[2]} << 8);
+            const std::uint32_t w = packed << (g_bit & 7u);
+            if (index && (table_one ? w >> 28 == 6u : w >> 30 == 2u)) {
+                g_bit += table_one ? 4 : 2;
+                break;
+            }
+            const DctEntry &e = table.at(w >> 16);
+            if (!e.length) throw BadCode{};
+            if (e.run == kEscape) {
+                read_coefficient(table, run, level);
+            } else {
+                run = e.run;
+                level = (w >> (31 - e.length)) & 1u ? -e.level : e.level;
+                g_bit += e.length + 1u;
+            }
+''', '''        if (have(32)) {   // keep the existing DMA refill threshold
+            // Two bytes cover the eight-bit lookup at any bit offset.
+            const std::uint8_t *p = g_in.data() + (g_bit >> 3);
+            const std::uint32_t prefix = (std::uint32_t{p[0]} << 8) | p[1];
+            const unsigned shift = g_bit & 7u;
+            const DctEntry &short_code = table.signed_prefix[((prefix << shift) >> 8) & 255u];
+            if (short_code.length) {
+                g_bit += short_code.length;
+                run = short_code.run;
+                level = short_code.level;
+            } else {
+                // Longer codes need at most 16 code bits and one sign bit.
+                const std::uint32_t w = ((prefix << 16) | (std::uint32_t{p[2]} << 8)) << shift;
+                if (index && (table_one ? w >> 28 == 6u : w >> 30 == 2u)) {
+                    g_bit += table_one ? 4 : 2;
+                    break;
+                }
+                const DctEntry &e = table.at(w >> 16);
+                if (!e.length) throw BadCode{};
+                if (e.run == kEscape) {
+                    read_coefficient(table, run, level);
+                } else {
+                    run = e.run;
+                    level = (w >> (31 - e.length)) & 1u ? -e.level : e.level;
+                    g_bit += e.length + 1u;
+                }
+            }
+'''),
+    ],
     # The I/O processor code tools/p3fes_iopgen.py translated. Build with PS2_IOP_BLOCKS if it is there, which the Makefile sees to;
     # blocks are checked against what is in memory whenever that changes, so anything else stays with the interpreter.
     'runtime/src/iop/iop.hpp': [
@@ -2425,6 +2651,47 @@ std::uint32_t g_vertex_serial = 0;
     ++g_vertex_serial;
 #endif
     State &s = g_state;
+'''),
+        ('''void draw_gpu(State &s, int needed) {
+    if (queue::g_skip_picture) return;
+    static bool known = false;
+    static std::uint32_t seen = 0;
+    static std::uint64_t clamp = 0;
+    Context &uc = s.ctx[static_cast<unsigned>(s.prim >> 9) & 1u];
+    if (!known || seen != g_setup_generation) {
+        known = true;
+        seen = g_setup_generation;
+        g_upload_ext.erase((static_cast<std::uint32_t>(uc.frame) & 0x1FFu) * 32u);
+        clamp = upload_clamped(s, uc);
+    }
+    const std::uint64_t saved_clamp = uc.clamp;
+    uc.clamp = clamp;
+    pica::draw(s, s.queue, needed, g_vertex_serial);
+    uc.clamp = saved_clamp;
+''', '''void draw_gpu(const State &s) {
+    if (queue::g_skip_picture) return;
+    static bool known = false;
+    static std::uint32_t seen = 0;
+    static std::uint64_t clamp = 0;
+    if (!known || seen != g_setup_generation) {
+        known = true;
+        seen = g_setup_generation;
+        const Context &uc = s.ctx[static_cast<unsigned>(s.prim >> 9) & 1u];
+        g_upload_ext.erase((static_cast<std::uint32_t>(uc.frame) & 0x1FFu) * 32u);
+        clamp = upload_clamped(s, uc);
+    }
+    pica::draw(s, g_vertex_serial, clamp);
+'''),
+        ('''        draw_gpu(s, needed);
+''', '''        draw_gpu(s);
+'''),
+        ('''#ifdef PS2_PICA
+        if (pica::active()) pica::draw(s, s.queue, needed, g_vertex_serial);
+        else
+#endif
+        if (cpu_raster()) raster::draw(s, s.queue, needed);
+''', '''        // PICA draws before this fallback, with its clamp passed separately.
+        if (cpu_raster()) raster::draw(s, s.queue, needed);
 '''),
     ],
     'runtime/include/ps2/vu_ops.hpp': [
@@ -2949,6 +3216,89 @@ bool stalled(int unit) { return state(unit).stalled; }
         ('''    if (is_shadow && gs::queue::g_ee_skip && qwc <= kKeptWords / 4u) {
 ''', '''    if (is_shadow && (gs::queue::g_ee_skip || u.dropping || u.passing)) {
 '''),
+        ('''std::size_t run(int unit, Unit &u, bool from_vu, bool is_shadow, const std::uint32_t *words, std::size_t count) {
+    std::size_t pos = 0;
+    while (pos < count && !u.stalled) {
+        const std::uint32_t cmd = words[pos];
+        if (!cmd) {   // padding: about 40000 of these per picture in this game
+            u.code = 0;
+            ++pos;
+            continue;
+        }
+        const std::size_t start = pos + 1;
+        const std::uint32_t need = data_words(u, cmd);
+        if (start + need > count) break;
+        execute(unit, u, from_vu, is_shadow, cmd, words + start);
+        pos = start + need;
+    }
+    return pos;
+}
+''', '''std::size_t run(int unit, Unit &u, bool from_vu, bool is_shadow, const std::uint32_t *words, std::size_t count) {
+    const std::uint32_t *at = words;
+    const std::uint32_t *const end = words + count;
+    while (at < end && !u.stalled) {
+        const std::uint32_t cmd = *at++;
+        if (!cmd) {
+            u.code = 0;
+            while (at < end && !*at) ++at;
+            continue;
+        }
+        const std::uint32_t need = data_words(u, cmd);
+        if (static_cast<std::size_t>(end - at) < need) {
+            --at;
+            break;
+        }
+        execute(unit, u, from_vu, is_shadow, cmd, at);
+        at += need;
+    }
+    return static_cast<std::size_t>(at - words);
+}
+'''),
+        ('''void process(int unit, Unit &u, bool from_vu, bool is_shadow) {''', '''// DMA chains often put an UNPACK command at the end of a tag and its data in
+// the next transfer. If only the command is pending, read the complete payload
+// from the new transfer without copying it through the pending vector.
+[[gnu::always_inline]] inline bool run_transfer(int unit, Unit &u, bool from_vu, bool is_shadow, const std::uint32_t *words, std::size_t count) {
+    if (u.stalled) return false;
+    std::size_t pos = 0;
+    if (!u.pending.empty()) {
+        if (u.pending.size() != 1) return false;
+        const std::uint32_t cmd = u.pending.front();
+        const std::uint32_t need = data_words(u, cmd);
+        if (!need || need > count) return false;
+        execute(unit, u, from_vu, is_shadow, cmd, words);
+        u.pending.clear();
+        pos = need;
+    }
+    pos += run(unit, u, from_vu, is_shadow, words + pos, count - pos);
+    if (pos < count) u.pending.assign(words + pos, words + count);
+    return true;
+}
+
+void process(int unit, Unit &u, bool from_vu, bool is_shadow) {'''),
+        ('''    if (is_shadow) gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16);
+    if (u.pending.empty() && !u.stalled) {
+        const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+        const std::size_t count = static_cast<std::size_t>(qwc) * 4;
+        const std::size_t pos = run(unit, u, from_vu, is_shadow, words, count);
+        if (pos < count) u.pending.assign(words + pos, words + count);
+        return;
+    }
+''', '''    if (is_shadow) gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16);
+    const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+    const std::size_t count = static_cast<std::size_t>(qwc) * 4;
+    if (run_transfer(unit, u, from_vu, is_shadow, words, count)) return;
+'''),
+        ('''void transfer_words(const std::uint32_t *words, std::size_t count) {
+    Unit &u = g_vu_side;
+    if (u.pending.empty() && !u.stalled) {
+        const std::size_t pos = run(1, u, true, false, words, count);
+        if (pos < count) u.pending.assign(words + pos, words + count);
+        return;
+    }
+''', '''void transfer_words(const std::uint32_t *words, std::size_t count) {
+    Unit &u = g_vu_side;
+    if (run_transfer(1, u, true, false, words, count)) return;
+'''),
     ],
     # Faster vector programs: the compiler is told VU memory and the registers do not overlap, flags nobody can see are not worked
     # out, and conversions and comparisons use the FPU instead of taking floats apart in integer registers.
@@ -3063,6 +3413,119 @@ inline std::uint32_t min(std::uint32_t a, std::uint32_t b) { return key(a) <= ke
 }
 
 
+# Keep the optional 3DS GS worker after the serial VU and graphics patches.
+SPLIT_GS_EDITS = {
+    'runtime/src/gs/queue.hpp': [
+        ('''extern bool g_quiet;''', '''#ifdef PS2_PICA
+extern bool g_split_pica;
+#endif
+extern bool g_quiet;'''),
+    ],
+    'runtime/src/gs/queue.cpp': [
+        ('''bool g_quiet = false;''', '''bool g_quiet = false;
+#ifdef PS2_PICA
+bool g_split_pica = false;
+#endif'''),
+        ('''        PS2_PROF(ps2::prof::Full);
+        svcSleepThread(100000);''', '''        // Only the game-to-VU queue feeds the EE frame-skipping heuristic.
+        if (this == &g_vu) {
+            PS2_PROF(ps2::prof::Full);
+            svcSleepThread(100000);
+        } else {
+            svcSleepThread(100000);
+        }'''),
+    ],
+    'runtime/src/gs/gs.cpp': [
+        ('''void start_thread() { queue::render().start(4096); }   // never carries anything: serve() below takes the messages directly''', '''void start_thread() { queue::render().start(queue::g_split_pica ? 512u << 10 : 4096u); }'''),
+    ],
+    'runtime/src/gs/gif.cpp': [
+        ('''    GsSink sink{path};
+    walk(g_paths[path], data, qwc, sink);''', '''#ifdef PS2_PICA
+    if (gs::queue::g_split_pica && gs::queue::role() == gs::queue::Role::Vu) {
+        // The VU reuses its packet memory after this call. Copy complete qwords
+        // into the ring; the GS retains the parser state across chunks.
+        while (qwc) {
+            const std::uint32_t part = std::min<std::uint32_t>(qwc, 4096u);
+            gs::queue::render().post(gs::queue::kGif, path, part, data, part * 16);
+            qwc -= part;
+            data += part * 16;
+        }
+        return;
+    }
+#endif
+    GsSink sink{path};
+    walk(g_paths[path], data, qwc, sink);'''),
+    ],
+    'runtime/src/system.cpp': [
+        ('''void run_vu_thread() {''', '''#ifdef PS2_PICA
+void enable_split_pica(bool enabled) { gs::queue::g_split_pica = enabled; }
+
+void run_pica_thread() {
+    using namespace gs::queue;
+    role() = Role::Render;
+    Ring &in = render();
+    for (;;) {
+        Header h;
+        const std::uint8_t *payload = nullptr;
+        if (!in.peek(h, payload)) {
+            in.wait_for_work(50);
+            continue;
+        }
+        if (h.type == kVuStop) {
+            in.pop(h);
+            return;
+        }
+        if (h.type == kGif) gif::render(static_cast<int>(h.arg0), payload, h.arg1);
+        else if (h.type == kVuFence) {
+            g_vu_fence.fetch_add(1);
+            notify(g_vu_fence);
+        } else gs::serve(h.type, h.arg0, payload);
+        in.pop(h);
+    }
+}
+#endif
+
+void run_vu_thread() {'''),
+        ('''            case gs::queue::kVuFence:
+                g_vu_fence.fetch_add(1);''', '''            case gs::queue::kVuFence:
+#ifdef PS2_PICA
+                if (gs::queue::g_split_pica) {
+                    gs::queue::render().post(gs::queue::kVuFence, 0, 0, nullptr, 0);
+                    break;
+                }
+#endif
+                g_vu_fence.fetch_add(1);'''),
+        ('''            case gs::queue::kVuStop:
+                in.pop(h);
+                return;
+            default: gs::serve(h.type, h.arg0, payload); break;''', '''            case gs::queue::kVuStop:
+                if (gs::queue::g_split_pica) gs::queue::render().post(gs::queue::kVuStop, 0, 0, nullptr, 0);
+                in.pop(h);
+                return;
+            default:
+                if (gs::queue::g_split_pica)
+                    gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes);
+                else gs::serve(h.type, h.arg0, payload);
+                break;'''),
+        ('''    gs::stats();
+''', '''#ifdef PS2_PICA
+    if (gs::queue::g_split_pica) sync_vu_thread();
+#endif
+    gs::stats();
+'''),
+    ],
+    'runtime/include/ps2/system.hpp': [
+        ('''void start_vu_thread();
+''', '''void start_vu_thread();
+#ifdef __3DS__
+void enable_split_pica(bool enabled);
+void run_pica_thread();
+#endif
+'''),
+    ],
+}
+
+
 def fail(msg):
     print("PATCH NOT APPLIED:", msg)
     raise SystemExit(1)
@@ -3072,7 +3535,7 @@ def fail(msg):
 originals = {}
 texts = {}
 pending = 0
-for key, edits in (*EDITS.items(), *PERF_EDITS.items()):
+for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items()):
     rel = key.split('#')[0]   # the part after # only keeps two lists for one file apart
     if rel in texts:
         t = texts[rel]
@@ -3082,9 +3545,8 @@ for key, edits in (*EDITS.items(), *PERF_EDITS.items()):
                 t = originals[rel] = f.read()
         except OSError:
             fail("cannot read " + rel)
-        # The performance edits can touch text inserted by earlier stages. Unwind
-        # their exact replacements in memory so those stages can still be verified.
-        for old, new in reversed(PERF_EDITS.get(rel, ())):
+        # Unwind the later stages in memory so their inputs can be verified.
+        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()))):
             if t.count(new) == 1:
                 t = t.replace(new, old)
                 pending -= 1

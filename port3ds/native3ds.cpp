@@ -40,66 +40,36 @@ inline u32 word(const u8 *p) {
 template <int Groups, bool HalfX, bool HalfY, bool Average>
 void plane(const u8 *a, const u8 *b, u8 *to, u32 sa, int rows1, int rows2, u32 stride, u32 gap) {
     alignas(16) u8 line[32];
-    u32 last_even[Groups], last_odd[Groups], even[Groups], odd[Groups];
+    u32 last_even[Groups], last_odd[Groups];
     u32 rounding = 0x00020002u;
-    const auto fetch = [&] {
-        if (Groups == 4) {
-            std::memcpy(line, a, 16);
-            std::memcpy(line + 16, b, 16);
-        } else {
-            std::memcpy(line, a, 8);
-            std::memcpy(line + 8, b, 8);
-            std::memcpy(line + 16, line, 16);   // the game rotates these 16 bytes
-        }
-        const u8 *p = line + sa;
-        for (int g = 0; g < Groups; ++g, p += 4) {
-            const u32 w = word(p);
-            u32 x = w & kEven, y = (w >> 8) & kEven;
-            if (HalfX) {
-                const u32 n = word(p + 1);
-                x += n & kEven;
-                y += (n >> 8) & kEven;
-            }
-            even[g] = x;
-            odd[g] = y;
+    const auto copy_line = [&] {
+        constexpr int width = Groups * 4;
+        std::memcpy(line, a, width);
+        std::memcpy(line + width, b, width);
+        if constexpr (Groups == 2)
+            std::memcpy(line + 16, line, 8);   // repeat the first half when the chroma window wraps
+    };
+    const auto samples = [](const u8 *p, u32 &x, u32 &y) {
+        const u32 w = word(p);
+        x = w & kEven;
+        y = (w >> 8) & kEven;
+        if constexpr (HalfX) {
+            const u32 n = word(p + 1);
+#ifdef __arm__
+            __asm__("uxtab16 %0, %0, %2\n\tuxtab16 %1, %1, %2, ror #8"
+                    : "+&r"(x), "+&r"(y) : "r"(n));
+#else
+            x += n & kEven;
+            y += (n >> 8) & kEven;
+#endif
         }
     };
-    const auto emit = [&] {
-        auto *d = reinterpret_cast<u32 *>(to);
-        for (int g = 0; g < Groups; ++g, d += 2) {
-            u32 x = even[g], y = odd[g];
-            if (HalfX && HalfY) {
-                const u32 sx = x, sy = y;
-                x = ((last_even[g] + x + rounding) >> 2) & kEven;
-                y = ((last_odd[g] + y + rounding) >> 2) & kEven;
-                last_even[g] = sx;
-                last_odd[g] = sy;
-            } else if (HalfX || HalfY) {
-                const u32 sx = x, sy = y;
-                x = ((x + (HalfY ? last_even[g] : 0u) + 0x00010001u) >> 1) & kEven;
-                y = ((y + (HalfY ? last_odd[g] : 0u) + 0x00010001u) >> 1) & kEven;
-                if (HalfY) {
-                    last_even[g] = sx;
-                    last_odd[g] = sy;
-                }
-            }
-            u32 n0 = (x & 0xFFFFu) | (y << 16), n1 = (x >> 16) | (y & 0xFFFF0000u);
-            if (Average) {
-                n0 = ((d[0] + n0 + 0x00010001u) >> 1) & kEven;
-                n1 = ((d[1] + n1 + 0x00010001u) >> 1) & kEven;
-            }
-            d[0] = n0;
-            d[1] = n1;
-        }
-        to += stride * 2;
-        if (Groups == 4 && Average) rounding = 0x00010001u;   // the game's routine loses its rounding constant after one row
-    };
-    if (HalfY) {
-        fetch();
-        for (int g = 0; g < Groups; ++g) {
-            last_even[g] = even[g];
-            last_odd[g] = odd[g];
-        }
+    if constexpr (HalfY) {
+        copy_line();
+        for (int g = 0; g < Groups; ++g)
+            samples(line + sa + g * 4, last_even[g], last_odd[g]);
+        a += stride;
+        b += stride;
     }
     for (int pass = 0; pass < 2; ++pass) {
         const int rows = pass ? rows2 : rows1;
@@ -108,16 +78,39 @@ void plane(const u8 *a, const u8 *b, u8 *to, u32 sa, int rows1, int rows2, u32 s
             b += gap;
         }
         for (int i = 0; i < rows; ++i) {
-            if (HalfY) {
-                a += stride;
-                b += stride;
-                fetch();
-            } else {
-                fetch();
-                a += stride;
-                b += stride;
+            copy_line();
+            a += stride;
+            b += stride;
+            const u8 *p = line + sa;
+            auto *d = reinterpret_cast<u32 *>(to);
+            for (int g = 0; g < Groups; ++g, p += 4, d += 2) {
+                u32 x, y;
+                samples(p, x, y);
+                if constexpr (HalfY) {
+                    const u32 prev_x = last_even[g], prev_y = last_odd[g];
+                    last_even[g] = x;
+                    last_odd[g] = y;
+                    if constexpr (HalfX) {
+                        x = ((prev_x + x + rounding) >> 2) & kEven;
+                        y = ((prev_y + y + rounding) >> 2) & kEven;
+                    } else {
+                        x = ((prev_x + x + 0x00010001u) >> 1) & kEven;
+                        y = ((prev_y + y + 0x00010001u) >> 1) & kEven;
+                    }
+                } else if constexpr (HalfX) {
+                    x = ((x + 0x00010001u) >> 1) & kEven;
+                    y = ((y + 0x00010001u) >> 1) & kEven;
+                }
+                u32 n0 = (x & 0xFFFFu) | (y << 16), n1 = (x >> 16) | (y & 0xFFFF0000u);
+                if constexpr (Average) {
+                    n0 = ((d[0] + n0 + 0x00010001u) >> 1) & kEven;
+                    n1 = ((d[1] + n1 + 0x00010001u) >> 1) & kEven;
+                }
+                d[0] = n0;
+                d[1] = n1;
             }
-            emit();
+            to += stride * 2;
+            if constexpr (Groups == 4 && Average) rounding = 0x00010001u;
         }
     }
 }
