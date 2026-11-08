@@ -7,6 +7,7 @@
     python3 p3fes_3ds_link.py draw 1             draws one picture in N; 0 draws what keeps up with the game
     python3 p3fes_3ds_link.py quit               leaves to the Homebrew Menu
     python3 p3fes_3ds_link.py install [file]     replaces the game (default build/3ds/p3fes.3dsx in ../ps2-web-recomp) and restarts it
+                                                 (sent zlib-packed, or plain to a build from before that)
     python3 p3fes_3ds_link.py settings "a;b"     writes args.txt, one setting per ; (an empty string clears it) and restarts
     python3 p3fes_3ds_link.py run                restarts the game
 
@@ -17,6 +18,7 @@ import argparse
 import os
 import socket
 import sys
+import time
 import zlib
 
 PORT = 5577
@@ -57,7 +59,16 @@ class Link:
             size, name = row.split(" ", 1)
             rows.append((int(size), name))
 
-    def put(self, path, data):
+    def put(self, path, data, packed=False):
+        """Send a file. packed sends it zlib-packed, which a game built before PUTZ answers with an error, so then it goes plain."""
+        if packed:
+            payload = zlib.compress(data, 6)
+            reply = self.ask("PUTZ %s %d %08x %d" % (path, len(payload), zlib.crc32(data), len(data)))
+            if reply == "GO":
+                self.sock.sendall(payload)
+                return self.line()
+            if not reply.startswith("ERR unknown"):
+                return reply
         reply = self.ask("PUT %s %d %08x" % (path, len(data), zlib.crc32(data)))
         if reply != "GO":
             return reply
@@ -104,7 +115,7 @@ def main():
     parser.add_argument("values", nargs="*")
     args = parser.parse_args()
     try:
-        link = Link(args.host, args.port, timeout=300 if args.command == "install" else 15)
+        link = Link(args.host, args.port, timeout=60 if args.command == "install" else 15)   # the game drops a link quiet for 20 s
         if args.command == "status":
             print(link.ask("PING"))
         elif args.command == "fetch":
@@ -119,8 +130,9 @@ def main():
             with open(args.values[0] if args.values else default, "rb") as program:
                 data = program.read()
             print("Sending %d bytes" % len(data), flush=True)
-            reply = link.put("/3ds/p3fes.3dsx", data)
-            print(reply)
+            started = time.time()
+            reply = link.put("/3ds/p3fes.3dsx", data, packed=True)
+            print(reply, "(%.0f s)" % (time.time() - started))
             if reply != "OK":
                 return 1
             print(link.ask("RUN"))

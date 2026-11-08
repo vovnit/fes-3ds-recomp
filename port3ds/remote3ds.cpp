@@ -3,6 +3,7 @@
 //   LS <folder>              one "<size> <name>" line per entry, then END
 //   GET <path>               "OK <size>", then the bytes
 //   PUT <path> <size> <crc>  "GO", then the bytes, then "OK" once they are checked and in place
+//   PUTZ <path> <size> <crc> <unpacked size>  the same with zlib-packed bytes; size is packed, the checksum is of the unpacked file
 //   PAD <hex bits> <frames>  hold PS2 pad buttons for that many game frames
 //   SHOTS <n>, DRAW <n>      change the screenshot and picture skipping settings while running
 //   QUIT, RUN                leave to the Homebrew Menu, or leave and start /3ds/p3fes.3dsx again
@@ -28,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 
 namespace remote {
 namespace {
@@ -40,6 +42,13 @@ constexpr std::uint32_t kRetryListening = 120;
 constexpr const char *kProgram = "/3ds/p3fes.3dsx";
 constexpr const char *kSettings = "/p3fes/args.txt";
 constexpr std::uint64_t kMostBytes = 64u << 20;   // more than the code region of a 3DS program
+// A transfer keeps reading or sending for this long each vblank instead of making one call. The socket service hands over a few
+// kilobytes a call, so one call per vblank held uploads to about 225 KB/s.
+constexpr u64 kBusyTicks = CPU_TICKS_PER_MSEC * 10;
+// A connection that goes quiet this long is dropped. When the console's Wi-Fi drops, the other end's close never arrives, and
+// without this the link would keep waiting on that connection and never take a new one.
+constexpr u64 kQuietTransfer = CPU_TICKS_PER_MSEC * 20000;
+constexpr u64 kQuietCommands = CPU_TICKS_PER_MSEC * 120000;
 
 u32 *g_memory = nullptr;
 int g_listener = -1, g_client = -1, g_last_error = 0;
@@ -53,9 +62,17 @@ FILE *g_file = nullptr;
 std::uint64_t g_left = 0;
 char g_target[64], g_partial[72];
 bool g_is_program = false, g_first_block = false;
+bool g_packed = false;   // the bytes arriving are zlib-packed
+z_stream g_zip{};
+char g_unpacked[kChunk];
+// The card writes small pieces slowly: uploads went to it about 5 KB at a time, and writing took 41.7 of 44 seconds.
+char g_write_buffer[0x20000];
+std::uint64_t g_unpacked_left = 0;
 std::uint32_t g_crc = 0, g_wanted_crc = 0;
 std::uint32_t g_crc_table[256];
 std::uint32_t g_ticks = 0;
+u64 g_heard = 0;   // when the client last sent or took bytes
+struct UploadTimes { u64 start, receive, unpack, write, wait; std::uint32_t calls; } g_times{};   // written to log.txt per upload
 volatile std::uint16_t g_buttons = 0;
 volatile std::uint64_t g_buttons_until = 0;
 volatile std::uint32_t g_hold_frames = 0;
@@ -84,8 +101,23 @@ void close_file() {
     g_file = nullptr;
 }
 
-void drop_client() {
+void end_unpacking() {
+    if (g_packed) inflateEnd(&g_zip);
+    g_packed = false;
+}
+
+void log_times(const char *how) {
+    const auto ms = [](u64 ticks) { return static_cast<unsigned long>(ticks / CPU_TICKS_PER_MSEC); };
+    std::fprintf(stderr, "[link] upload %s after %lu ms: receive %lu ms in %lu calls, unpack %lu, write %lu, waiting %lu\n", how,
+                 ms(svcGetSystemTick() - g_times.start), ms(g_times.receive), static_cast<unsigned long>(g_times.calls),
+                 ms(g_times.unpack), ms(g_times.write), ms(g_times.wait));
+}
+
+void drop_client(const char *why = nullptr) {
+    if (why && g_client >= 0) std::fprintf(stderr, "[link] connection dropped: %s\n", why);
+    if (g_receiving) log_times("stopped");
     close_file();
+    end_unpacking();
     if (g_receiving) std::remove(g_partial);
     if (g_client >= 0) close(g_client);
     g_client = -1;
@@ -166,25 +198,46 @@ bool may_put_state(const char *path) {
            !std::strchr(path + kFolder, '/') && !std::strstr(path, "..");
 }
 
-void start_put(const char *path, std::uint64_t size, std::uint32_t crc) {
+void start_put(const char *path, std::uint64_t size, std::uint32_t crc, bool packed = false, std::uint64_t unpacked = 0) {
     g_is_program = !std::strcmp(path, kProgram);
     if (!g_is_program && std::strcmp(path, kSettings) && !may_put_state(path)) return say("ERR not allowed\n");
     if (size > kMostBytes || (g_is_program && size < 4)) return say("ERR wrong size\n");
+    if (packed && (unpacked > kMostBytes || (g_is_program && unpacked < 4))) return say("ERR wrong size\n");
+    if (packed) {
+        g_zip = z_stream{};
+        if (inflateInit(&g_zip) != Z_OK) return say("ERR cannot unpack\n");
+        g_packed = true;
+        g_unpacked_left = unpacked;
+    }
     std::snprintf(g_target, sizeof g_target, "sdmc:%s", path);
     std::snprintf(g_partial, sizeof g_partial, "%s.part", g_target);
     g_file = std::fopen(g_partial, "wb");
-    if (!g_file) return say("ERR cannot write there\n");
+    if (!g_file) {
+        end_unpacking();
+        return say("ERR cannot write there\n");
+    }
+    std::setvbuf(g_file, g_write_buffer, _IOFBF, sizeof g_write_buffer);
     g_left = size;
     g_wanted_crc = crc;
     g_crc = 0;
     g_first_block = true;
     g_receiving = true;
+    g_times = UploadTimes{svcGetSystemTick(), 0, 0, 0, 0, 0};
     say("GO\n");
 }
 
 void finish_put() {
+    const u64 before = svcGetSystemTick();
     close_file();
+    g_times.write += svcGetSystemTick() - before;
+    log_times("done");
     g_receiving = false;
+    const bool whole = !g_packed || (g_zip.avail_in == 0 && g_unpacked_left == 0 && inflate(&g_zip, Z_FINISH) == Z_STREAM_END);
+    end_unpacking();
+    if (!whole) {
+        std::remove(g_partial);
+        return say("ERR the packed file did not unpack to its size, nothing changed\n");
+    }
     if (g_crc != g_wanted_crc) {
         std::remove(g_partial);
         return say("ERR checksum does not match, nothing changed\n");
@@ -197,7 +250,9 @@ void finish_put() {
     } else {
         std::remove(g_target);
     }
-    say(std::rename(g_partial, g_target) == 0 ? "OK\n" : "ERR could not put the file in place\n");
+    const bool placed = std::rename(g_partial, g_target) == 0;
+    std::fprintf(stderr, "[link] %s %s\n", placed ? "wrote" : "could not write", g_target);
+    say(placed ? "OK\n" : "ERR could not put the file in place\n");
 }
 
 void run_command(char *line, std::uint64_t frame) {
@@ -217,12 +272,14 @@ void run_command(char *line, std::uint64_t frame) {
     } else if (!std::strcmp(line, "GET") && rest) {
         if (may_read(rest)) start_get(rest);
         else say("ERR not allowed\n");
-    } else if (!std::strcmp(line, "PUT") && rest) {
+    } else if ((!std::strcmp(line, "PUT") || !std::strcmp(line, "PUTZ")) && rest) {
         char *more = nullptr, *size = std::strchr(rest, ' ');
         if (!size) return say("ERR needs a path, a size and a checksum\n");
         *size++ = 0;
         const std::uint64_t bytes = std::strtoull(size, &more, 10);
-        start_put(rest, bytes, static_cast<std::uint32_t>(std::strtoul(more, nullptr, 16)));
+        const auto crc = static_cast<std::uint32_t>(std::strtoul(more, &more, 16));
+        if (line[3] == 'Z') start_put(rest, bytes, crc, true, std::strtoull(more, nullptr, 10));
+        else start_put(rest, bytes, crc);
     } else if (!std::strcmp(line, "PAD") && rest) {
         char *more = nullptr;
         const auto bits = static_cast<std::uint16_t>(std::strtoul(rest, &more, 16));
@@ -259,32 +316,92 @@ void send_more() {
         }
     }
     const ssize_t sent = send(g_client, g_chunk + g_chunk_at, g_chunk_end - g_chunk_at, 0);
-    if (sent > 0) g_chunk_at += static_cast<std::size_t>(sent);
-    else if (!would_block()) drop_client();
+    if (sent > 0) {
+        g_chunk_at += static_cast<std::size_t>(sent);
+        g_heard = svcGetSystemTick();
+    } else if (!would_block()) {
+        drop_client("send failed");
+    }
+}
+
+// Bytes of the file itself: checked, counted into the checksum and written.
+bool write_plain(const char *data, std::size_t size) {
+    if (!size) return true;
+    if (g_first_block && g_is_program && (size < 4 || std::memcmp(data, "3DSX", 4))) {
+        say("ERR not a 3DSX program, nothing changed\n");
+        drop_client();
+        return false;
+    }
+    g_first_block = false;
+    add_to_crc(data, size);
+    const u64 before = svcGetSystemTick();
+    const bool written = std::fwrite(data, 1, size, g_file) == size;
+    g_times.write += svcGetSystemTick() - before;
+    if (!written) {
+        drop_client();
+        return false;
+    }
+    return true;
+}
+
+// Bytes as they arrive, packed or not. Returns false if the client was dropped.
+bool take(const char *data, std::size_t size) {
+    g_left -= size;
+    if (!g_packed) return write_plain(data, size);
+    g_zip.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(data));
+    g_zip.avail_in = static_cast<uInt>(size);
+    for (;;) {
+        g_zip.next_out = reinterpret_cast<Bytef *>(g_unpacked);
+        g_zip.avail_out = sizeof g_unpacked;
+        const u64 before = svcGetSystemTick();
+        const int status = inflate(&g_zip, Z_NO_FLUSH);
+        g_times.unpack += svcGetSystemTick() - before;
+        const std::size_t made = sizeof g_unpacked - g_zip.avail_out;
+        if ((status != Z_OK && status != Z_STREAM_END && status != Z_BUF_ERROR) || made > g_unpacked_left) {
+            say("ERR the packed file is damaged, nothing changed\n");
+            drop_client();
+            return false;
+        }
+        g_unpacked_left -= made;
+        if (!write_plain(g_unpacked, made)) return false;
+        if (status == Z_STREAM_END || g_zip.avail_out != 0) return true;   // done, or all input used
+    }
 }
 
 void receive_more() {
-    const std::size_t want = g_left < kChunk ? static_cast<std::size_t>(g_left) : kChunk;
-    const ssize_t got = want ? recv(g_client, g_chunk, want, 0) : 0;
-    if (got > 0) {
-        if (g_first_block && g_is_program && (got < 4 || std::memcmp(g_chunk, "3DSX", 4))) {
-            say("ERR not a 3DSX program, nothing changed\n");
-            return drop_client();
+    const u64 until = svcGetSystemTick() + kBusyTicks;
+    while (g_receiving && g_left) {
+        const std::size_t want = g_left < kChunk ? static_cast<std::size_t>(g_left) : kChunk;
+        const u64 before = svcGetSystemTick();
+        const ssize_t got = recv(g_client, g_chunk, want, 0);
+        const u64 after = svcGetSystemTick();
+        g_times.receive += after - before;
+        ++g_times.calls;
+        if (got > 0) {
+            g_heard = after;
+            if (!take(g_chunk, static_cast<std::size_t>(got))) return;
+        } else if (got == 0 || !would_block()) {
+            return drop_client(got == 0 ? "closed during an upload" : "receive failed during an upload");
+        } else if (svcGetSystemTick() < until) {
+            const u64 before = svcGetSystemTick();
+            svcSleepThread(250000);
+            g_times.wait += svcGetSystemTick() - before;
+        } else {
+            break;
         }
-        g_first_block = false;
-        add_to_crc(g_chunk, static_cast<std::size_t>(got));
-        if (std::fwrite(g_chunk, 1, static_cast<std::size_t>(got), g_file) != static_cast<std::size_t>(got)) return drop_client();
-        g_left -= static_cast<std::uint64_t>(got);
-    } else if (want && (got == 0 || !would_block())) {
-        return drop_client();
+        if (svcGetSystemTick() >= until) break;
     }
-    if (!g_left) finish_put();
+    if (g_receiving && !g_left) finish_put();
 }
 
 void read_commands(std::uint64_t frame) {
     const ssize_t got = recv(g_client, g_line + g_line_used, sizeof g_line - 1 - g_line_used, 0);
-    if (got == 0 || (got < 0 && !would_block())) return drop_client();
-    if (got > 0) g_line_used += static_cast<std::size_t>(got);
+    if (got == 0) return drop_client();
+    if (got < 0 && !would_block()) return drop_client("receive failed");
+    if (got > 0) {
+        g_line_used += static_cast<std::size_t>(got);
+        g_heard = svcGetSystemTick();
+    }
     while (g_client >= 0 && !g_sending && !g_receiving) {
         char *end = static_cast<char *>(std::memchr(g_line, '\n', g_line_used));
         if (!end) {
@@ -300,15 +417,9 @@ void read_commands(std::uint64_t frame) {
         run_command(line, frame);
     }
     if (g_receiving && g_line_used) {   // the first bytes of an upload can arrive with the command
-        if (g_is_program && (g_line_used < 4 || std::memcmp(g_line, "3DSX", 4))) {
-            say("ERR not a 3DSX program, nothing changed\n");
-            return drop_client();
-        }
-        g_first_block = false;
-        add_to_crc(g_line, g_line_used);
-        std::fwrite(g_line, 1, g_line_used, g_file);
-        g_left -= g_line_used;
+        const std::size_t size = g_line_used < g_left ? g_line_used : static_cast<std::size_t>(g_left);
         g_line_used = 0;
+        if (!take(g_line, size)) return;
         if (!g_left) finish_put();
     }
 }
@@ -363,9 +474,19 @@ void poll(std::uint64_t frame) {
         sockaddr_in from{};
         socklen_t size = sizeof from;
         g_client = accept(g_listener, reinterpret_cast<sockaddr *>(&from), &size);
-        if (g_client >= 0) fcntl(g_client, F_SETFL, fcntl(g_client, F_GETFL, 0) | O_NONBLOCK);
+        if (g_client >= 0) {
+            fcntl(g_client, F_SETFL, fcntl(g_client, F_GETFL, 0) | O_NONBLOCK);
+            g_heard = svcGetSystemTick();
+        } else if (!would_block()) {   // a Wi-Fi drop can leave the listener dead: open a new one
+            std::fprintf(stderr, "[link] listener failed, errno %d; opening it again\n", errno);
+            close(g_listener);
+            g_listener = -1;
+            g_last_error = 0;
+        }
         return;
     }
+    if (svcGetSystemTick() - g_heard > (g_sending || g_receiving ? kQuietTransfer : kQuietCommands))
+        return drop_client(g_sending || g_receiving ? "transfer stalled" : "idle");
     if (g_sending) send_more();
     else if (g_receiving) receive_more();
     else read_commands(frame);

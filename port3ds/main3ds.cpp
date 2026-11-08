@@ -47,6 +47,7 @@ static_assert(ps2::kRamAddress3ds == OS_HEAP_AREA_BEGIN + (28u << 20), "the PS2 
 
 void register_generated_code();
 void register_generated_vu();
+bool ps2_dump_ee_seen(const char *path);   // from eerecomp; false unless the game code was made with --record-seen
 
 namespace {
 
@@ -506,6 +507,7 @@ void emulate(void *) {
         ps2::boot(entry, {"SLUS_216.21"});
         if (g_state_path.empty() || ps2::load_state(g_state_path)) ps2::run();
         ps2::stop_iop_thread();
+        if (ps2_dump_ee_seen("sdmc:/p3fes/eeseen.bin")) std::fprintf(stderr, "[3ds] wrote sdmc:/p3fes/eeseen.bin\n");
     }
     {
         const struct mallinfo m = mallinfo();

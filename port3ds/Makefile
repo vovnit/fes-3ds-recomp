@@ -3,6 +3,7 @@
 DEVKITPRO ?= /opt/devkitpro
 PREFIX    := $(DEVKITPRO)/devkitARM/bin/arm-none-eabi-
 CTRU      := $(DEVKITPRO)/libctru
+PORTLIBS  := $(DEVKITPRO)/portlibs/3ds
 TOOLS     := $(DEVKITPRO)/tools/bin
 OUT       := /w/build/3ds
 
@@ -56,8 +57,11 @@ $(OUT)/p3fes.3dsx: $(OUT)/p3fes.elf
 	$(TOOLS)/3dsxtool $< $@
 
 $(OUT)/p3fes.elf: $(OBJS) $(CONFIG)
-	$(PREFIX)g++ -specs=3dsx.specs $(ARCH) -Wl,--gc-sections -Wl,-Map,$(OUT)/p3fes.map $(OBJS) -L$(CTRU)/lib -lcitro3d -lctru -lm -o $@
+	$(PREFIX)g++ -specs=3dsx.specs $(ARCH) -Wl,--gc-sections -Wl,-Map,$(OUT)/p3fes.map $(OBJS) -L$(CTRU)/lib -L$(PORTLIBS)/lib -lcitro3d -lctru -lz -lm -o $@
 	$(PREFIX)size $@
+
+# The wireless link unpacks uploads with zlib from the portlibs.
+$(OUT)/obj/p/port3ds/remote3ds.o: CXXFLAGS += -I$(PORTLIBS)/include
 
 # Translated game code: exceptions never pass through it, and leaving them out makes it smaller.
 $(OUT)/obj/w/generated/%.o: /w/generated/%.cpp $(CONFIG)

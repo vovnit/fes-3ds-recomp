@@ -30,6 +30,13 @@ FILES = {
     'recomp/main.cpp': '    std::string elf_path = argv[1], entries_path, out, probes_path, modules_dir, variants_path, vanilla_path;\n        else if (arg == "--probes" && i + 1 < argc) probes_path = argv[++i];\n            generate(translations, options);\n',
     'runtime/include/ps2/vu.hpp': '#include <cstdint>\n\nnamespace ps2::vu {\ninline void add(Vu0Regs &v, unsigned dest, unsigned fd, unsigned fs, unsigned ft) {\ninline void max(Vu0Regs &v, unsigned dest, unsigned fd, unsigned fs, unsigned ft) {\ninline void adda(Vu0Regs &v, unsigned dest, unsigned fs, unsigned ft) {\ninline void opmula(Vu0Regs &v, unsigned fs, unsigned ft) {\n',
 }
+# eerecomp --record-seen and --seen.
+FILES['recomp/main.cpp'] += '    bool stats = false;\n'
+FILES['recomp/codegen.cpp'] += ('    std::string rebase() const { return relocatable_ ? "c.base = B; " : ""; }\n'
+                                '        out_ << "#include \\"units.hpp\\"\\n\\nnamespace gen {\\n\\nusing namespace ps2;\\n\\n";\n'
+                                '        out_ << "void " << unit_name(u) << "(Cpu &c, std::uint32_t entry, std::uint32_t depth) {\\n";\n'
+                                '                out_ << label(a) << ":\\n";\n'
+                                '    write_if_changed(fs::path(options.output) / "units.hpp", header.str());\n')
 # The I/O processor thread edits (PERF_EDITS in the tool) need these lines in the fixture.
 FILES['runtime/include/ps2/system.hpp'] = FILES.get('runtime/include/ps2/system.hpp', "") + 'void sync_iop();\n'
 FILES['runtime/src/system.cpp'] = FILES.get('runtime/src/system.cpp', "") + '    iop::sio2::flush_cards();\n    iop::vblank(true);\n    schedule(hw::kEventVblankEnd + 100, now() + hblank_cycles() * 22u, [] { iop::vblank(false); });\n    if (id == hw::kEventVblankEnd + 100) return [] { iop::vblank(false); };\n    iop::state(s);\nvoid sync_iop() {\n    const std::uint64_t t = now();\n    if (t > g_iop_synced) {\nvoid request_iop_sync() {\n    if (g_cpu.budget > 64) set_budget(g_cpu, 64);\n}\n'

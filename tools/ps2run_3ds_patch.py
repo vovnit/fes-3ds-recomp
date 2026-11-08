@@ -729,6 +729,11 @@ inline void qfsrv(Reg128 &d, const Reg128 &s, const Reg128 &t, std::uint32_t sa)
     # port3ds/native3ds.cpp, on the 3DS only; if that returns false, as it does for anything it does not cover, the game's code runs.
     'recomp/codegen.hpp': [
         ('    std::set<std::uint32_t> probes;\n', '    std::set<std::uint32_t> probes;\n    std::map<std::uint32_t, std::string> natives;   // ps2run_3ds_patch.py\n'),
+        ('    std::map<std::uint32_t, std::string> natives;   // ps2run_3ds_patch.py\n', '''    std::map<std::uint32_t, std::string> natives;   // ps2run_3ds_patch.py
+    bool record_seen = false;   // ps2run_3ds_patch.py: eerecomp --record-seen and --seen
+    std::uint32_t seen_base = 0;
+    std::vector<std::uint8_t> seen;
+'''),
     ],
     'recomp/codegen.cpp': [
         ('''            if (group_start(a)) {
@@ -764,6 +769,80 @@ inline void qfsrv(Reg128 &d, const Reg128 &s, const Reg128 &t, std::uint32_t sa)
                 while (file >> address >> name) options.natives[static_cast<std::uint32_t>(std::stoul(address, nullptr, 16))] = name;
             }
             generate(translations, options);
+'''),
+        ('    bool stats = false;\n', '    bool stats = false, record_seen = false;   // ps2run_3ds_patch.py\n    std::vector<std::string> seen_paths;\n'),
+        ('''        else if (arg == "--natives" && i + 1 < argc) natives_path = argv[++i];
+''', '''        else if (arg == "--natives" && i + 1 < argc) natives_path = argv[++i];
+        else if (arg == "--record-seen") record_seen = true;
+        else if (arg == "--seen" && i + 1 < argc) seen_paths.push_back(argv[++i]);
+'''),
+        ('''            if (!natives_path.empty()) {   // ps2run_3ds_patch.py
+''', '''            options.record_seen = record_seen;   // ps2run_3ds_patch.py
+            for (const std::string &path : seen_paths) {   // each --seen file adds what one recording reached
+                std::ifstream file(path, std::ios::binary);
+                std::uint32_t head[3] = {};
+                if (!file.read(reinterpret_cast<char *>(head), sizeof head) || head[0] != 0x31534545u) throw std::runtime_error("not a recording: " + path);
+                if (!options.seen.empty() && head[1] != options.seen_base) throw std::runtime_error("recorded from another program: " + path);
+                std::vector<std::uint8_t> bytes(head[2]);
+                if (!file.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) throw std::runtime_error("short recording: " + path);
+                options.seen_base = head[1];
+                options.seen.resize(std::max(options.seen.size(), bytes.size()));
+                for (std::size_t k = 0; k < bytes.size(); ++k) options.seen[k] |= bytes[k];
+            }
+            if (!natives_path.empty()) {   // ps2run_3ds_patch.py
+'''),
+    ],
+    # eerecomp --record-seen makes code that sets a byte as each label runs, one byte per 16 bytes of the program, which keeps the
+    # table small enough to fit beside the game. The 3DS port writes those bytes to sdmc:/p3fes/eeseen.bin when a "frames" test
+    # ends. eerecomp --seen FILE (any number of times) then marks every label that no recording reached as cold, and a unit with
+    # none reached as a cold function. GCC moves cold code to the end of each function and makes it smaller, so the code that
+    # runs sits closer together in the instruction cache.
+    'recomp/codegen.cpp#seen': [
+        ('''    std::string rebase() const { return relocatable_ ? "c.base = B; " : ""; }
+''', r'''    std::string rebase() const { return relocatable_ ? "c.base = B; " : ""; }
+    std::string heat(std::uint32_t a) const {   // ps2run_3ds_patch.py
+        if (relocatable_) return "";
+        if (options_.record_seen) return std::format(" g_ee_seen[{}u] = 1;", (a - layout_.origin()) >> 4);
+        const std::uint32_t k = (a - options_.seen_base) >> 4;
+        return k < options_.seen.size() && !options_.seen[k] ? " __attribute__((cold));" : "";
+    }
+    bool unit_ran(std::uint32_t u) const {
+        if (relocatable_ || options_.seen.empty()) return true;
+        for (std::uint32_t a = layout_.base_of(u); a < layout_.base_of(u) + layout_.size(); a += 16)
+            if (const std::uint32_t k = (a - options_.seen_base) >> 4; k >= options_.seen.size() || options_.seen[k]) return true;
+        return false;
+    }
+'''),
+        ('''        out_ << "#include \\"units.hpp\\"\\n\\nnamespace gen {\\n\\nusing namespace ps2;\\n\\n";
+''', r'''        out_ << "#include \"units.hpp\"\n\nnamespace gen {\n\nusing namespace ps2;\n\n";
+        if (options_.record_seen && !relocatable_) out_ << "extern std::uint8_t g_ee_seen[];\n\n";
+'''),
+        ('''        out_ << "void " << unit_name(u) << "(Cpu &c, std::uint32_t entry, std::uint32_t depth) {\\n";
+''', r'''        out_ << (unit_ran(u) ? "" : "__attribute__((cold)) ") << "void " << unit_name(u) << "(Cpu &c, std::uint32_t entry, std::uint32_t depth) {\n";
+'''),
+        ('''                out_ << label(a) << ":\\n";
+''', r'''                out_ << label(a) << ":" << heat(a) << "\n";
+'''),
+        ('''    write_if_changed(fs::path(options.output) / "units.hpp", header.str());
+''', r'''    {   // ps2run_3ds_patch.py: the bytes --record-seen sets, one per 16 bytes of the program, and their writer
+        std::uint32_t base = 0, count = 0;
+        for (const Translation &t : translations)
+            if (!t.relocatable) {
+                base = t.program->base & ~((1u << options.unit_bits) - 1u);
+                count = (t.program->end - base + 15u) >> 4;
+            }
+        table << "\n#include <cstdio>\n\n";
+        if (options.record_seen) table << std::format("namespace gen {{ std::uint8_t g_ee_seen[{}]; }}\n\n", count);
+        table << "bool ps2_dump_ee_seen(const char *path) {\n";
+        if (options.record_seen)
+            table << std::format("    std::FILE *f = std::fopen(path, \"wb\");\n    if (!f) return false;\n"
+                                 "    const std::uint32_t head[3] = {{0x31534545u, {:#x}u, {}u}};\n    std::fwrite(head, 4, 3, f);\n"
+                                 "    std::fwrite(gen::g_ee_seen, 1, sizeof gen::g_ee_seen, f);\n    std::fclose(f);\n    return true;\n", base, count);
+        else
+            table << "    (void)path;\n    return false;\n";
+        table << "}\n";
+    }
+    write_if_changed(fs::path(options.output) / "units.hpp", header.str());
 '''),
     ],
     # Video reads and writes the IPU's registers about 30,000 times per picture.
@@ -3827,6 +3906,56 @@ void transfer_records(const std::uint8_t *payload, std::uint32_t bytes);   // ps
         ('''    std::string o = std::format("void {}(Vu0Regs &r, std::uint8_t *mem) {{\\n''', '''    std::string o = std::format("void {}(Vu0Regs &__restrict r, std::uint8_t *__restrict mem) {{\\n'''),
         ('''        const Upper u = upper(hi, any_status ? true : (any_flags && out_live));
 ''', '''        const Upper u = upper(hi, any_status ? true : (any_flags && out_live && (!g_scalar || flags_seen.count(pc))));
+'''),
+        # The float registers and ACC live in locals, like the integer registers, so GCC can keep them in registers and drop
+        # stores a later instruction overwrites. Every exit goes through one of two labels, where they are written back.
+        ('''        else if (!l.supported) body += std::format("vu::interpret(1, {}u); return; ", pc);
+''', '''        else if (!l.supported) body += std::format("jpc = {}u; goto dispatch; ", pc);
+'''),
+        ('''                o += std::format("    if (ending) {{ r.tpc = {}; return; }}\\n", tpc);
+''', '''                o += std::format("    if (ending) {{ jpc = {}; goto leave; }}\\n", tpc);
+'''),
+        ('''        if (!in.count(next)) o += std::format("    vu::interpret(1, {}u);\\n    return;\\n", next);
+    }
+    o += "dispatch:\\n    vu::interpret(1, jpc);\\n    return;\\n}\\n\\n";
+''', '''        if (!in.count(next)) o += std::format("    jpc = {}u;\\n    goto dispatch;\\n", next);
+    }
+    o += "dispatch:\\n    vu::interpret(1, jpc);\\n    return;\\nleave:\\n    r.tpc = jpc;\\n    return;\\n}\\n\\n";
+'''),
+        ('''    return local_vi(o);
+''', '''    return local_vi(local_vf(o));
+'''),
+        ('''// VU integer ALU instructions whose result a directly following conditional branch does not see yet
+''', '''// Whether the program can change this register: an assignment to it or a lane, or a copy or store into it.
+bool writes_register(const std::string &o, const std::string &name) {
+    for (std::size_t at = o.find(name); at != std::string::npos; at = o.find(name, at + 1)) {
+        const std::string_view before(o.data(), at), after(o.data() + at + name.size());
+        if (before.ends_with("memcpy(&") || before.ends_with("vstore(") || before.ends_with("put(")) return true;
+        const std::size_t lane = after.starts_with(".w[") || after.starts_with(".sw[") ? after.find(']') + 1 : 0;
+        if (after.substr(lane).starts_with(" = ")) return true;
+    }
+    return false;
+}
+
+// The float registers VF1 to VF31 and ACC as locals, and those the program changes written back where it leaves. efu reads its
+// register from r.
+std::string local_vf(std::string o) {
+    std::string declare, sync;
+    for (int n = 0; n < 33; ++n) {
+        const std::string get = n == 32 ? "r.acc" : std::format("r.vf[{}]", n), local = n == 32 ? "acc" : std::format("vf{}", n);
+        if (!n || o.find(get) == std::string::npos) continue;
+        if (writes_register(o, get)) sync += std::format("{} = {}; ", get, local);
+        replace_all(o, get, local);
+        declare += std::format("    Reg128 {} = {};\\n", local, get);
+    }
+    if (declare.empty()) return o;
+    o.insert(o.find("    goto L_"), declare);
+    if (!sync.empty())
+        for (const char *exit : {"vu::interpret(", "r.tpc = ", "efu(r, "}) replace_all(o, exit, sync + exit);
+    return o;
+}
+
+// VU integer ALU instructions whose result a directly following conditional branch does not see yet
 '''),
     ],
     # eerecomp --natives: a name that starts with loop_ goes at the top of a loop, returns nothing and leaves the game's code to carry on.
