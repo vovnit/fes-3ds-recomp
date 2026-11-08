@@ -58,8 +58,18 @@ for rel in ("recomp/vurecomp.cpp", "runtime/include/ps2/fpu.hpp", "runtime/inclu
 for rel, first in (("runtime/src/gs/queue.hpp", 1), ("runtime/src/vif.hpp", 0), ("runtime/src/gs/gif.cpp", 0),
                    ("runtime/src/system.cpp", -1)):
     for old, _ in perf["PERF_EDITS"][rel][first:]:
-        if old not in FILES.get(rel, ""):
+        inserted = any(old in new for edits in perf_inserted.get(rel, ()) for _, new in edits)
+        if old not in FILES.get(rel, "") and not inserted:
             FILES[rel] = FILES.get(rel, "") + old
+FILES["runtime/src/vif.cpp"] += next(old for old, _ in perf["PERF_EDITS"]["runtime/src/vif.cpp"] if "void unpack_fast(" in old)
+for old, _ in perf["PERF_EDITS"]["runtime/src/ipu/ipu.cpp"]:
+    if old.startswith(("    g_in.erase(", "    case kVdec: {")):
+        FILES["runtime/src/ipu/ipu.cpp"] += old
+# The program upload and program cache edits.
+for rel in ("runtime/src/vu_micro.cpp", "runtime/src/vu_micro.hpp"):
+    for old, _ in perf["PERF_EDITS"][rel]:
+        if old not in FILES[rel]:
+            FILES[rel] += old
 FILES["runtime/src/vif.cpp"] = FILES["runtime/src/vif.cpp"].replace('#include "ps2/state.hpp"\n', '#include "ps2/state.hpp"\n#include "ps2/system.hpp"\n', 1)
 FILES["runtime/src/vif.cpp"] = FILES["runtime/src/vif.cpp"].replace(
     'std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {\n    Unit &u = state(unit);\n',

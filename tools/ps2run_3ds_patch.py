@@ -2384,6 +2384,266 @@ inline std::uint32_t sat8(int v) {   // v >> 7, to 0..255
                 }
             }
 '''),
+        ('''inline int clip9(int v) {   // to -256..255
+    int r;
+    __asm__("ssat %0, #9, %1" : "=r"(r) : "r"(v));
+    return r;
+}
+
+''', '''template <unsigned shift>
+inline int clip9(int v) {   // shift, then saturate to -256..255
+    int result;
+    __asm__("ssat %0, #9, %1, asr %2" : "=r"(result) : "r"(v), "I"(shift));
+    return result;
+}
+
+'''),
+        ('''template <bool one_ac>
+inline void idct_column(const int *b, std::int16_t *o, int stride) {
+    int x1 = one_ac ? 0 : b[32] * 256, x2 = one_ac ? 0 : b[48], x3 = one_ac ? 0 : b[16], x4 = b[8];
+    int x5 = one_ac ? 0 : b[56], x6 = one_ac ? 0 : b[40], x7 = one_ac ? 0 : b[24];
+''', '''template <unsigned row_limit>
+inline void idct_column(const int *b, std::int16_t *o, int stride) {
+    int x1 = row_limit > 4 ? b[32] * 256 : 0, x2 = row_limit > 6 ? b[48] : 0, x3 = row_limit > 2 ? b[16] : 0, x4 = b[8];
+    int x5 = row_limit > 7 ? b[56] : 0, x6 = row_limit > 5 ? b[40] : 0, x7 = row_limit > 3 ? b[24] : 0;
+'''),
+        ('''    o[0] = static_cast<std::int16_t>(clip9((x7 + x1) >> 14));
+    o[stride] = static_cast<std::int16_t>(clip9((x3 + x2) >> 14));
+    o[2 * stride] = static_cast<std::int16_t>(clip9((x0 + x4) >> 14));
+    o[3 * stride] = static_cast<std::int16_t>(clip9((x8 + x6) >> 14));
+    o[4 * stride] = static_cast<std::int16_t>(clip9((x8 - x6) >> 14));
+    o[5 * stride] = static_cast<std::int16_t>(clip9((x0 - x4) >> 14));
+    o[6 * stride] = static_cast<std::int16_t>(clip9((x3 - x2) >> 14));
+    o[7 * stride] = static_cast<std::int16_t>(clip9((x7 - x1) >> 14));
+''', '''    o[0] = static_cast<std::int16_t>(clip9<14>(x7 + x1));
+    o[stride] = static_cast<std::int16_t>(clip9<14>(x3 + x2));
+    o[2 * stride] = static_cast<std::int16_t>(clip9<14>(x0 + x4));
+    o[3 * stride] = static_cast<std::int16_t>(clip9<14>(x8 + x6));
+    o[4 * stride] = static_cast<std::int16_t>(clip9<14>(x8 - x6));
+    o[5 * stride] = static_cast<std::int16_t>(clip9<14>(x0 - x4));
+    o[6 * stride] = static_cast<std::int16_t>(clip9<14>(x3 - x2));
+    o[7 * stride] = static_cast<std::int16_t>(clip9<14>(x7 - x1));
+'''),
+        ('''    if (!ac) {
+        const std::int16_t v = static_cast<std::int16_t>(clip9((f[0] + 4) >> 3));
+        for (int y = 0; y < 8; ++y, out += stride)
+            for (int x = 0; x < 8; ++x) out[x] = v;
+        return;
+    }
+    // With no vertical frequencies, the column pass gives the same output on every line.
+    if (rows == 1u) {
+        idct_row(f);
+        std::int16_t line[8];
+        for (int x = 0; x < 8; ++x) line[x] = static_cast<std::int16_t>(clip9((f[x] + 32) >> 6));
+        for (int y = 0; y < 8; ++y, out += stride) std::memcpy(out, line, sizeof line);
+        return;
+    }
+    for (int y = 0; y < 8; ++y)
+        if (rows & (1u << y)) idct_row(f + y * 8);
+    if (rows & ~3u) {
+        for (int x = 0; x < 8; ++x) idct_column<false>(f + x, out + x, stride);
+    } else {
+        for (int x = 0; x < 8; ++x) idct_column<true>(f + x, out + x, stride);
+    }''', '''    if (!ac) {
+        const std::int16_t v = static_cast<std::int16_t>(clip9<3>(f[0] + 4));
+        for (int y = 0; y < 8; ++y, out += stride)
+            for (int x = 0; x < 8; ++x) out[x] = v;
+        return;
+    }
+    // With no vertical frequencies, the column pass gives the same output on every line.
+    if (rows == 1u) {
+        idct_row(f);
+        std::int16_t line[8];
+        for (int x = 0; x < 8; ++x) line[x] = static_cast<std::int16_t>(clip9<6>(f[x] + 32));
+        for (int y = 0; y < 8; ++y, out += stride) std::memcpy(out, line, sizeof line);
+        return;
+    }
+    for (int y = 0; y < 8; ++y)
+        if (rows & (1u << y)) idct_row(f + y * 8);
+    // Select a column transform that omits the absent high vertical frequencies.
+    if (!(rows & ~3u)) {
+        for (int x = 0; x < 8; ++x) idct_column<2>(f + x, out + x, stride);
+    } else if (!(rows & ~7u)) {
+        for (int x = 0; x < 8; ++x) idct_column<3>(f + x, out + x, stride);
+    } else if (!(rows & ~15u)) {
+        for (int x = 0; x < 8; ++x) idct_column<4>(f + x, out + x, stride);
+    } else if (!(rows & ~63u)) {
+        for (int x = 0; x < 8; ++x) idct_column<6>(f + x, out + x, stride);
+    } else {
+        for (int x = 0; x < 8; ++x) idct_column<8>(f + x, out + x, stride);
+    }'''),
+        ('''void convert_fast(const std::uint8_t *raw) {   // 32-bit pixels, no alpha thresholds
+    std::uint32_t pixels[256];
+    const std::uint8_t *cb = raw + 256, *cr = raw + 320;
+    const auto pixel = [](std::uint32_t y, int r, int g, int b) {
+        const int lum = y > 16 ? 149 * static_cast<int>(y - 16) : 0;
+        return sat8(lum + r) | (sat8(lum + g) << 8) | (sat8(lum + b) << 16) | 0x80000000u;
+    };
+    for (int row = 0; row < 8; ++row) {
+        std::uint32_t *top = pixels + row * 32, *bottom = top + 16;
+        const std::uint8_t *y0 = raw + row * 32, *y1 = y0 + 16;
+        for (int x = 0; x < 8; ++x, top += 2, bottom += 2, y0 += 2, y1 += 2) {
+            const int u = *cb++ - 128, v = *cr++ - 128;
+            const int r = 204 * v + 64, g = -50 * u - 104 * v + 64, b = 258 * u + 64;
+            top[0] = pixel(y0[0], r, g, b);
+            top[1] = pixel(y0[1], r, g, b);
+            bottom[0] = pixel(y1[0], r, g, b);
+            bottom[1] = pixel(y1[1], r, g, b);
+        }
+    }
+    const auto *bytes = reinterpret_cast<const std::uint8_t *>(pixels);
+    g_out.insert(g_out.end(), bytes, bytes + sizeof pixels);
+}''', '''struct CscTables {
+    std::uint16_t luma[256];
+    std::uint32_t cb[256], cr[256];
+};
+
+constexpr std::uint32_t csc_pair(int low, int high) {
+    return static_cast<std::uint16_t>(low) | (static_cast<std::uint32_t>(static_cast<std::uint16_t>(high)) << 16);
+}
+
+constexpr auto kCscTables = [] {
+    CscTables t{};
+    for (int i = 0; i < 256; ++i) {
+        const int chroma = i - 128;
+        t.luma[i] = i > 16 ? 149 * (i - 16) : 0;
+        // The blue offset can exceed a signed halfword. Store half the offset.
+        t.cb[i] = csc_pair(129 * chroma + 32, -50 * chroma);
+        t.cr[i] = csc_pair(204 * chroma + 64, -104 * chroma + 64);
+    }
+    return t;
+}();
+
+void convert_fast(const std::uint8_t *raw) {   // 32-bit pixels, no alpha thresholds
+    std::uint32_t pixels[256];
+    const std::uint8_t *cb = raw + 256, *cr = raw + 320;
+    const auto pixel = [](std::uint32_t y, int r, int g, int b) {
+        const int lum = kCscTables.luma[y];
+        return sat8(lum + r) | (sat8(lum + g) << 8) | (sat8(lum + b) << 16) | 0x80000000u;
+    };
+    for (int row = 0; row < 8; ++row) {
+        std::uint32_t *top = pixels + row * 32, *bottom = top + 16;
+        const std::uint8_t *y0 = raw + row * 32, *y1 = y0 + 16;
+        for (int x = 0; x < 8; ++x, top += 2, bottom += 2, y0 += 2, y1 += 2) {
+            const std::uint32_t u = kCscTables.cb[*cb++], v = kCscTables.cr[*cr++];
+            const int r = static_cast<std::int16_t>(v), b = 2 * static_cast<std::int16_t>(u);
+            const int g = (static_cast<std::int32_t>(u) >> 16) + (static_cast<std::int32_t>(v) >> 16);
+            top[0] = pixel(y0[0], r, g, b);
+            top[1] = pixel(y0[1], r, g, b);
+            bottom[0] = pixel(y1[0], r, g, b);
+            bottom[1] = pixel(y1[1], r, g, b);
+        }
+    }
+    const auto *bytes = reinterpret_cast<const std::uint8_t *>(pixels);
+    g_out.insert(g_out.end(), bytes, bytes + sizeof pixels);
+}'''),
+        ('''#ifdef __3DS__
+    if (byte + 8 <= g_in.size()) {
+''', '''#ifdef __3DS__
+    // A read of up to 32 bits spans at most five bytes at any bit offset.
+    if (byte + 5 <= g_in.size() && n <= 32) {
+        const auto *p = g_in.data() + byte;
+        const unsigned offset = bit & 7u;
+        std::uint32_t word;
+        std::memcpy(&word, p, 4);
+        const std::uint32_t shifted = (__builtin_bswap32(word) << offset) | (std::uint32_t{p[4]} >> (8 - offset));
+        return shifted >> (32 - n);
+    }
+    if (byte + 8 <= g_in.size()) {
+'''),
+        ('''    g_in.erase(g_in.begin(), g_in.begin() + static_cast<std::ptrdiff_t>(drop));
+''', '''    if (!drop) return;
+    g_in.erase(g_in.begin(), g_in.begin() + static_cast<std::ptrdiff_t>(drop));
+'''),
+        ('''    case kVdec: {
+        const bool ok = atomic([&] {
+            skip(cmd & 0x3Fu);
+            const Lookup *table = nullptr;
+            switch ((cmd >> 26) & 3u) {
+            case 0: table = &tables().mbai; break;
+            case 1:
+                switch (picture_type()) {
+                case 1: table = &tables().mb_i; break;
+                case 2: table = &tables().mb_p; break;
+                case 3: table = &tables().mb_b; break;
+                default: throw BadCode{};
+                }
+                break;
+            case 2: table = &tables().motion; break;
+            default: table = &tables().dmv; break;
+            }
+            g_result = decode(*table);
+        });
+        if (ok) commit();
+        return ok;
+    }
+    case kFdec: {
+        const bool ok = atomic([&] {
+            skip(cmd & 0x3Fu);
+            g_result = peek(32);
+        });
+        if (ok) commit();
+        return ok;
+    }
+''', '''    case kVdec: {
+        const auto select_table = [&]() -> const Lookup * {
+            switch ((cmd >> 26) & 3u) {
+            case 0: return &tables().mbai;
+            case 1:
+                switch (picture_type()) {
+                case 1: return &tables().mb_i;
+                case 2: return &tables().mb_p;
+                case 3: return &tables().mb_b;
+                default: return nullptr;
+                }
+            case 2: return &tables().motion;
+            default: return &tables().dmv;
+            }
+        };
+#ifdef __3DS__
+        // Buffered commands need no DMA refill or rollback.
+        const std::size_t at = g_bit + (cmd & 0x3Fu);
+        const Lookup *cached = select_table();
+        if (cached && cached->bits <= 25 && (at >> 3) + 4 <= g_in.size()) {
+            std::uint32_t word;
+            std::memcpy(&word, g_in.data() + (at >> 3), 4);
+            const auto code = (__builtin_bswap32(word) << (at & 7u)) >> (32 - cached->bits);
+            const Entry &entry = cached->entries[code];
+            if (entry.length) {
+                g_result = entry.value;
+                g_bit = at + entry.length;
+                commit();
+                return true;
+            }
+        }
+#endif
+        const bool ok = atomic([&] {
+            skip(cmd & 0x3Fu);
+            const Lookup *table = select_table();
+            if (!table) throw BadCode{};
+            g_result = decode(*table);
+        });
+        if (ok) commit();
+        return ok;
+    }
+    case kFdec: {
+#ifdef __3DS__
+        const std::size_t at = g_bit + (cmd & 0x3Fu);
+        if (g_in.size() * 8 >= at + 32) {
+            g_result = bits_at(at, 32);
+            g_bit = at;
+            commit();
+            return true;
+        }
+#endif
+        const bool ok = atomic([&] {
+            skip(cmd & 0x3Fu);
+            g_result = peek(32);
+        });
+        if (ok) commit();
+        return ok;
+    }
+'''),
     ],
     # The I/O processor code tools/p3fes_iopgen.py translated. Build with PS2_IOP_BLOCKS if it is there, which the Makefile sees to;
     # blocks are checked against what is in memory whenever that changes, so anything else stays with the interpreter.
@@ -2629,6 +2889,75 @@ void pump() {
 '''),
     ],
     'runtime/src/gs/gs.cpp': [
+        ('''void packed_run(const std::uint8_t *kinds, std::uint32_t nreg, std::uint32_t loops, const std::uint8_t *data) {
+    using word = std::uint32_t __attribute__((may_alias, aligned(4)));
+    State &s = g_state;
+    const word *q = reinterpret_cast<const word *>(data);
+    for (; loops; --loops) {
+        for (std::uint32_t r = 0; r < nreg; ++r, q += 4) {
+            switch (kinds[r]) {
+            case 1: {
+                std::uint32_t qbits;
+                std::memcpy(&qbits, &s.q, 4);
+                s.rgbaq = (q[0] & 0xFFu) | ((q[1] & 0xFFu) << 8) | ((q[2] & 0xFFu) << 16) | ((q[3] & 0xFFu) << 24) | (static_cast<std::uint64_t>(qbits) << 32);
+                break;
+            }
+            case 2:
+                s.st = q[0] | (static_cast<std::uint64_t>(q[1]) << 32);
+                std::memcpy(&s.q, const_cast<const word *>(q + 2), 4);
+                break;
+            case 3: s.uv = (q[0] & 0x3FFFu) | ((q[1] & 0x3FFFu) << 16); break;
+            case 4: vertex(q[0] & 0xFFFFu, q[1] & 0xFFFFu, (q[2] >> 4) & 0xFFFFFFu, static_cast<std::uint8_t>(q[3] >> 4), !((q[3] >> 15) & 1u)); break;
+            default: vertex(q[0] & 0xFFFFu, q[1] & 0xFFFFu, q[2], static_cast<std::uint8_t>(s.fog >> 56), !((q[3] >> 15) & 1u)); break;
+            }
+        }
+    }
+}
+''', '''using PackedWord = std::uint32_t __attribute__((may_alias, aligned(4)));
+
+static inline void packed_stq(State &s, const PackedWord *q) {
+    s.st = q[0] | (static_cast<std::uint64_t>(q[1]) << 32);
+    std::memcpy(&s.q, q + 2, 4);
+}
+
+static inline void packed_rgbaq(State &s, const PackedWord *q, std::uint32_t qbits) {
+    s.rgbaq = (q[0] & 0xFFu) | ((q[1] & 0xFFu) << 8) | ((q[2] & 0xFFu) << 16) | ((q[3] & 0xFFu) << 24) | (static_cast<std::uint64_t>(qbits) << 32);
+}
+
+static inline void packed_xyzf(const PackedWord *q) {
+    vertex(q[0] & 0xFFFFu, q[1] & 0xFFFFu, (q[2] >> 4) & 0xFFFFFFu, static_cast<std::uint8_t>(q[3] >> 4), !((q[3] >> 15) & 1u));
+}
+
+void packed_run(const std::uint8_t *kinds, std::uint32_t nreg, std::uint32_t loops, const std::uint8_t *data) {
+    State &s = g_state;
+    const PackedWord *q = reinterpret_cast<const PackedWord *>(data);
+    // The game's 3D draws send STQ, RGBA and XYZF for each vertex.
+    if (nreg == 3 && kinds[0] == 2 && kinds[1] == 1 && kinds[2] == 4) {
+        for (; loops; --loops, q += 12) {
+            packed_stq(s, q);
+            packed_rgbaq(s, q + 4, q[2]);
+            packed_xyzf(q + 8);
+        }
+        return;
+    }
+    for (; loops; --loops) {
+        for (std::uint32_t r = 0; r < nreg; ++r, q += 4) {
+            switch (kinds[r]) {
+            case 1: {
+                std::uint32_t qbits;
+                std::memcpy(&qbits, &s.q, 4);
+                packed_rgbaq(s, q, qbits);
+                break;
+            }
+            case 2: packed_stq(s, q); break;
+            case 3: s.uv = (q[0] & 0x3FFFu) | ((q[1] & 0x3FFFu) << 16); break;
+            case 4: packed_xyzf(q); break;
+            default: vertex(q[0] & 0xFFFFu, q[1] & 0xFFFFu, q[2], static_cast<std::uint8_t>(s.fog >> 56), !((q[3] >> 15) & 1u)); break;
+            }
+        }
+    }
+}
+'''),
         ('''std::uint32_t g_setup_generation = 0;
 ''', '''std::uint32_t g_setup_generation = 0;
 #ifdef PS2_PICA
@@ -2918,6 +3247,111 @@ bool Ring::peek(Header &header, const std::uint8_t *&payload) {
 '''),
     ],
     'runtime/src/vif.cpp': [
+        ('''template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
+void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
+    std::uint32_t cycle = 0;
+    const bool keep_zw = v2_keep(), zero_zw = v2_zero();
+    for (std::uint32_t n = 0; n < num; ++n) {
+        std::uint32_t value[4];
+        for (std::uint32_t j = 0; j < Components; ++j) {
+            const std::size_t at = static_cast<std::size_t>(n) * Components + j;
+            if constexpr (Bits == 32) {
+                std::memcpy(&value[j], bytes + at * 4, 4);
+            } else if constexpr (Bits == 16) {
+                std::uint16_t h;
+                std::memcpy(&h, bytes + at * 2, 2);
+                value[j] = Usn ? h : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(h)));
+            } else {
+                value[j] = Usn ? bytes[at] : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(bytes[at])));
+            }
+        }
+        if constexpr (Components == 1) {
+            value[1] = value[2] = value[3] = value[0];
+        } else if constexpr (Components == 2) {
+            if (keep_zw) {
+                std::uint32_t old[4];
+                std::memcpy(old, mem + (addr & mask) * 16, 16);
+                value[2] = old[2];
+                value[3] = old[3];
+            } else if (zero_zw) {
+                value[2] = value[3] = 0;
+            } else {
+                value[2] = value[0];
+                value[3] = value[1];
+            }
+        } else if constexpr (Components == 3) {
+            value[3] = 0;
+        }
+        std::memcpy(mem + (addr & mask) * 16, value, 16);
+        ++addr;
+        if (++cycle >= wl) {
+            addr += skip;
+            cycle = 0;
+        }
+    }
+}
+
+''', '''template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
+__attribute__((always_inline)) inline void unpack_vector(std::uint8_t *dst, const std::uint8_t *src, bool keep_zw, bool zero_zw) {
+    std::uint32_t value[4];
+    for (std::uint32_t j = 0; j < Components; ++j) {
+        if constexpr (Bits == 32) {
+            std::memcpy(&value[j], src + j * 4, 4);
+        } else if constexpr (Bits == 16) {
+            std::uint16_t h;
+            std::memcpy(&h, src + j * 2, 2);
+            value[j] = Usn ? h : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(h)));
+        } else {
+            value[j] = Usn ? src[j] : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(src[j])));
+        }
+    }
+    if constexpr (Components == 1) {
+        value[1] = value[2] = value[3] = value[0];
+    } else if constexpr (Components == 2) {
+        if (keep_zw) {
+            std::uint32_t old[4];
+            std::memcpy(old, dst, 16);
+            value[2] = old[2];
+            value[3] = old[3];
+        } else if (zero_zw) {
+            value[2] = value[3] = 0;
+        } else {
+            value[2] = value[0];
+            value[3] = value[1];
+        }
+    } else if constexpr (Components == 3) {
+        value[3] = 0;
+    }
+    std::memcpy(dst, value, 16);
+}
+
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
+void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
+    std::uint32_t cycle = 0;
+    const bool keep_zw = v2_keep(), zero_zw = v2_zero();
+#ifdef PS2_PICA
+    // A regular stride inside VU memory needs neither cycle tracking nor address wrapping.
+    if (wl <= 1 || skip == 0) {
+        const std::uint32_t step = 1 + skip;
+        addr &= mask;
+        if ((num - 1) * step <= mask - addr) {
+            for (std::uint32_t n = 0; n < num; ++n, addr += step, bytes += Components * (Bits / 8))
+                unpack_vector<Bits, Components, Usn>(mem + addr * 16, bytes, keep_zw, zero_zw);
+            return;
+        }
+    }
+#endif
+    for (std::uint32_t n = 0; n < num; ++n) {
+        unpack_vector<Bits, Components, Usn>(mem + (addr & mask) * 16, bytes + n * Components * (Bits / 8), keep_zw, zero_zw);
+        ++addr;
+        if (++cycle >= wl) {
+            addr += skip;
+            cycle = 0;
+        }
+    }
+}
+
+'''),
         ('''void run_vu(int unit, std::uint32_t address, bool resume = false) {
     Unit &u = state(unit);
 ''', '''void run_vu(int unit, Unit &u, bool is_shadow, std::uint32_t address, bool resume = false) {
@@ -3299,6 +3733,16 @@ void process(int unit, Unit &u, bool from_vu, bool is_shadow) {'''),
     Unit &u = g_vu_side;
     if (run_transfer(1, u, true, false, words, count)) return;
 '''),
+        ('''        if (at_first + count * 8u <= size && std::memcmp(code + at_first, data, count * 8u) == 0) break;   // the usual case
+''', '''        if (at_first + count * 8u <= size) {
+            if (std::memcmp(code + at_first, data, count * 8u) == 0) break;
+            // This game swaps programs in and out many times a picture. A block that does not wrap is copied in one piece, and the
+            // program cache is told which part changed.
+            std::memcpy(code + at_first, data, count * 8u);
+            vu::code_changed(unit, at_first, count * 8u);
+            break;
+        }
+'''),
     ],
     # Faster vector programs: the compiler is told VU memory and the registers do not overlap, flags nobody can see are not worked
     # out, and conversions and comparisons use the FPU instead of taking floats apart in integer registers.
@@ -3309,6 +3753,23 @@ void transfer_records(const std::uint8_t *payload, std::uint32_t bytes);   // ps
 '''),
     ],
     'runtime/src/gs/gif.cpp': [
+        ('''            if (g_fast[sink.path].on && p.reg == 0) {
+''', '''            // A+D tags with one register contain only direct GS writes.
+            if (!g_fast[sink.path].on && p.nreg == 1 && (p.regs & 15u) == 0xEu) {
+                const std::uint32_t loops = std::min(qwc - i, p.nloop - p.loop);
+                const auto *at = data + static_cast<std::size_t>(i) * 16;
+                for (std::uint32_t r = 0; r < loops; ++r, at += 16) {
+                    std::uint64_t value;
+                    std::memcpy(&value, at, sizeof value);
+                    sink.reglist(at[8], value);
+                }
+                i += loops - 1;
+                p.loop += loops;
+                if (p.loop == p.nloop) p.active = false;
+                break;
+            }
+            if (g_fast[sink.path].on && p.reg == 0) {
+'''),
         ('''#include "ps2/state.hpp"
 ''', '''#include "ps2/memory.hpp"
 #include "ps2/state.hpp"
@@ -3402,12 +3863,105 @@ inline std::uint32_t from_fixed'''),
         ('''inline std::uint32_t max(std::uint32_t a, std::uint32_t b) { return key(a) >= key(b) ? a : b; }
 inline std::uint32_t min(std::uint32_t a, std::uint32_t b) { return key(a) <= key(b) ? a : b; }
 ''', '''#ifdef PS2_VU_FAST
-inline std::uint32_t max(std::uint32_t a, std::uint32_t b) { return to_float(a) >= to_float(b) ? a : b; }
-inline std::uint32_t min(std::uint32_t a, std::uint32_t b) { return to_float(a) <= to_float(b) ? a : b; }
+// The bits put in integer order, so a comparison needs no float compare, which stalls the FPU. Only denormals and the two zeros can
+// come out differently from comparing them as floats.
+inline std::int32_t order(std::uint32_t x) {
+    return static_cast<std::int32_t>(x ^ (static_cast<std::uint32_t>(static_cast<std::int32_t>(x) >> 31) >> 1));
+}
+inline std::uint32_t max(std::uint32_t a, std::uint32_t b) { return order(a) >= order(b) ? a : b; }
+inline std::uint32_t min(std::uint32_t a, std::uint32_t b) { return order(a) <= order(b) ? a : b; }
 #else
 inline std::uint32_t max(std::uint32_t a, std::uint32_t b) { return key(a) >= key(b) ? a : b; }
 inline std::uint32_t min(std::uint32_t a, std::uint32_t b) { return key(a) <= key(b) ? a : b; }
 #endif
+'''),
+    ],
+    # A program upload marks only the 256-byte pages it changed, so the programs looked up elsewhere in VU memory stay cached.
+    'runtime/src/vu_micro.hpp': [
+        ('''void code_changed(int unit);
+''', '''void code_changed(int unit);
+void code_changed(int unit, std::uint32_t first, std::uint32_t bytes);   // ps2run_3ds_patch.py: only these bytes of code changed
+'''),
+    ],
+    'runtime/src/vu_micro.cpp': [
+        ('''struct Candidate {
+    std::vector<std::uint32_t> runs;
+    std::vector<std::uint8_t> code;
+''', '''struct Candidate {
+    std::vector<std::uint32_t> runs;
+    std::vector<std::uint8_t> code;
+    std::uint64_t pages = 0;   // the 256-byte pages of VU1 code the runs cover
+'''),
+        ('''    std::vector<Candidate> candidates;
+    std::uint32_t next = 0;
+};
+''', '''    std::vector<Candidate> candidates;
+    std::uint32_t next = 0;
+    std::uint64_t pages = 0;   // the pages the cached answer depends on
+};
+'''),
+        ('''        c.code.insert(c.code.end(), g_vu1_code + pc, g_vu1_code + pc + 8);
+''', '''        c.code.insert(c.code.end(), g_vu1_code + pc, g_vu1_code + pc + 8);
+        c.pages |= std::uint64_t{1} << ((pc >> 8) & 63u);
+'''),
+        ('''void code_changed(int unit) {
+    g_scan[unit & 1] = true;
+    ++g_generation[unit & 1];
+}
+''', '''// The generation at which each 256-byte page of VU1 code last changed. A cached program none of whose pages changed since it was
+// looked up is still the right one, whatever was uploaded elsewhere.
+std::uint32_t g_page_changed[64] = {};
+
+void code_changed(int unit) {
+    g_scan[unit & 1] = true;
+    ++g_generation[unit & 1];
+    if (unit & 1)
+        for (std::uint32_t &page : g_page_changed) page = g_generation[1];
+}
+
+void code_changed(int unit, std::uint32_t first, std::uint32_t bytes) {
+    if (!(unit & 1) || !bytes || first + bytes > 16384u) {
+        code_changed(unit);
+        return;
+    }
+    g_scan[1] = true;
+    ++g_generation[1];
+    for (std::uint32_t page = first >> 8; page <= (first + bytes - 1) >> 8; ++page) g_page_changed[page] = g_generation[1];
+}
+'''),
+        ('''    if (e.generation == g_generation[1]) return e.function;
+    e.generation = g_generation[1];
+    for (const Candidate &c : e.candidates)
+        if (candidate_matches(c)) {
+            e.function = c.function;
+            e.jit = c.jit;
+            return e.function;
+        }
+''', '''    if (e.generation == g_generation[1]) return e.function;
+    if (e.pages) {
+        bool stale = false;
+        for (std::uint64_t m = e.pages; m && !stale; m &= m - 1) stale = g_page_changed[__builtin_ctzll(m)] > e.generation;
+        if (!stale) {
+            e.generation = g_generation[1];
+            return e.function;
+        }
+    }
+    e.generation = g_generation[1];
+    for (const Candidate &c : e.candidates)
+        if (candidate_matches(c)) {
+            e.function = c.function;
+            e.jit = c.jit;
+            e.pages = c.pages;
+            return e.function;
+        }
+'''),
+        ('''    Candidate c = make_candidate(pcs);
+    c.function = e.function;
+    c.jit = e.jit;
+''', '''    Candidate c = make_candidate(pcs);
+    c.function = e.function;
+    c.jit = e.jit;
+    e.pages = c.pages;
 '''),
     ],
 }
