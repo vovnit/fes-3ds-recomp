@@ -40,7 +40,7 @@ endif
 HOST      := /p/port3ds/main3ds.cpp /p/port3ds/pica.cpp /p/port3ds/native3ds.cpp /p/port3ds/memcpy3ds.cpp /p/port3ds/remote3ds.cpp /p/port3ds/iop3ds.cpp
 OBJS      := $(patsubst /%.cpp,$(OUT)/obj/%.o,$(RUNTIME) $(GAME) $(HOST)) $(OUT)/shader/gs_v_shbin.o
 CONFIG    := $(OUT)/build-config
-CONFIG_FLAGS = $(CXXFLAGS) VUOPT=$(VUOPT)
+CONFIG_FLAGS = $(CXXFLAGS) VUOPT=$(VUOPT) GAMEOPT=$(GAMEOPT)
 
 all: $(OUT)/p3fes.3dsx
 
@@ -64,9 +64,11 @@ $(OUT)/p3fes.elf: $(OBJS) $(CONFIG)
 $(OUT)/obj/p/port3ds/remote3ds.o: CXXFLAGS += -I$(PORTLIBS)/include
 
 # Translated game code: exceptions never pass through it, and leaving them out makes it smaller.
+# GAMEOPT adds flags for the translated EE code alone (generated/p3fes/unit_*), for experiments such as -mthumb.
+GAMEOPT   ?=
 $(OUT)/obj/w/generated/%.o: /w/generated/%.cpp $(CONFIG)
 	@mkdir -p $(dir $@)
-	$(PREFIX)g++ $(CXXFLAGS) -DPS2_VU_FAST -fno-exceptions -fno-rtti -I/w/generated/p3fes -Wno-unused-label -Wno-unused-variable -c $< -o $@
+	$(PREFIX)g++ $(CXXFLAGS) $(if $(findstring /p3fes/unit_,$<),$(GAMEOPT)) -DPS2_VU_FAST -fno-exceptions -fno-rtti -I/w/generated/p3fes -Wno-unused-label -Wno-unused-variable -c $< -o $@
 
 # Vector programs copy registers with "add 0", which is a real addition unless the sign of zero can be ignored.
 # Loop peeling reduces repeated work in the compiled vector loops. VUOPT changes the flags for those programs alone.

@@ -245,6 +245,46 @@ void decode(Texture &e, const State &st, std::uint32_t cpsm, std::uint32_t csa, 
     const bool clut16 = !(cpsm == PSMCT32 || cpsm == PSMCT24);
     auto *out = static_cast<std::uint32_t *>(e.tex.data);
     const std::uint32_t *clut = st.clut;
+    if ((psm == PSMCT32 || psm == PSMCT24) && e.half <= 1 && (w << e.half) == gw && (h << e.half) == gh) {
+        // A 32-bit texture whose size (halved or not) fills its GS area: each 8x8 tile reads one GS page, at offsets that depend only
+        // on where the tile sits in the page. The per-texel path costs two software divisions and a call per texel, which made a
+        // movie picture take 34 ms.
+        static std::uint16_t offsets[2][32][64];
+        static bool made = false;
+        if (!made) {
+            static const std::uint8_t kBlock[4][8] = {{0, 1, 4, 5, 16, 17, 20, 21}, {2, 3, 6, 7, 18, 19, 22, 23},
+                                                      {8, 9, 12, 13, 24, 25, 28, 29}, {10, 11, 14, 15, 26, 27, 30, 31}};
+            static const std::uint8_t kColumn[2][8] = {{0, 1, 4, 5, 8, 9, 12, 13}, {2, 3, 6, 7, 10, 11, 14, 15}};
+            for (int half = 0; half < 2; ++half)
+                for (int pos = 0; pos < 32; ++pos)
+                    for (int i = 0; i < 64; ++i) {
+                        const int x = ((pos & 7) * 8 + g_morton_x[i]) << half, y = ((pos >> 3) * 8 + g_morton_y[i]) << half;
+                        offsets[half][pos][i] = (x < 64 && y < 32)
+                            ? static_cast<std::uint16_t>(kBlock[y / 8][x / 8] * 256 + ((y & 7) / 2) * 64 + kColumn[y & 1][x & 7] * 4) : 0;
+                    }
+            made = true;
+        }
+        const std::uint8_t *mem = memory();
+        const std::uint32_t per_row = bw ? bw : 1u, alpha = ta0 << 24, mask = kMemorySize - 1u, sh = e.half;
+        for (int ty = 0; ty < h; ty += 8) {
+            const std::uint32_t sy = static_cast<std::uint32_t>(ty) << sh;
+            const std::uint32_t row_page = bp * 256u + (sy / 32u) * per_row * 8192u;
+            for (int tx = 0; tx < w; tx += 8) {
+                const std::uint32_t sx = static_cast<std::uint32_t>(tx) << sh, page = row_page + (sx / 64u) * 8192u;
+                const std::uint16_t *at = offsets[sh][((sy & 31u) >> sh) + ((sx & 63u) >> (3u + sh))];
+                std::uint32_t *tile = out + (ty * w + tx * 8);
+                for (int i = 0; i < 64; ++i) {
+                    std::uint32_t raw;
+                    std::memcpy(&raw, mem + ((page + at[i]) & mask), 4);
+                    if (psm == PSMCT24) {
+                        raw &= 0xFFFFFFu;
+                        raw |= (aem && !raw) ? 0u : alpha;
+                    }
+                    tile[i] = to_gpu(raw);
+                }
+            }
+        }
+    } else
     for (int ty = 0; ty < h; ty += 8) {
         for (int tx = 0; tx < w; tx += 8) {
             std::uint32_t *tile = out + (ty * w + tx * 8);
