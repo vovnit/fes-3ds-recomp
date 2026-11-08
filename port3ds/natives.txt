@@ -23,4 +23,6 @@
 004FE750 avg_luma_xy
 004FE870 avg_chroma_xy
 00521250 memcpy
+0053A410 adx_frames
+0053A9B8 adx_stereo
 00578160 find_code

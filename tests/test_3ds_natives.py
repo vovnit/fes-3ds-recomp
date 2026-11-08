@@ -13,6 +13,6 @@ with open(os.path.join(folder, "native3ds.cpp")) as f:
 defined = set(re.findall(r"^(?:bool|void) native_(\w+)\(Cpu &c\)", source, re.M)) | set(re.findall(r"^MOTION\((\w+),", source, re.M))
 missing = [n for _, n in listed if n not in defined]
 assert not missing, missing
-unused = defined - {n for _, n in listed}
+unused = {n for n in defined - {n for _, n in listed} if not n.endswith("_check")}   # check hooks are listed only for a check build
 assert not unused, unused
 print("ok   every native function in natives.txt exists, and every one that exists is listed")

@@ -3,6 +3,10 @@
 // generated code declares them where it calls them. Each returns false for anything it does not cover, and the game's code runs.
 // The video routines were compared with the game's own code on every call for about 2,000 frames of the opening movie.
 #include "ps2/generated.hpp"
+#ifdef PS2_CHECK_NATIVES
+#include "ps2/system.hpp"
+#include <cstdio>
+#endif
 
 #include <bit>
 #include <cstring>
@@ -558,5 +562,229 @@ void native_loop_copy_pairs(Cpu &c) {
     set32(c.r[6], from_at + bytes);
     c.budget -= static_cast<std::int32_t>(count - 1) * 9;
 }
+
+// CRI ADX sound with its key stream, decoded on the game core whenever music or voices play: 1.5 to 6% of the game's code. Each
+// 18-byte frame is a big-endian scale, mixed with the key, and 16 bytes of two 4-bit samples each, predicted from the last two.
+// A scale with the top bit set ends the data and leaves the history as it was. The game's instruction counts are charged as they
+// would have run; a clamped sample costs 3 more.
+namespace {
+
+using s16 = std::int16_t;
+using s32 = std::int32_t;
+
+inline s32 half16(const u8 *p) {
+    s16 v;
+    std::memcpy(&v, p, 2);
+    return v;
+}
+
+inline void put16(u8 *p, s32 v) {
+    p[0] = static_cast<u8>(v);
+    p[1] = static_cast<u8>(v >> 8);
+}
+
+inline bool apart(u32 a, u32 n, u32 b, u32 m) { return a + n <= b || b + m <= a; }
+
+struct Adx {
+    s32 coef1, coef2, multiplier, increment, table[16];
+    // The frame's scale from its first two bytes and the key, which moves on, or -1 at the end of the data.
+    s32 scale(const u8 *frame, u32 &key) const {
+        const s32 word = static_cast<s16>((frame[0] << 8) | frame[1]);
+        if (word & 0x8000) return -1;
+        const s32 scale = static_cast<s32>((static_cast<u32>(word) ^ key) & 0x1FFFu) + 1;
+        key = (static_cast<u32>(static_cast<s32>(key) * multiplier) + static_cast<u32>(increment)) & 0x7FFFu;
+        return scale;
+    }
+    s32 clamp(s32 v, s32 &spent) const {
+        if (static_cast<u32>(v + 0x8000) <= 0xFFFFu) return v;
+        spent += 3;
+        return v > 0x7FFF ? 0x7FFF : -0x8000;
+    }
+    s32 predict(s32 h1, s32 h2) const { return static_cast<s32>(static_cast<u32>(coef1 * h1) + static_cast<u32>(coef2 * h2)) >> 12; }
+    // 32 samples from the 16 bytes after the scale, h1 the last sample and h2 the one before.
+    void frame(const u8 *in, s32 scale, s32 &h1, s32 &h2, u8 *out, s32 &spent) const {
+        for (int i = 0; i < 16; ++i) {
+            const u8 b = in[i];
+            const s32 a = clamp(static_cast<s32>(static_cast<u32>(predict(h1, h2)) + static_cast<u32>((static_cast<std::int8_t>(b) >> 4) * scale)), spent);
+            const s32 z = clamp(static_cast<s32>(static_cast<u32>(predict(a, h1)) + static_cast<u32>(table[b & 15] * scale)), spent);
+            put16(out + i * 4, a);
+            put16(out + i * 4 + 2, z);
+            h2 = a;
+            h1 = z;
+        }
+    }
+};
+
+// The two-sample history of a channel, last sample first.
+struct History {
+    s32 h1, h2;
+    explicit History(const u8 *p) : h1(half16(p)), h2(half16(p + 2)) {}
+    void put(u8 *p) const { put16(p, h1), put16(p + 2, h2); }
+};
+
+const u8 *adx_table() { return range(0x007C1A40u, 64); }
+
+#ifdef PS2_CHECK_NATIVES
+// What the game's code should leave, worked out by the native, which then lets the game's code run; the check at the function's
+// last block compares. Each output is one channel's samples.
+struct AdxCheck {
+    bool armed;
+    u32 out_at[2], hist_at[2], key_at, channels, bytes, result;
+    u8 out[2][64 * 256], hist[2][4], key[2];
+    std::int64_t spent, start, budget;
+    u32 calls, bad, budget_off;
+} g_adx_check[2];
+
+void check_adx(Cpu &c, AdxCheck &e, const char *name) {
+    if (!e.armed) return;
+    e.armed = false;
+    ++e.calls;
+    bool same = c.r[2].w[0] == e.result && std::memcmp(range(e.key_at, 2), e.key, 2) == 0;
+    for (u32 n = 0; n < e.channels; ++n)
+        same = same && (!e.bytes || std::memcmp(range(e.out_at[n], e.bytes), e.out[n], e.bytes) == 0) &&
+               std::memcmp(range(e.hist_at[n], 4), e.hist[n], 4) == 0;
+    if (!same && ++e.bad <= 20)
+        std::fprintf(stderr, "[check] %s call %lu differs: result %lu/%lu\n", name, static_cast<unsigned long>(e.calls),
+                     static_cast<unsigned long>(c.r[2].w[0]), static_cast<unsigned long>(e.result));
+    const std::int64_t game = static_cast<std::int64_t>(ps2::now()) - e.start + 11;   // the last block is still to run
+    if (game != e.spent && ++e.budget_off <= 20)
+        std::fprintf(stderr, "[check] %s call %lu (%lu bytes) charged %lld, the game %lld; budget %lld before, %ld after\n", name,
+                     static_cast<unsigned long>(e.calls), static_cast<unsigned long>(e.bytes), static_cast<long long>(e.spent),
+                     static_cast<long long>(game), static_cast<long long>(e.budget), static_cast<long>(c.budget));
+    if (e.calls % 500 == 0)
+        std::fprintf(stderr, "[check] %s %lu calls, %lu differ, %lu charged wrong\n", name, static_cast<unsigned long>(e.calls),
+                     static_cast<unsigned long>(e.bad), static_cast<unsigned long>(e.budget_off));
+}
+#endif
+
+}
+
+// One channel. a0 frames, a1 how many, a2 16-bit samples out, a3 the history, t0 and t1 the prediction coefficients, t2 the key,
+// t3 its multiplier, and the first stack argument its increment. Returns how many frames it decoded.
+bool native_adx_frames(Cpu &c) {
+    const u32 src_at = c.r[4].w[0], dst_at = c.r[6].w[0], hist_at = c.r[7].w[0], key_at = c.r[10].w[0];
+    const auto count = static_cast<s32>(c.r[5].w[0]);
+    if (count <= 0 || count > 256 || ((src_at | dst_at | hist_at | key_at) & 1u)) return false;
+    const u32 frames = static_cast<u32>(count), in_bytes = frames * 18, out_bytes = frames * 64;
+    const u8 *src = range(src_at, in_bytes), *stack = range(c.r[29].w[0], 2), *table = adx_table();
+    u8 *dst = range(dst_at, out_bytes), *hist = range(hist_at, 4), *key = range(key_at, 2);
+    if (!src || !dst || !hist || !key || !stack || !table) return false;
+    if (!apart(dst_at, out_bytes, src_at, in_bytes) || !apart(dst_at, out_bytes, hist_at, 4) || !apart(dst_at, out_bytes, key_at, 2) ||
+        !apart(hist_at, 4, key_at, 2))
+        return false;
+    Adx adx{static_cast<s16>(c.r[8].w[0]), static_cast<s16>(c.r[9].w[0]), static_cast<s16>(c.r[11].w[0]), half16(stack), {}};
+    std::memcpy(adx.table, table, sizeof adx.table);
+#ifdef PS2_CHECK_NATIVES
+    AdxCheck &e = g_adx_check[0];
+    u8 *out = e.out[0], *const key_out = e.key, *const hist_out = e.hist[0];
+    std::memcpy(key_out, key, 2);
+    std::memcpy(hist_out, hist, 4);
+#else
+    u8 *out = dst;
+    u8 *const key_out = key, *const hist_out = hist;
+#endif
+    History h(hist);
+    u32 k = static_cast<std::uint16_t>(half16(key));
+    s32 spent = 25 + 3;
+    u32 done = 0;
+    for (; done < frames; ++done, src += 18, out += 64) {
+        const s32 scale = adx.scale(src, k);
+        if (scale < 0) break;
+        put16(key_out, static_cast<s32>(k));
+        adx.frame(src + 2, scale, h.h1, h.h2, out, spent);
+        spent += 9 + 15 + 16 * 43 + 4;
+    }
+    if (done < frames) spent += 9 + 11;
+    else h.put(hist_out), spent += 3 + 11;
+    const u32 result = done < frames ? done : frames;
+#ifdef PS2_CHECK_NATIVES
+    e.armed = true;
+    e.out_at[0] = dst_at, e.hist_at[0] = hist_at, e.key_at = key_at, e.channels = 1, e.bytes = done * 64, e.result = result;
+    e.spent = spent, e.start = static_cast<std::int64_t>(ps2::now()), e.budget = c.budget;
+    return false;
+#else
+    set32(c.r[2], result);
+    c.budget -= spent;
+    return true;
+#endif
+}
+
+// Two channels, their frames in turn, each with its own history; the key moves on with every frame. Reached by a jump from the
+// function at 0x0053AD00. a0 frames, a1 how many of both channels, a2 and t0 the left and right samples out, a3 and t1 their
+// histories, t2 and t3 the prediction coefficients; on the stack the key's address, its multiplier and its increment. Returns a1,
+// or twice the pairs decoded if the data ends.
+bool native_adx_stereo(Cpu &c) {
+    const u32 src_at = c.r[4].w[0], out_at[2] = {c.r[6].w[0], c.r[8].w[0]}, hist_at[2] = {c.r[7].w[0], c.r[9].w[0]};
+    const auto total = static_cast<s32>(c.r[5].w[0]);
+    const s32 pairs = total / 2;
+    const u8 *stack = range(c.r[29].w[0], 18), *table = adx_table();
+    if (pairs <= 0 || pairs > 256 || !stack || !table) return false;
+    const u32 key_at = word(stack);
+    if ((src_at | out_at[0] | out_at[1] | hist_at[0] | hist_at[1] | key_at) & 1u) return false;
+    const u32 n = static_cast<u32>(pairs), in_bytes = n * 36, out_bytes = n * 64;
+    const u8 *src = range(src_at, in_bytes);
+    u8 *dst[2] = {range(out_at[0], out_bytes), range(out_at[1], out_bytes)}, *hist[2] = {range(hist_at[0], 4), range(hist_at[1], 4)};
+    u8 *key = range(key_at, 2);
+    if (!src || !dst[0] || !dst[1] || !hist[0] || !hist[1] || !key) return false;
+    for (int i = 0; i < 2; ++i)
+        if (!apart(out_at[i], out_bytes, src_at, in_bytes) || !apart(out_at[i], out_bytes, hist_at[0], 4) ||
+            !apart(out_at[i], out_bytes, hist_at[1], 4) || !apart(out_at[i], out_bytes, key_at, 2) || !apart(hist_at[i], 4, key_at, 2))
+            return false;
+    if (!apart(out_at[0], out_bytes, out_at[1], out_bytes) || !apart(hist_at[0], 4, hist_at[1], 4)) return false;
+    Adx adx{static_cast<s16>(c.r[10].w[0]), static_cast<s16>(c.r[11].w[0]), half16(stack + 8), half16(stack + 16), {}};
+    std::memcpy(adx.table, table, sizeof adx.table);
+#ifdef PS2_CHECK_NATIVES
+    AdxCheck &e = g_adx_check[1];
+    u8 *out[2] = {e.out[0], e.out[1]}, *const key_out = e.key, *const hist_out[2] = {e.hist[0], e.hist[1]};
+    std::memcpy(key_out, key, 2);
+    std::memcpy(hist_out[0], hist[0], 4);
+    std::memcpy(hist_out[1], hist[1], 4);
+#else
+    u8 *out[2] = {dst[0], dst[1]};
+    u8 *const key_out = key, *const hist_out[2] = {hist[0], hist[1]};
+#endif
+    History h[2] = {History(hist[0]), History(hist[1])};
+    u32 k = static_cast<std::uint16_t>(half16(key));
+    s32 spent = 34;
+    u32 done = 0;
+    bool ended = false;
+    for (; done < n; ++done, src += 36, out[0] += 64, out[1] += 64) {
+        const s32 left = adx.scale(src, k);
+        if (left < 0) {
+            spent += 13 + 11;
+            ended = true;
+            break;
+        }
+        put16(key_out, static_cast<s32>(k));
+        const s32 right = adx.scale(src + 18, k);
+        if (right < 0) {
+            spent += 13 + 24 + 11;
+            ended = true;
+            break;
+        }
+        put16(key_out, static_cast<s32>(k));
+        adx.frame(src + 2, left, h[0].h1, h[0].h2, out[0], spent);
+        adx.frame(src + 20, right, h[1].h1, h[1].h2, out[1], spent);
+        spent += 13 + 24 + 15 + 16 * 87 + 7;
+    }
+    if (!ended) h[0].put(hist_out[0]), h[1].put(hist_out[1]), spent += 18;
+    const u32 result = ended ? done * 2 : static_cast<u32>(total);
+#ifdef PS2_CHECK_NATIVES
+    e.armed = true;
+    e.out_at[0] = out_at[0], e.out_at[1] = out_at[1], e.hist_at[0] = hist_at[0], e.hist_at[1] = hist_at[1], e.key_at = key_at;
+    e.channels = 2, e.bytes = done * 64, e.result = result, e.spent = spent, e.start = static_cast<std::int64_t>(ps2::now()), e.budget = c.budget;
+    return false;
+#else
+    set32(c.r[2], result);
+    c.budget -= spent;
+    return true;
+#endif
+}
+
+#ifdef PS2_CHECK_NATIVES
+// Listed in natives.txt only for a check build, at the last block of each decoder.
+void native_loop_adx_frames_check(Cpu &c) { check_adx(c, g_adx_check[0], "adx"); }
+void native_loop_adx_stereo_check(Cpu &c) { check_adx(c, g_adx_check[1], "adx stereo"); }
+#endif
 
 }

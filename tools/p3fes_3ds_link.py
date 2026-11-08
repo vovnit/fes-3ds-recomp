@@ -59,20 +59,26 @@ class Link:
             size, name = row.split(" ", 1)
             rows.append((int(size), name))
 
+    def send(self, data):
+        """sendall's timeout limits the whole call, so a big file goes in pieces: the timeout then means no progress for that long."""
+        view = memoryview(data)
+        for at in range(0, len(view), 0x10000):
+            self.sock.sendall(view[at:at + 0x10000])
+
     def put(self, path, data, packed=False):
         """Send a file. packed sends it zlib-packed, which a game built before PUTZ answers with an error, so then it goes plain."""
         if packed:
             payload = zlib.compress(data, 6)
             reply = self.ask("PUTZ %s %d %08x %d" % (path, len(payload), zlib.crc32(data), len(data)))
             if reply == "GO":
-                self.sock.sendall(payload)
+                self.send(payload)
                 return self.line()
             if not reply.startswith("ERR unknown"):
                 return reply
         reply = self.ask("PUT %s %d %08x" % (path, len(data), zlib.crc32(data)))
         if reply != "GO":
             return reply
-        self.sock.sendall(data)
+        self.send(data)
         return self.line()
 
     def get(self, path, target):
