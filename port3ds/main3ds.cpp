@@ -20,6 +20,7 @@
 #include "pica.hpp"
 #include "remote3ds.hpp"
 #include "ps2/disc.hpp"
+#include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
@@ -95,7 +96,12 @@ void log_what_fits() {
 }
 
 constexpr const char *kFolder = "/p3fes";
-constexpr std::size_t kEmulationStack = 3u << 19;   // 1.5 MB
+constexpr std::size_t kEmulationStack = 64u << 10;   // only until emulate() moves to kGameStackTop
+// The game thread's real stack is mapped together with the PS2 RAM, after it, so translated calls can test their depth
+// against a constant (ps2::stack_ok). Calls stop at the floor; the 1 MB under it holds the frames of the last calls.
+constexpr u32 kGameStackTop = 0x0BD80000u;
+static_assert(ps2::kStackFloor3ds >= ps2::kRamAddress3ds + ps2::kRamSize + (1u << 20) - 0x1000u, "room under the floor");
+static_assert(kGameStackTop - ps2::kStackFloor3ds == 512u << 10, "512 KB of nested calls");
 constexpr std::size_t kVuStack = 512u << 10;
 
 volatile bool g_quit = false;
@@ -257,7 +263,45 @@ void pmu_line() {
                  static_cast<unsigned long long>((now[3] - g_pmu_last[3]) / static_cast<u64>(CPU_TICKS_PER_MSEC)),
                  static_cast<unsigned long long>((now[4] - g_pmu_last[4]) / static_cast<u64>(CPU_TICKS_PER_MSEC)));
     std::memcpy(g_pmu_last, now, sizeof now);
+#ifdef PS2_PROF_ALL
+    static constexpr const char *kNames[] = {"vu", "gif", "upload", "draw", "iop", "spu", "ipu", "vif", "dma", "events", "kernel",
+                                             "present", "wait", "full", "game", "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9"};
+    constexpr int kBuckets = ps2::prof::Count + 1 + ps2::prof::kExtra;
+    static_assert(std::size(kNames) == kBuckets);
+    static u64 printed[kBuckets][2];
+    if (ps2::prof::on_game_thread()) ps2::prof::switch_events(ps2::prof::g_events_at);
+    for (int k = 0; k < kBuckets; ++k) {
+        const u64 a = ps2::prof::g_events[k][0] - printed[k][0], b = ps2::prof::g_events[k][1] - printed[k][1];
+        if (a || b) std::fprintf(g_perf, " ev_%s %llu %llu", kNames[k], static_cast<unsigned long long>(a), static_cast<unsigned long long>(b));
+        printed[k][0] = ps2::prof::g_events[k][0];
+        printed[k][1] = ps2::prof::g_events[k][1];
+    }
+#endif
 }
+
+}
+
+#ifdef PS2_PROF_ALL
+namespace ps2::prof {
+std::uint64_t g_events[Count + 1 + kExtra][2];
+int g_events_at = Count;
+void *g_game_thread = nullptr;
+
+void switch_events(int to) {
+    static u64 last[2];
+    if (g_pmu_a >= 0) {
+        const u64 a = pmu_read(PERFCOUNTERREG_CORE_COUNT_REG_0), b = pmu_read(PERFCOUNTERREG_CORE_COUNT_REG_1);
+        g_events[g_events_at][0] += a - last[0];
+        g_events[g_events_at][1] += b - last[1];
+        last[0] = a;
+        last[1] = b;
+    }
+    g_events_at = to;
+}
+}
+#endif
+
+namespace {
 
 // The game counts vblanks, so without this a scene lighter than one vblank of work plays fast. Two frames of credit even out a slow one.
 void hold_speed() {
@@ -323,6 +367,43 @@ void on_vblank() {
     }
 }
 
+// mvdprobe 1: can the New 3DS video decoder (MVD) start while the game is resident? It logs the work buffer
+// MVD asks for at a few movie sizes and whether it starts with the smallest one, then shuts it down again.
+bool g_mvd_probe = false;
+
+void mvd_probe() {
+    std::fprintf(stderr, "[mvd] linear free %lu KB before\n", static_cast<unsigned long>(linearSpaceFree() >> 10));
+    Result r = mvdstdInit(MVDMODE_COLORFORMATCONV, MVD_INPUT_YUYV422, MVD_OUTPUT_RGB565, 0, nullptr);
+    std::fprintf(stderr, "[mvd] init for conversion 0x%08lX\n", static_cast<unsigned long>(r));
+    if (R_FAILED(r)) return;
+    struct Size { u32 w, h, refs; };
+    const Size sizes[] = {{640, 448, 1}, {640, 448, 2}, {640, 448, 4}, {512, 448, 2}, {400, 240, 2}};
+    u32 smallest = 0;
+    for (const Size &z : sizes) {
+        MVDSTD_CalculateWorkBufSizeConfig cfg{};
+        cfg.ref_frames_a.enable = 1;
+        cfg.ref_frames_a.ref_frames = static_cast<u8>(z.refs);
+        cfg.width = z.w;
+        cfg.height = z.h;
+        u32 size = 0;
+        r = mvdstdCalculateBufferSize(&cfg, &size);
+        std::fprintf(stderr, "[mvd] %lux%lu, %lu reference frames: result 0x%08lX, work buffer %lu KB\n", static_cast<unsigned long>(z.w),
+                     static_cast<unsigned long>(z.h), static_cast<unsigned long>(z.refs), static_cast<unsigned long>(r), static_cast<unsigned long>(size >> 10));
+        if (R_SUCCEEDED(r) && z.w == 640 && z.refs == 2) smallest = size;
+    }
+    mvdstdExit();
+    if (!smallest) smallest = MVD_DEFAULT_WORKBUF_SIZE;
+    r = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_RGB565, smallest, nullptr);
+    std::fprintf(stderr, "[mvd] init for H.264 with %lu KB: 0x%08lX, linear free %lu KB\n", static_cast<unsigned long>(smallest >> 10),
+                 static_cast<unsigned long>(r), static_cast<unsigned long>(linearSpaceFree() >> 10));
+    if (R_SUCCEEDED(r)) mvdstdExit();
+    r = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_RGB565, MVD_DEFAULT_WORKBUF_SIZE, nullptr);
+    std::fprintf(stderr, "[mvd] init for H.264 with the default %lu KB: 0x%08lX\n", static_cast<unsigned long>(MVD_DEFAULT_WORKBUF_SIZE >> 10),
+                 static_cast<unsigned long>(r));
+    if (R_SUCCEEDED(r)) mvdstdExit();
+    std::fprintf(stderr, "[mvd] linear free %lu KB after\n", static_cast<unsigned long>(linearSpaceFree() >> 10));
+}
+
 void read_settings() {
     std::FILE *f = std::fopen("sdmc:/p3fes/args.txt", "r");
     if (!f) return;
@@ -361,6 +442,7 @@ void read_settings() {
         }
         else if (!std::strcmp(key, "iopthread")) g_iop_thread = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "uncapped")) g_hold_speed = std::strtoul(value, nullptr, 10) == 0;
+        else if (!std::strcmp(key, "mvdprobe")) g_mvd_probe = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "draw")) g_draw_every = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         else if (!std::strcmp(key, "shots")) {
             mkdir("sdmc:/p3fes/shots", 0777);
@@ -377,6 +459,7 @@ void read_settings() {
 bool start_gpu() {
     using namespace ps2::gs;
     if (!pica::init()) return false;
+    if (g_mvd_probe) mvd_probe();
     pica::set_present_every(g_show_every);
     pica::set_shot_every(g_shots_every);
     pica::set_draw_every(g_draw_every);
@@ -468,8 +551,11 @@ Thread start_vu_thread() {
     return thread;
 }
 
-void emulate(void *) {
+void emulate_on_game_stack() {
     Thread vu_thread = nullptr;
+#ifdef PS2_PROF_ALL
+    ps2::prof::g_game_thread = getThreadLocalStorage();
+#endif
     g_split_gs = g_split_gs && g_vu_thread && !g_software && g_draw_every == 1;
     if (g_software) {
         ps2::g_options.frames_dir = g_shots_every ? "sdmc:/p3fes/shots" : "";
@@ -527,6 +613,18 @@ void emulate(void *) {
     g_finished = true;
 }
 
+// Calls fn on the stack that ends at top, then comes back to the caller's stack.
+[[gnu::naked]] void call_on_stack(void (*fn)(), u32 top) {
+    asm volatile("push {r4, lr}\n\t"
+                 "mov r4, sp\n\t"
+                 "mov sp, r1\n\t"
+                 "blx r0\n\t"
+                 "mov sp, r4\n\t"
+                 "pop {r4, pc}\n\t");
+}
+
+void emulate(void *) { call_on_stack(emulate_on_game_stack, kGameStackTop); }
+
 }
 
 int main() {
@@ -555,7 +653,7 @@ int main() {
 
     log_memory();
     u32 mapped = 0;
-    const Result rc = svcControlMemory(&mapped, ps2::kRamAddress3ds, 0, ps2::kRamSize + 0x1000u, MEMOP_ALLOC,
+    const Result rc = svcControlMemory(&mapped, ps2::kRamAddress3ds, 0, kGameStackTop - ps2::kRamAddress3ds, MEMOP_ALLOC,
                                        static_cast<MemPerm>(MEMPERM_READ | MEMPERM_WRITE));
     if (R_FAILED(rc)) log_what_fits();
     std::fprintf(stderr, "[3ds] PS2 RAM at 0x%08lX, result 0x%08lX, heap %lu MB\n", static_cast<unsigned long>(mapped),

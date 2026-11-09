@@ -101,6 +101,20 @@ FILES["runtime/src/system.cpp"] += ('void run_vu_thread() {\n    gs::stats();\n'
                                    '            case gs::queue::kVuFence:\n                g_vu_fence.fetch_add(1);\n')
 FILES["runtime/src/gs/gif.cpp"] += '    GsSink sink{path};\n    walk(g_paths[path], data, qwc, sink);\n'
 
+# And the edits that replace the call depth with a stack check, the last ones for their files.
+earlier = {}
+for name in ("EDITS", "PERF_EDITS", "SPLIT_GS_EDITS"):
+    for key, edits in perf[name].items():
+        earlier.setdefault(key.split("#")[0], []).append(edits)
+for stage in ("STACK_EDITS", "NARROW_EDITS", "LOOP_EDITS"):
+    for rel, edits in perf[stage].items():
+        for old, _ in edits:
+            inserted = any(old in new for group in earlier.get(rel, ()) for _, new in group)
+            if old not in FILES.get(rel, "") and not inserted:
+                FILES[rel] = FILES.get(rel, "") + old
+    for key, edits in perf[stage].items():
+        earlier.setdefault(key.split("#")[0], []).append(edits)
+
 
 def run(folder):
     return subprocess.run([sys.executable, tool, folder], capture_output=True, text=True)
@@ -187,4 +201,11 @@ with tempfile.TemporaryDirectory() as d:
     upgraded = run(d)
     assert upgraded.returncode == 0 and upgraded.stdout.startswith("patched"), upgraded.stdout
     assert read(ipu) == patched_ipu
+    # Calls test the stack pointer instead of passing a depth count.
+    assert "kStackFloor3ds = 0x0BD00000u" in read("runtime/include/ps2/generated.hpp")
+    assert "if (stack_ok()) {}(c, {}u); else" in read("recomp/codegen.cpp") and "depth" not in read("recomp/codegen.cpp")
+    assert "void analyse_narrow()" in read("recomp/codegen.cpp") and "analyse_narrow();\n        find_loops();\n        out_.str({});" in read("recomp/codegen.cpp")
+    assert "std::string promote_loops(std::string s)" in read("recomp/codegen.cpp") and "local_budget(promote_loops(out_.str()))" in read("recomp/codegen.cpp")
+    assert "inline decltype(auto) bud_x(" in read("runtime/include/ps2/memory.hpp")
+    assert "void call(Cpu &c, std::uint32_t target) {" in read("runtime/src/dispatch.cpp")
 print("ok   3DS patch applies once, is idempotent, refuses unknown source and leaves desktop paths alone")

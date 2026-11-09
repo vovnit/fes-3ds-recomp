@@ -7,7 +7,7 @@ PORTLIBS  := $(DEVKITPRO)/portlibs/3ds
 TOOLS     := $(DEVKITPRO)/tools/bin
 OUT       := /w/build/3ds
 
-ARCH      := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
+ARCH      := -march=armv6k -mtune=arm1136jf-s -mfloat-abi=hard -mtp=soft
 OPT       ?= -O2
 CXXFLAGS  := $(ARCH) $(OPT) -std=gnu++20 -D__3DS__ -fno-math-errno -ffunction-sections -Wno-psabi -MMD -MP \
              -DPS2_PICA -I$(CTRU)/include -I/w/runtime/include -I/w/runtime/src -I/p/port3ds -I$(OUT)/shader

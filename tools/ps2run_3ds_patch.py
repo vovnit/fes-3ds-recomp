@@ -4209,6 +4209,807 @@ void run_pica_thread();
 }
 
 
+# Translated calls nest on the host stack. They used to pass a depth count to every call, which cost a register and three
+# instructions per call site; now each call compares the stack pointer with a floor (a constant on the 3DS, where the game
+# thread's stack sits at a fixed address), and a call that would go below it unwinds to the dispatcher as before.
+STACK_EDITS = {
+    'runtime/include/ps2/generated.hpp': [
+        (r'''using UnitFn = void (*)(Cpu &, std::uint32_t entry, std::uint32_t depth);
+
+inline constexpr std::uint32_t kMaxDepth = 192;
+''', r'''using UnitFn = void (*)(Cpu &, std::uint32_t entry);
+
+// A translated call goes ahead only while the host stack is above a floor; otherwise it unwinds to the dispatcher. The stack
+// pointer is fixed for the length of a function, so the compiler tests it once per call of a unit.
+#ifdef __3DS__
+inline constexpr std::uint32_t kStackFloor3ds = 0x0BD00000u;   // the game thread's stack is mapped above it (main3ds.cpp); an ARM immediate
+[[gnu::always_inline]] inline bool stack_ok() {
+    std::uint32_t sp;
+    asm("mov %0, sp" : "=r"(sp));
+    return sp >= kStackFloor3ds;
+}
+#else
+extern std::uintptr_t g_stack_floor;   // set by run(); 0 lets every call through
+[[gnu::always_inline]] inline bool stack_ok() { return reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0)) >= g_stack_floor; }
+#endif
+'''),
+        (r'''void dispatch(Cpu &c, std::uint32_t entry, std::uint32_t depth);
+void call(Cpu &c, std::uint32_t target, std::uint32_t depth);
+''', r'''void dispatch(Cpu &c, std::uint32_t entry);
+void call(Cpu &c, std::uint32_t target);
+'''),
+    ],
+    'runtime/src/dispatch.cpp': [
+        (r'''void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
+''', r'''#ifndef __3DS__
+std::uintptr_t g_stack_floor = 0;
+#endif
+
+void dispatch(Cpu &c, std::uint32_t) {
+'''),
+        (r'''                mu->function(c, entry, depth);
+''', r'''                mu->function(c, entry);
+'''),
+        (r'''    u->function(c, id, depth);
+}
+
+void call(Cpu &c, std::uint32_t target, std::uint32_t depth) {
+    c.pc = target;
+    if (depth >= kMaxDepth) return;
+    dispatch(c, 0, depth);
+}
+''', r'''    u->function(c, id);
+}
+
+void call(Cpu &c, std::uint32_t target) {
+    c.pc = target;
+    if (!stack_ok()) return;
+    dispatch(c, 0);
+}
+'''),
+    ],
+    'runtime/src/kernel.cpp': [
+        (r'''        dispatch(c, 0, 0);
+    }
+    g_guest_calls.pop_back();
+''', r'''        dispatch(c, 0);
+    }
+    g_guest_calls.pop_back();
+'''),
+    ],
+    'runtime/src/system.cpp': [
+        (r'''int run() {
+    Cpu &c = g_cpu;
+''', r'''int run() {
+    Cpu &c = g_cpu;
+#ifndef __3DS__
+    if (!g_stack_floor) g_stack_floor = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0)) - (256u << 10);
+#endif
+'''),
+        (r'''        if (c.budget <= 0) refill(c);
+        dispatch(c, 0, 0);
+''', r'''        if (c.budget <= 0) refill(c);
+        dispatch(c, 0);
+'''),
+    ],
+    'recomp/codegen.cpp': [
+        (r'''                line("{ const std::uint32_t t = eret(c); c.pc = t; [[clang::musttail]] return dispatch(c, 0u, depth); }");
+            } else if (fl == Flow::Stop) {
+''', r'''                line("{ const std::uint32_t t = eret(c); c.pc = t; [[clang::musttail]] return dispatch(c, 0u); }");
+            } else if (fl == Flow::Stop) {
+'''),
+        (r'''                line("{ const std::uint32_t t = eret(c); c.pc = t; [[clang::musttail]] return dispatch(c, 0u, depth); }");
+                falls = false;
+''', r'''                line("{ const std::uint32_t t = eret(c); c.pc = t; [[clang::musttail]] return dispatch(c, 0u); }");
+                falls = false;
+'''),
+        (r'''"(Cpu &c, std::uint32_t entry, std::uint32_t depth) {\n";''', r'''"(Cpu &c, std::uint32_t entry) {\n";'''),
+        (r'''line(std::format("{}[[clang::musttail]] return {}(c, {}u, depth);", rebase(), unit_name(layout_.unit_of(a)), id_of(a)));''',
+         r'''line(std::format("{}[[clang::musttail]] return {}(c, {}u);", rebase(), unit_name(layout_.unit_of(a)), id_of(a)));'''),
+        (r'''line(std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u, depth);", pc(a)));''',
+         r'''line(std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u);", pc(a)));'''),
+        (r'''return check + std::format("{}[[clang::musttail]] return {}(c, {}u, depth);", rebase(), unit_name(layout_.unit_of(t)), id_of(t));''',
+         r'''return check + std::format("{}[[clang::musttail]] return {}(c, {}u);", rebase(), unit_name(layout_.unit_of(t)), id_of(t));'''),
+        (r'''return std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u, depth);", pc(t));''',
+         r'''return std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u);", pc(t));'''),
+        (r'''            invoke = relocatable_ ? std::format("if (depth < kMaxDepth) {{ c.base = B; {}(c, {}u, depth + 1u); }} else {{ c.pc = {}; return; }}",
+                                                unit_name(layout_.unit_of(t)), id_of(t), pc(t))
+                                  : std::format("if (depth < kMaxDepth) {}(c, {}u, depth + 1u); else {{ c.pc = {}; return; }}",
+                                                unit_name(layout_.unit_of(t)), id_of(t), pc(t));
+        else
+            invoke = std::format("call(c, {}, depth + 1u);", pc(t));
+''', r'''            invoke = relocatable_ ? std::format("if (stack_ok()) {{ c.base = B; {}(c, {}u); }} else {{ c.pc = {}; return; }}",
+                                                unit_name(layout_.unit_of(t)), id_of(t), pc(t))
+                                  : std::format("if (stack_ok()) {}(c, {}u); else {{ c.pc = {}; return; }}",
+                                                unit_name(layout_.unit_of(t)), id_of(t), pc(t));
+        else
+            invoke = std::format("call(c, {});", pc(t));
+'''),
+        (r'''{} {} call(c, t, depth + 1u); if (c.pc != {}) [[unlikely]] return; }}", target, link, slot''',
+         r'''{} {} call(c, t); if (c.pc != {}) [[unlikely]] return; }}", target, link, slot'''),
+        (r'''c.pc = t; [[clang::musttail]] return dispatch(c, 0u, depth); }}", target, slot));''',
+         r'''c.pc = t; [[clang::musttail]] return dispatch(c, 0u); }}", target, slot));'''),
+        (r'''if (entry) goto dispatch_entry; }} [[clang::musttail]] return dispatch(c, 0u, depth); }}"''',
+         r'''if (entry) goto dispatch_entry; }} [[clang::musttail]] return dispatch(c, 0u); }}"'''),
+        (r'''c.pc = t; call(c, t, depth + 1u); if (c.pc != {}) [[unlikely]] return; }}",''',
+         r'''c.pc = t; call(c, t); if (c.pc != {}) [[unlikely]] return; }}",'''),
+        (r'''"(ps2::Cpu &c, std::uint32_t entry, std::uint32_t depth);\n";''', r'''"(ps2::Cpu &c, std::uint32_t entry);\n";'''),
+    ],
+}
+
+
+# Guest registers are 64 bits wide (128 with the multimedia half), but nearly all game code works on 32-bit values whose
+# upper word only copies bit 31. Storing that copy after every 32-bit result costs an extra instruction and an extra store.
+# The generator now works out, per unit, which registers' upper words are known to be such a copy (so 64-bit operations
+# on them can be done in 32 bits) and which upper words nothing reads before they are rewritten (so they need not be
+# stored). Every exit from the unit counts as reading every register, so guest state outside a unit is unchanged.
+# EERECOMP_WIDE=1 in the environment turns it off.
+NARROW_EDITS = {
+    'recomp/codegen.cpp': [
+        (r'''#include <bit>
+''', r'''#include <bit>
+#include <cstdlib>
+'''),
+        (r'''std::string d(std::uint32_t r) { return r ? std::format("c.r[{}].d[0]", r) : "0ull"; }
+std::string sd(std::uint32_t r) { return r ? std::format("c.r[{}].sd[0]", r) : "0ll"; }
+std::string reg(std::uint32_t r) { return std::format("c.r[{}]", r); }
+''', r'''// ps2run_3ds_patch.py: while the generator works out which upper words an instruction reads, d, sd and reg note them here
+std::uint32_t *g_hi_reads = nullptr;
+std::string d(std::uint32_t r) { if (g_hi_reads) *g_hi_reads |= 1u << r; return r ? std::format("c.r[{}].d[0]", r) : "0ull"; }
+std::string sd(std::uint32_t r) { if (g_hi_reads) *g_hi_reads |= 1u << r; return r ? std::format("c.r[{}].sd[0]", r) : "0ll"; }
+std::string reg(std::uint32_t r) { if (g_hi_reads) *g_hi_reads |= 1u << r; return std::format("c.r[{}]", r); }
+'''),
+        (r'''    std::string uimm(const Insn &i) const {
+        if (const auto e = field(i)) return "(static_cast<std::uint64_t>(" + *e + ") & 0xFFFFull)";
+        return std::format("{}ull", i.uimm());
+    }
+''', r'''    std::string uimm(const Insn &i) const {
+        if (const auto e = field(i)) return "(static_cast<std::uint64_t>(" + *e + ") & 0xFFFFull)";
+        return std::format("{}ull", i.uimm());
+    }
+
+    std::string uimm32(const Insn &i) const {
+        if (const auto e = field(i)) return "(static_cast<std::uint32_t>(" + *e + ") & 0xFFFFu)";
+        return std::format("{}u", i.uimm());
+    }
+
+    // ps2run_3ds_patch.py: facts about the guest registers' upper words at one instruction of the unit being written.
+    // canon: registers whose upper word is known to copy bit 31 of the lower one (r0 always).
+    // live: registers whose upper word may be read after the instruction before it is rewritten; every exit reads them all.
+    struct Ctx { std::uint32_t canon = 1u, live = ~1u; };
+    struct Effect { std::uint32_t reads = 0, kills = 0, out = 1u; bool barrier = false; };
+
+    bool cn(std::uint32_t r) const { return r == 0 || ((ctx_.canon >> r) & 1u); }
+    std::string s32(std::uint32_t r) { return cn(r) ? std::format("static_cast<std::int32_t>({})", w(r)) : sd(r); }
+
+    void use_node(std::uint32_t a, bool slot) {
+        ctx_ = narrow_ ? nodes_[((a - base_) >> 2) * 2 + (slot ? 1u : 0u)] : Ctx{};
+    }
+
+    // what one instruction (or the delay slot of the branch at a) does to the facts, found by generating it and dropping the text
+    Effect dry(std::uint32_t a, bool slot, std::uint32_t canon) {
+        Effect e;
+        const Ctx keep = ctx_;
+        const std::uint32_t pending = pending_;
+        std::string *const capture = capture_;
+        std::string text;
+        ctx_ = Ctx{canon | 1u, ~1u};
+        kills_ = canon_set_ = 0;
+        g_hi_reads = &e.reads;
+        const Insn i = at(a);
+        const Flow fl = flow(i.op);
+        std::uint32_t clobber = 0;
+        if (slot) {
+            const Insn ds = p_.is_code(a + 4) ? at(a + 4) : Insn{a + 4, 0, Invalid};
+            text = delay(ds);
+            clobber = (1u << ds.rd()) | (1u << ds.rt());
+        } else if (fl == Flow::None) {
+            capture_ = &text;
+            simple(i);
+            clobber = (1u << i.rd()) | (1u << i.rt());
+        } else if (fl != Flow::Stop) {
+            if (fl == Flow::Branch || fl == Flow::BranchLikely || i.op == Bltzal || i.op == Bgezal || i.op == Bltzall || i.op == Bgezall)
+                (void)condition(i);
+            clobber = (1u << 31) | (fl == Flow::CallRegister ? 1u << i.rd() : 0u);
+        }
+        g_hi_reads = nullptr;
+        capture_ = capture;
+        pending_ = pending;
+        e.reads &= ~1u;
+        e.kills = kills_ & ~1u;
+        e.barrier = (!slot && fl == Flow::Stop) || text.find("return") != std::string::npos || text.find("trap(c") != std::string::npos
+                    || text.find("breakpoint(c") != std::string::npos;
+        e.out = e.barrier ? 1u : ((canon & ~clobber) | canon_set_ | 1u);
+        ctx_ = keep;
+        return e;
+    }
+
+    void analyse_narrow() {
+        const std::uint32_t words = layout_.size() / 4, end = base_ + layout_.size();
+        narrow_ = std::getenv("EERECOMP_WIDE") == nullptr;
+        for (std::uint32_t a = base_; narrow_ && a < end; a += 4)
+            if (p_.is_code(a) && group_start(a)) narrow_ = false;
+        ctx_ = Ctx{};
+        if (!narrow_) return;
+        constexpr std::uint32_t kExit = 0xFFFFFFFFu;
+        struct Edge { std::uint32_t to; bool reset; };
+        struct Node { bool code = false, pre = false, reached = false; std::vector<Edge> next; };
+        std::vector<Node> g(2 * words);
+        const auto index = [&](std::uint32_t a, bool slot) { return ((a - base_) >> 2) * 2 + (slot ? 1u : 0u); };
+        const auto normal = [&](std::uint32_t a) { return in_unit(a) && p_.is_code(a) ? index(a, false) : kExit; };
+        for (std::uint32_t a = base_; a < end; a += 4) {
+            if (!p_.is_code(a)) continue;
+            Node &n = g[index(a, false)];
+            n.code = true;
+            n.pre = options_.natives.count(a) || options_.probes.count(a);
+            const Insn i = at(a);
+            const Flow fl = flow(i.op);
+            if (fl == Flow::None) {
+                n.next.push_back({normal(a + 4), false});
+                continue;
+            }
+            if (fl == Flow::Stop) continue;
+            Node &s = g[index(a, true)];
+            s.code = true;
+            n.next.push_back({index(a, true), false});
+            const std::uint32_t t = i.branch_target_of();
+            const auto target = [&](Node &x) {
+                if (dynamic_jump(a) || !in_unit(t) || !p_.is_code(t)) {
+                    x.next.push_back({kExit, false});
+                    return;
+                }
+                x.next.push_back({index(t, false), false});
+                if (t <= a) x.next.push_back({kExit, false});   // the time-slice check before a backward jump may leave
+            };
+            if (fl == Flow::BranchLikely || i.op == Bltzall || i.op == Bgezall) n.next.push_back({normal(a + 8), false});
+            switch (fl) {
+            case Flow::Branch: target(s); s.next.push_back({normal(a + 8), false}); break;
+            case Flow::BranchLikely: case Flow::Jump: target(s); break;
+            case Flow::Call: case Flow::CallRegister: s.next.push_back({kExit, false}); s.next.push_back({normal(a + 8), true}); break;
+            default: s.next.push_back({kExit, false}); break;
+            }
+        }
+        std::vector<std::uint32_t> canon(2 * words, ~0u);
+        for (const Node &n : g)
+            for (const Edge &e : n.next)
+                if (e.to != kExit) g[e.to].reached = true;
+        for (std::uint32_t k = 0; k < g.size(); ++k)
+            if (g[k].pre || !g[k].reached) canon[k] = 1u;
+        for (const auto &[x, id] : ids_[layout_.unit_of(base_)]) canon[index(x, false)] = 1u;   // entered from outside
+        std::vector<Effect> fx(2 * words);
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (std::uint32_t k = 0; k < g.size(); ++k) {
+                if (!g[k].code) continue;
+                fx[k] = dry(base_ + (k >> 1) * 4u, (k & 1u) != 0, canon[k]);
+                for (const Edge &e : g[k].next) {
+                    if (e.to == kExit) continue;
+                    const std::uint32_t v = canon[e.to] & (e.reset ? 1u : fx[k].out);
+                    if (v != canon[e.to]) {
+                        canon[e.to] = v;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        std::vector<std::uint32_t> in(2 * words, 0u);
+        const auto out_of = [&](std::uint32_t k) {
+            std::uint32_t v = 0;
+            for (const Edge &e : g[k].next) v |= e.to == kExit ? ~1u : in[e.to];
+            return v;
+        };
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (std::uint32_t k = static_cast<std::uint32_t>(g.size()); k-- > 0;) {
+                if (!g[k].code) continue;
+                const std::uint32_t v = g[k].pre || fx[k].barrier ? ~1u : (fx[k].reads | (out_of(k) & ~fx[k].kills));
+                if (v != in[k]) {
+                    in[k] = v;
+                    changed = true;
+                }
+            }
+        }
+        nodes_.assign(2 * words, Ctx{});
+        for (std::uint32_t k = 0; k < g.size(); ++k)
+            if (g[k].code) nodes_[k] = Ctx{canon[k] | 1u, out_of(k)};
+    }
+'''),
+        (r'''        out_.str({});
+''', r'''        analyse_narrow();
+        out_.str({});
+'''),
+        (r'''            if (options_.probes.count(a)) line(std::format("probe(c, {});", pc(a)));
+            const Insn i = at(a);
+''', r'''            if (options_.probes.count(a)) line(std::format("probe(c, {});", pc(a)));
+            const Insn i = at(a);
+            use_node(a, false);
+'''),
+        (r'''        const std::string slot = delay(ds);
+''', r'''        const Ctx keep = ctx_;   // ps2run_3ds_patch.py: the delay slot has facts of its own
+        use_node(a, true);
+        const std::string slot = delay(ds);
+        ctx_ = keep;
+'''),
+        (r'''        case Beq: case Beql: return d(i.rs()) + " == " + d(i.rt());
+        case Bne: case Bnel: return d(i.rs()) + " != " + d(i.rt());
+        case Blez: case Blezl: return sd(i.rs()) + " <= 0";
+        case Bgtz: case Bgtzl: return sd(i.rs()) + " > 0";
+        case Bltz: case Bltzl: case Bltzal: case Bltzall: return sd(i.rs()) + " < 0";
+        case Bgez: case Bgezl: case Bgezal: case Bgezall: return sd(i.rs()) + " >= 0";
+''', r'''        case Beq: case Beql: return cn(i.rs()) && cn(i.rt()) ? w(i.rs()) + " == " + w(i.rt()) : d(i.rs()) + " == " + d(i.rt());
+        case Bne: case Bnel: return cn(i.rs()) && cn(i.rt()) ? w(i.rs()) + " != " + w(i.rt()) : d(i.rs()) + " != " + d(i.rt());
+        case Blez: case Blezl: return s32(i.rs()) + " <= 0";
+        case Bgtz: case Bgtzl: return s32(i.rs()) + " > 0";
+        case Bltz: case Bltzl: case Bltzal: case Bltzall: return s32(i.rs()) + " < 0";
+        case Bgez: case Bgezl: case Bgezal: case Bgezall: return s32(i.rs()) + " >= 0";
+'''),
+        (r'''    void set_d(std::uint32_t r, const std::string &value) {
+        if (r) line(std::format("c.r[{}].d[0] = {};", r, value));
+    }
+
+    void set_w(std::uint32_t r, const std::string &value) {
+        if (r) line(std::format("set32(c.r[{}], {});", r, value));
+    }
+''', r'''    void set_d(std::uint32_t r, const std::string &value) {
+        if (!r) return;
+        kills_ |= 1u << r;
+        line(std::format("c.r[{}].d[0] = {};", r, value));
+    }
+
+    // ps2run_3ds_patch.py: a 32-bit result; its upper word is stored only when something may read it before it is rewritten
+    void set_w(std::uint32_t r, const std::string &value) {
+        if (!r) return;
+        kills_ |= 1u << r;
+        canon_set_ |= 1u << r;
+        if ((ctx_.live >> r) & 1u) line(std::format("set32(c.r[{}], {});", r, value));
+        else line(std::format("c.r[{}].w[0] = {};", r, value));
+    }
+'''),
+        (r'''        case Movz: if (rd) line(std::format("if ({} == 0) c.r[{}].d[0] = {};", d(rt), rd, d(rs))); break;
+        case Movn: if (rd) line(std::format("if ({} != 0) c.r[{}].d[0] = {};", d(rt), rd, d(rs))); break;
+''', r'''        case Movz: case Movn: {
+            if (!rd) break;
+            const std::string test = std::format("if ({} {} 0)", cn(rt) ? w(rt) : d(rt), i.op == Movz ? "==" : "!=");
+            if (cn(rd) && cn(rs)) canon_set_ |= 1u << rd;
+            if (!cn(rs)) line(std::format("{} c.r[{}].d[0] = {};", test, rd, d(rs)));
+            else if ((ctx_.live >> rd) & 1u) line(std::format("{} set32(c.r[{}], {});", test, rd, w(rs)));
+            else line(std::format("{} c.r[{}].w[0] = {};", test, rd, w(rs)));
+            break;
+        }
+'''),
+        (r'''        case Add: case Addu: set_w(rd, w(rs) + " + " + w(rt)); break;
+        case Sub: case Subu: set_w(rd, w(rs) + " - " + w(rt)); break;
+        case And: set_d(rd, d(rs) + " & " + d(rt)); break;
+        case Or: set_d(rd, d(rs) + " | " + d(rt)); break;
+        case Xor: set_d(rd, d(rs) + " ^ " + d(rt)); break;
+        case Nor: set_d(rd, "~(" + d(rs) + " | " + d(rt) + ")"); break;
+''', r'''        case Add: case Addu: set_w(rd, w(rs) + " + " + w(rt)); break;
+        case Sub: case Subu: set_w(rd, w(rs) + " - " + w(rt)); break;
+        case And: if (cn(rs) && cn(rt)) set_w(rd, w(rs) + " & " + w(rt)); else set_d(rd, d(rs) + " & " + d(rt)); break;
+        case Or: if (cn(rs) && cn(rt)) set_w(rd, w(rs) + " | " + w(rt)); else set_d(rd, d(rs) + " | " + d(rt)); break;
+        case Xor: if (cn(rs) && cn(rt)) set_w(rd, w(rs) + " ^ " + w(rt)); else set_d(rd, d(rs) + " ^ " + d(rt)); break;
+        case Nor: if (cn(rs) && cn(rt)) set_w(rd, "~(" + w(rs) + " | " + w(rt) + ")"); else set_d(rd, "~(" + d(rs) + " | " + d(rt) + ")"); break;
+'''),
+        (r'''        case Slt: set_d(rd, std::format("{} < {} ? 1ull : 0ull", sd(rs), sd(rt))); break;
+        case Sltu: set_d(rd, std::format("{} < {} ? 1ull : 0ull", d(rs), d(rt))); break;
+        case Dadd: case Daddu: set_d(rd, d(rs) + " + " + d(rt)); break;
+        case Dsub: case Dsubu: set_d(rd, d(rs) + " - " + d(rt)); break;
+''', r'''        case Slt:
+            if (cn(rs) && cn(rt)) set_w(rd, std::format("static_cast<std::int32_t>({}) < static_cast<std::int32_t>({}) ? 1u : 0u", w(rs), w(rt)));
+            else set_w(rd, std::format("{} < {} ? 1u : 0u", sd(rs), sd(rt)));
+            break;
+        case Sltu:
+            if (cn(rs) && cn(rt)) set_w(rd, std::format("{} < {} ? 1u : 0u", w(rs), w(rt)));
+            else set_w(rd, std::format("{} < {} ? 1u : 0u", d(rs), d(rt)));
+            break;
+        case Dadd: case Daddu:
+            if ((rt == 0 && cn(rs)) || (rs == 0 && cn(rt))) set_w(rd, w(rs | rt));
+            else set_d(rd, d(rs) + " + " + d(rt));
+            break;
+        case Dsub: case Dsubu: if (rt == 0 && cn(rs)) set_w(rd, w(rs)); else set_d(rd, d(rs) + " - " + d(rt)); break;
+'''),
+        (r'''        case Dsrl32: set_d(rd, std::format("{} >> {}", d(rt), sa + 32)); break;
+        case Dsra32: set_d(rd, std::format("static_cast<std::uint64_t>({} >> {})", sd(rt), sa + 32)); break;
+''', r'''        case Dsrl32:
+            if (sa) set_w(rd, std::format("static_cast<std::uint32_t>({} >> {})", d(rt), sa + 32));
+            else set_d(rd, std::format("{} >> {}", d(rt), sa + 32));
+            break;
+        case Dsra32: set_w(rd, std::format("static_cast<std::uint32_t>({} >> {})", sd(rt), sa + 32)); break;
+'''),
+        (r'''        case Slti: set_d(rt, std::format("{} < {}ll ? 1ull : 0ull", sd(rs), i.simm())); break;
+        case Sltiu: set_d(rt, std::format("{} < static_cast<std::uint64_t>({}ll) ? 1ull : 0ull", d(rs), i.simm())); break;
+        case Andi: set_d(rt, std::format("{} & {}", d(rs), uimm(i))); break;
+        case Ori: set_d(rt, std::format("{} | {}", d(rs), uimm(i))); break;
+        case Xori: set_d(rt, std::format("{} ^ {}", d(rs), uimm(i))); break;
+''', r'''        case Slti:
+            if (cn(rs)) set_w(rt, std::format("static_cast<std::int32_t>({}) < {} ? 1u : 0u", w(rs), i.simm()));
+            else set_w(rt, std::format("{} < {}ll ? 1u : 0u", sd(rs), i.simm()));
+            break;
+        case Sltiu:
+            if (cn(rs)) set_w(rt, std::format("{} < static_cast<std::uint32_t>({}) ? 1u : 0u", w(rs), i.simm()));
+            else set_w(rt, std::format("{} < static_cast<std::uint64_t>({}ll) ? 1u : 0u", d(rs), i.simm()));
+            break;
+        case Andi: set_w(rt, std::format("{} & {}", w(rs), uimm32(i))); break;
+        case Ori: if (cn(rs)) set_w(rt, std::format("{} | {}", w(rs), uimm32(i))); else set_d(rt, std::format("{} | {}", d(rs), uimm(i))); break;
+        case Xori: if (cn(rs)) set_w(rt, std::format("{} ^ {}", w(rs), uimm32(i))); else set_d(rt, std::format("{} ^ {}", d(rs), uimm(i))); break;
+'''),
+        (r'''            if (const auto e = field(i)) line(std::format("c.r[{}].sd[0] = static_cast<std::int32_t>({} << 16);", rt, *e));
+            else line(std::format("c.r[{}].sd[0] = static_cast<std::int32_t>({});", rt, hex(i.uimm() << 16)));
+''', r'''            if (const auto e = field(i)) set_w(rt, std::format("({} << 16)", *e));
+            else set_w(rt, hex(i.uimm() << 16));
+'''),
+        (r'''line(std::format("c.r[{}].sd[0] = static_cast<std::int8_t>(ld8({}));", rt, address(i)));''',
+         r'''set_w(rt, std::format("static_cast<std::uint32_t>(static_cast<std::int8_t>(ld8({})))", address(i)));'''),
+        (r'''line(std::format("c.r[{}].d[0] = ld8({});", rt, address(i)));''', r'''set_w(rt, std::format("ld8({})", address(i)));'''),
+        (r'''line(std::format("c.r[{}].sd[0] = static_cast<std::int16_t>(ld16({}));", rt, address(i)));''',
+         r'''set_w(rt, std::format("static_cast<std::uint32_t>(static_cast<std::int16_t>(ld16({})))", address(i)));'''),
+        (r'''line(std::format("c.r[{}].d[0] = ld16({});", rt, address(i)));''', r'''set_w(rt, std::format("ld16({})", address(i)));'''),
+        (r'''line(std::format("c.r[{}].d[0] = ld32({});", rt, address(i)));''', r'''set_d(rt, std::format("ld32({})", address(i)));'''),
+        (r'''line(std::format("c.r[{}].d[0] = ld64({});", rt, address(i)));''', r'''set_d(rt, std::format("ld64({})", address(i)));'''),
+        (r'''        case Sd: line(std::format("st64({}, {});", address(i), d(rt))); break;
+''', r'''        case Sd:
+            line(std::format("st64({}, {});", address(i),
+                             cn(rt) ? std::format("static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>({})))", w(rt)) : d(rt)));
+            break;
+'''),
+        (r'''    std::string *capture_{};
+''', r'''    std::string *capture_{};
+    Ctx ctx_;   // ps2run_3ds_patch.py: upper-word facts at the instruction being written
+    std::vector<Ctx> nodes_;
+    bool narrow_ = false;
+    std::uint32_t kills_ = 0, canon_set_ = 0;
+'''),
+    ],
+}
+
+
+# The last edits for their files: small loops with no calls keep the guest registers they use in locals, so the
+# compiler holds them in ARM registers for the whole loop (promote_loops; EERECOMP_NOLOOPS=1 turns it off and
+# EERECOMP_LOOPS=a:b limits it to some loops, for bisecting). The cycle budget can also live in a local
+# (local_budget), but only with EERECOMP_LOCALBUD=1: it saves about 1% of console time and costs 2.8 MB of code.
+LOOP_EDITS = {
+    'recomp/codegen.cpp': [
+        (r'''#include <filesystem>
+#include <format>
+''', r'''#include <filesystem>
+#include <functional>
+#include <cctype>
+#include <cstring>
+#include <format>
+'''),
+        (r'''struct UnitRow {''', r'''// ps2run_3ds_patch.py: small loops with no calls (marked by the generator with //@LOOP_BEGIN and //@LOOP_END) keep the
+// guest registers they use in locals, so the compiler can hold them in ARM registers for the whole loop. The locals are
+// loaded before the loop and written back at every exit and before a preempt check that gives up the thread. A loop
+// whose text calls anything that may read the registers, or uses a register in a form this does not know, stays as it
+// was (for that register, or entirely). EERECOMP_NOLOOPS=1 turns it off.
+std::string promote_loops(std::string s) {
+    const std::string begin_tag = "//@LOOP_BEGIN ", end_tag = "//@LOOP_END ";
+    std::string decls;
+    int k = 0;
+    for (std::size_t b = s.find(begin_tag); b != std::string::npos; b = s.find(begin_tag, b)) {
+        const std::size_t bl = s.find('\n', b);
+        const std::string lab = s.substr(b + begin_tag.size(), bl - b - begin_tag.size());
+        const std::size_t e = s.find(end_tag + lab + "\n", bl);
+        if (e == std::string::npos) throw std::runtime_error("promote_loops: unmatched " + lab);
+        const std::size_t el = e + end_tag.size() + lab.size() + 1;
+        std::string body = s.substr(bl + 1, e - bl - 1);
+        const auto keep = [&] { s.replace(b, el - b, body); b += body.size(); };
+        // calls that may read guest registers, and anything else this does not handle
+        bool ok = body.find("goto dispatch_entry") == std::string::npos && body.find('#') == std::string::npos &&
+                  body.find("stop(") == std::string::npos && body.find("probe(") == std::string::npos;
+        for (std::size_t q = body.find("(c"); ok && q != std::string::npos; q = body.find("(c", q + 1)) {
+            if (q + 2 >= body.size() || (body[q + 2] != ',' && body[q + 2] != ')')) continue;
+            std::size_t n = q;
+            while (n > 0 && (std::isalnum(static_cast<unsigned char>(body[n - 1])) || body[n - 1] == '_' || body[n - 1] == ':')) --n;
+            const std::string name = body.substr(n, q - n);
+            const bool tail = n >= 7 && body.compare(n - 7, 7, "return ") == 0;
+            static const std::set<std::string> plain = {"preempt", "fpu_compare", "fpu_div", "mfc0", "mtc0", "cfc2", "ctc2", "cpcond0"};   // never touch guest registers
+            if (!tail && !plain.count(name)) ok = false;
+        }
+        for (std::size_t q = body.find("return;"); ok && q != std::string::npos; q = body.find("return;", q + 1))
+            if (q < 9 || body.compare(q - 9, 9, "kUnwind; ") != 0) ok = false;
+        // registers and the forms they are used in
+        std::uint32_t used = 0, pinned = 0, written = 0;
+        for (std::size_t q = body.find("c.r["); ok && q != std::string::npos; q = body.find("c.r[", q + 1)) {
+            const std::size_t close = body.find(']', q);
+            const std::uint32_t r = static_cast<std::uint32_t>(std::stoul(body.substr(q + 4, close - q - 4)));
+            used |= 1u << r;
+            const std::string rest = body.substr(close + 1, 8);
+            const bool typed = rest.starts_with(".w[0]") || rest.starts_with(".d[0]") || rest.starts_with(".sd[0]");
+            const bool set = q >= 6 && body.compare(q - 6, 6, "set32(") == 0;
+            if (!typed && !set) pinned |= 1u << r;
+            const std::size_t after = typed ? body.find(']', close + 1) + 1 : close + 1;
+            if (set || (typed && body.compare(after, 3, " = ") == 0)) written |= 1u << r;
+        }
+        const std::uint32_t promo = used & ~pinned & ~1u;
+        static long seen_loops = 0;   // EERECOMP_LOOPS=a:b promotes only loops a..b-1 in generation order (for bisecting)
+        const long n = seen_loops++;
+        if (const char *range = std::getenv("EERECOMP_LOOPS")) {
+            const long lo = std::strtol(range, nullptr, 10), hi = std::strtol(std::strchr(range, ':') + 1, nullptr, 10);
+            if (n < lo || n >= hi) ok = false;
+        }
+        if (!ok || !promo) { keep(); continue; }
+        const auto local = [&](std::uint32_t r) { return std::format("l{}_{}", k, r); };
+        // the end of an expression that starts at i: the next ';' or unmatched ')' outside parentheses
+        const auto expr_end = [](const std::string &t, std::size_t i) {
+            int open = 0;
+            for (; i < t.size(); ++i) {
+                const char ch = t[i];
+                if (ch == '(') ++open;
+                else if (ch == ')') { if (open == 0) return i; --open; }
+                else if (ch == ';' && open == 0) return i;
+            }
+            return i;
+        };
+        std::function<std::string(const std::string &)> rewrite = [&](const std::string &t) {
+            std::string out;
+            std::size_t cur = 0;
+            for (std::size_t q = t.find("c.r["); q != std::string::npos; q = t.find("c.r[", cur)) {
+                const std::size_t close = t.find(']', q);
+                const std::uint32_t r = static_cast<std::uint32_t>(std::stoul(t.substr(q + 4, close - q - 4)));
+                if (!(promo >> r & 1)) { out.append(t, cur, close + 1 - cur); cur = close + 1; continue; }
+                const bool set = q >= 6 && q - 6 >= cur && t.compare(q - 6, 6, "set32(") == 0;
+                if (set) {   // set32(c.r[N], X)
+                    const std::size_t x = close + 3, xe = expr_end(t, x);
+                    out.append(t, cur, q - 6 - cur);
+                    out += local(r) + " = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(" + rewrite(t.substr(x, xe - x)) + ")))";
+                    cur = xe + 1;
+                    continue;
+                }
+                const std::size_t dot = close + 1, fe = t.find(']', dot) + 1;
+                const std::string field = t.substr(dot + 1, t.find('[', dot) - dot - 1);   // w, d or sd
+                out.append(t, cur, q - cur);
+                if (t.compare(fe, 3, " = ") == 0) {
+                    const std::size_t x = fe + 3, xe = expr_end(t, x);
+                    const std::string v = rewrite(t.substr(x, xe - x));
+                    if (field == "d") out += local(r) + " = " + v;
+                    else if (field == "sd") out += local(r) + " = static_cast<std::uint64_t>(" + v + ")";
+                    else out += local(r) + " = (" + local(r) + " & 0xFFFFFFFF00000000ull) | static_cast<std::uint32_t>(" + v + ")";
+                    cur = xe;
+                } else {
+                    if (field == "d") out += local(r);
+                    else if (field == "sd") out += "static_cast<std::int64_t>(" + local(r) + ")";
+                    else out += "static_cast<std::uint32_t>(" + local(r) + ")";
+                    cur = fe;
+                }
+            }
+            out.append(t, cur);
+            return out;
+        };
+        body = rewrite(body);
+        std::string wb, wbx, rl, load;
+        for (std::uint32_t r = 1; r < 32; ++r) {
+            if (!(promo >> r & 1)) continue;
+            decls += "    std::uint64_t " + local(r) + ";\n";
+            const std::string from = std::format("c.r[{}].d[0]", r);
+            load += local(r) + " = " + from + "; ";
+            rl += (rl.empty() ? "" : ", ") + local(r) + " = " + from;
+            if (written >> r & 1) {
+                wb += from + " = " + local(r) + "; ";
+                wbx += (wbx.empty() ? "" : ", ") + from + " = " + local(r);
+            }
+        }
+        // labels of the loop: branches to anything else leave it
+        std::set<std::string> inside;
+        for (std::size_t q = body.find("\nL_"); q != std::string::npos; q = body.find("\nL_", q + 1)) inside.insert(body.substr(q + 1, 10));
+        std::string out;
+        std::size_t cur = 0;
+        for (std::size_t q = body.find("goto L_"); q != std::string::npos; q = body.find("goto L_", cur)) {
+            const std::string target = body.substr(q + 5, 10);
+            out.append(body, cur, q - cur);
+            if (target == lab) out += "goto " + lab + "_in;";
+            else if (inside.count(target)) out += "goto " + target + ";";
+            else out += "{ " + wb + "goto " + target + "; }";
+            cur = q + 16;
+        }
+        out.append(body, cur);
+        body.swap(out);
+        const auto replace_all = [&](const std::string &from, const std::string &to) {
+            for (std::size_t q = body.find(from); q != std::string::npos; q = body.find(from, q + to.size())) body.replace(q, from.size(), to);
+        };
+        replace_all("[[clang::musttail]] return", wb + "[[clang::musttail]] return");
+        replace_all("c.budget < 0 && preempt(c)", "c.budget < 0 && (" + (wbx.empty() ? "" : wbx + ", ") + "preempt(c) || (" + rl + ", false))");
+        body = "    " + load + "\n" + lab + "_in:\n" + body + "    " + wb + "\n";
+        std::size_t start = b;
+        keep();
+        // jumps from outside to a label inside the loop (other than its top, where the loads are) load the locals first
+        for (const std::string &y : inside) {
+            const std::string from = "goto " + y + ";", to = "{ " + load + "goto " + y + "; }";
+            for (std::size_t q = s.find(from); q != std::string::npos; q = s.find(from, q + 1)) {
+                if (q >= start && q < b) { q = b - 1; continue; }
+                s.replace(q, from.size(), to);
+                if (q < start) { start += to.size() - from.size(); b += to.size() - from.size(); }
+                q += to.size() - 1;
+            }
+        }
+        ++k;
+    }
+    if (!decls.empty()) {
+        const std::string head = "(Cpu &c, std::uint32_t entry) {\n";
+        const std::size_t at = s.find(head);
+        if (at == std::string::npos) throw std::runtime_error("promote_loops: no unit function");
+        s.insert(at + head.size(), decls);
+    }
+    return s;
+}
+
+// ps2run_3ds_patch.py: generated code keeps the cycle budget in a local, bud, so the compiler can keep it in a
+// register instead of loading and storing c.budget in every block. It is written back before anything that may read
+// or change it (calls, returns, preempt, syscalls, hardware access through the slow memory paths) and read again after.
+// Off unless EERECOMP_LOCALBUD=1: it saves about 1% of console time but the write-backs on the slow paths add 2.8 MB
+// of code, nearly all the memory the 3DS has left.
+std::string local_budget(std::string s) {
+    if (!std::getenv("EERECOMP_LOCALBUD")) return s;
+    const auto replace_all = [&](const std::string &from, const std::string &to) {
+        std::string r;
+        r.reserve(s.size() + s.size() / 8);
+        std::size_t p = 0;
+        for (std::size_t q; (q = s.find(from, p)) != std::string::npos; p = q + from.size()) r.append(s, p, q - p).append(to);
+        r.append(s, p);
+        s.swap(r);
+    };
+    replace_all("c.budget", "bud");
+    replace_all("[[clang::musttail]] return ", "c.budget = bud; [[clang::musttail]] return ");
+    replace_all("return;", "{ c.budget = bud; return; }");
+    static const std::set<std::string> plain = {"fpu_compare", "fpu_div", "ctc1", "cfc1"};   // never touch the budget
+    static const std::set<std::string> memory = {"ld8", "ld16", "ld32", "ld64", "ld128", "st8", "st16", "st32", "st64", "st128",
+                                                 "lwl", "lwr", "ldl", "ldr", "swl", "swr", "sdl", "sdr"};
+    const auto ident = [](char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == ':'; };
+    std::string r;
+    r.reserve(s.size() + s.size() / 4);
+    std::size_t p = 0;
+    for (std::size_t q = s.find('('); q != std::string::npos; q = s.find('(', q + 1)) {
+        std::size_t b = q;
+        while (b > p && ident(s[b - 1])) --b;
+        if (b == q) continue;
+        const std::string name = s.substr(b, q - b);
+        if (memory.count(name)) {
+            r.append(s, p, b - p).append("bud_").append(name).append("(c, bud, ");
+            p = q + 1;
+        } else if ((s.compare(q, 3, "(c,") == 0 || s.compare(q, 3, "(c)") == 0) && !plain.count(name) && !name.starts_with("mmi::") &&
+                   !(b >= 7 && s.compare(b - 7, 7, "return ") == 0)) {
+            r.append(s, p, b - p).append("bud_x(c, bud, ").append(name);
+            p = q + 2;
+        }
+    }
+    r.append(s, p);
+    const std::string head = "(Cpu &c, std::uint32_t entry) {\n";
+    const std::size_t at = r.find(head);
+    if (at == std::string::npos) throw std::runtime_error("local_budget: no unit function");
+    r.insert(at + head.size(), "    std::int32_t bud = c.budget;\n");
+    return r;
+}
+
+struct UnitRow {'''),
+        (r'''        write_if_changed(fs::path(options_.output) / std::format("{}.cpp", unit_name(u)), out_.str());''', r'''        write_if_changed(fs::path(options_.output) / std::format("{}.cpp", unit_name(u)), local_budget(promote_loops(out_.str())));'''),
+        (r'''                out_ << label(a) << ":" << heat(a) << "\n";
+            }''', r'''                out_ << label(a) << ":" << heat(a) << "\n";
+                if (loops_.count(a)) out_ << "//@LOOP_BEGIN " << label(a) << "\n";
+            }'''),
+        (r'''                control(i, ds);
+                falls = fl != Flow::Jump && fl != Flow::JumpRegister;''', r'''                control(i, ds);
+                if (const auto lp = loop_ends_.find(a); lp != loop_ends_.end()) out_ << "//@LOOP_END " << label(lp->second) << "\n";
+                falls = fl != Flow::Jump && fl != Flow::JumpRegister;'''),
+        (r'''        analyse_narrow();
+        out_.str({});''', r'''        analyse_narrow();
+        find_loops();
+        out_.str({});'''),
+        (r'''    bool in_unit(std::uint32_t a) const { return a >= base_ && a < base_ + layout_.size(); }''', r'''    bool in_unit(std::uint32_t a) const { return a >= base_ && a < base_ + layout_.size(); }
+
+    // ps2run_3ds_patch.py: loops for promote_loops: a backward branch and its target, at most 160 instructions, only
+    // plain instructions and static branches inside, not overlapping (smallest first)
+    void find_loops() {
+        loops_.clear();
+        loop_ends_.clear();
+        if (std::getenv("EERECOMP_NOLOOPS") || relocatable_ || !variants_.empty()) return;
+        const std::uint32_t end = base_ + layout_.size();
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> edges;   // from, to
+        for (std::uint32_t a = base_; a < end; a += 4) {
+            if (!p_.is_code(a)) continue;
+            const Flow fl = flow(at(a).op);
+            if ((fl == Flow::Branch || fl == Flow::BranchLikely || fl == Flow::Jump) && !dynamic_jump(a)) edges.push_back({a, at(a).branch_target_of()});
+        }
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> cands;   // target, branch
+        static const std::uint32_t most = std::getenv("EERECOMP_LOOPMAX") ? std::strtoul(std::getenv("EERECOMP_LOOPMAX"), nullptr, 10) : 160;
+        static const bool outer = std::getenv("EERECOMP_LOOPOUTER") != nullptr;   // largest first, so outer loops win
+        for (const auto &[x, t] : edges)
+            if (t <= x && in_unit(t) && x + 8 <= end && x + 8 - t <= 4 * most) cands.push_back({t, x});
+        std::sort(cands.begin(), cands.end(), [](const auto &l, const auto &r) { return outer ? r.second - r.first < l.second - l.first : l.second - l.first < r.second - r.first; });
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> taken;
+        for (const auto &[t, x] : cands) {
+            const std::uint32_t stop = x + 8;
+            // entries other than the top are fine: promote_loops loads the locals at every jump in from outside
+            bool ok = labels_.count(t) != 0;
+            for (const auto &[lo, hi] : taken) if (t < hi + 8 && lo < stop) ok = false;
+            for (std::uint32_t a = t; ok && a < stop; a += 4) {
+                if (!p_.is_code(a) || options_.natives.count(a) || options_.probes.count(a)) { ok = false; break; }
+                const Flow fl = flow(at(a).op);
+                if (fl != Flow::None && fl != Flow::Branch && fl != Flow::BranchLikely && fl != Flow::Jump) ok = false;
+                if (fl != Flow::None && dynamic_jump(a)) ok = false;
+            }
+            if (!ok) continue;
+            taken.push_back({t, x});
+            loops_[t] = x;
+            loop_ends_[x] = t;
+        }
+    }'''),
+        (r'''    std::set<std::uint32_t> labels_;
+    std::string *capture_{};''', r'''    std::set<std::uint32_t> labels_;
+    std::map<std::uint32_t, std::uint32_t> loops_, loop_ends_;   // ps2run_3ds_patch.py: loop start -> backward branch, and back
+    std::string *capture_{};'''),
+    ],
+    'runtime/include/ps2/memory.hpp': [
+        (r'''#include <cstring>
+''', r'''#include <cstring>
+#include <type_traits>
+'''),
+        (r'''inline void sdr(const Reg128 &rt, std::uint32_t a) {
+    const std::uint32_t shift = (a & 7u) * 8u;
+    const std::uint64_t mem = ld64(a & ~7u);
+    st64(a & ~7u, (rt.d[0] << shift) | (mem & mask_below(shift)));
+}
+''', r'''inline void sdr(const Reg128 &rt, std::uint32_t a) {
+    const std::uint32_t shift = (a & 7u) * 8u;
+    const std::uint64_t mem = ld64(a & ~7u);
+    st64(a & ~7u, (rt.d[0] << shift) | (mem & mask_below(shift)));
+}
+
+// ps2run_3ds_patch.py: generated code keeps the cycle budget in a local (see local_budget in recomp/codegen.cpp).
+// bud_x writes it back around a call that may read or change it; the memory wrappers do so only on the slow path,
+// which reaches hardware registers whose handlers read the time or shorten the slice.
+template <class F, class... A>
+[[gnu::always_inline]] inline decltype(auto) bud_x(Cpu &c, std::int32_t &b, F &&f, A &&...a) {
+    c.budget = b;
+    if constexpr (std::is_void_v<decltype(f(c, static_cast<A &&>(a)...))>) {
+        f(c, static_cast<A &&>(a)...);
+        b = c.budget;
+    } else {
+        auto v = f(c, static_cast<A &&>(a)...);
+        b = c.budget;
+        return v;
+    }
+}
+
+#define PS2_BUD_LD(name, T) \
+    [[gnu::always_inline]] inline T bud_##name(Cpu &c, std::int32_t &b, std::uint32_t a) { \
+        if (a < kRamSize) [[likely]] return name(a); \
+        c.budget = b; const T v = name(a); b = c.budget; return v; }
+#define PS2_BUD_ST(name, T) \
+    [[gnu::always_inline]] inline void bud_##name(Cpu &c, std::int32_t &b, std::uint32_t a, T v) { \
+        if (a < kRamSize) [[likely]] { name(a, v); return; } \
+        c.budget = b; name(a, v); b = c.budget; }
+#define PS2_BUD_REG(name, R) \
+    [[gnu::always_inline]] inline void bud_##name(Cpu &c, std::int32_t &b, R rt, std::uint32_t a) { \
+        if (a < kRamSize) [[likely]] { name(rt, a); return; } \
+        c.budget = b; name(rt, a); b = c.budget; }
+PS2_BUD_LD(ld8, std::uint8_t)
+PS2_BUD_LD(ld16, std::uint16_t)
+PS2_BUD_LD(ld32, std::uint32_t)
+PS2_BUD_LD(ld64, std::uint64_t)
+PS2_BUD_ST(st8, std::uint8_t)
+PS2_BUD_ST(st16, std::uint16_t)
+PS2_BUD_ST(st32, std::uint32_t)
+PS2_BUD_ST(st64, std::uint64_t)
+PS2_BUD_ST(st128, const Reg128 &)
+PS2_BUD_REG(lwl, Reg128 &)
+PS2_BUD_REG(lwr, Reg128 &)
+PS2_BUD_REG(ldl, Reg128 &)
+PS2_BUD_REG(ldr, Reg128 &)
+PS2_BUD_REG(swl, const Reg128 &)
+PS2_BUD_REG(swr, const Reg128 &)
+PS2_BUD_REG(sdl, const Reg128 &)
+PS2_BUD_REG(sdr, const Reg128 &)
+[[gnu::always_inline]] inline void bud_ld128(Cpu &c, std::int32_t &b, std::uint32_t a, Reg128 &out) {
+    if (a < kRamSize) [[likely]] { ld128(a, out); return; }
+    c.budget = b; ld128(a, out); b = c.budget; }
+#undef PS2_BUD_LD
+#undef PS2_BUD_ST
+#undef PS2_BUD_REG
+'''),
+    ],
+}
+
+
 def fail(msg):
     print("PATCH NOT APPLIED:", msg)
     raise SystemExit(1)
@@ -4218,7 +5019,7 @@ def fail(msg):
 originals = {}
 texts = {}
 pending = 0
-for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items()):
+for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items()):
     rel = key.split('#')[0]   # the part after # only keeps two lists for one file apart
     if rel in texts:
         t = texts[rel]
@@ -4229,7 +5030,7 @@ for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items())
         except OSError:
             fail("cannot read " + rel)
         # Unwind the later stages in memory so their inputs can be verified.
-        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()))):
+        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()))):
             if t.count(new) == 1:
                 t = t.replace(new, old)
                 pending -= 1
