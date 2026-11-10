@@ -106,7 +106,7 @@ earlier = {}
 for name in ("EDITS", "PERF_EDITS", "SPLIT_GS_EDITS"):
     for key, edits in perf[name].items():
         earlier.setdefault(key.split("#")[0], []).append(edits)
-for stage in ("STACK_EDITS", "NARROW_EDITS", "LOOP_EDITS"):
+for stage in ("STACK_EDITS", "NARROW_EDITS", "LOOP_EDITS", "SP_EDITS", "HOT_EDITS", "VIFADDR_EDITS"):
     for rel, edits in perf[stage].items():
         for old, _ in edits:
             inserted = any(old in new for group in earlier.get(rel, ()) for _, new in group)
@@ -207,5 +207,6 @@ with tempfile.TemporaryDirectory() as d:
     assert "void analyse_narrow()" in read("recomp/codegen.cpp") and "analyse_narrow();\n        find_loops();\n        out_.str({});" in read("recomp/codegen.cpp")
     assert "std::string promote_loops(std::string s)" in read("recomp/codegen.cpp") and "local_budget(promote_loops(out_.str()))" in read("recomp/codegen.cpp")
     assert "inline decltype(auto) bud_x(" in read("runtime/include/ps2/memory.hpp")
+    assert "stack_access(local_budget(promote_loops(out_.str())))" in read("recomp/codegen.cpp") and "inline std::uint32_t sp_ld32(" in read("runtime/include/ps2/memory.hpp")
     assert "void call(Cpu &c, std::uint32_t target) {" in read("runtime/src/dispatch.cpp")
 print("ok   3DS patch applies once, is idempotent, refuses unknown source and leaves desktop paths alone")

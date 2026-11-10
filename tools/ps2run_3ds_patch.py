@@ -5010,6 +5010,376 @@ PS2_BUD_REG(sdr, const Reg128 &)
 }
 
 
+# Loads and stores through the guest stack pointer skip the range check: eerecomp rewrites ld32((sp + N)) into
+# sp_ld32(sp, N), which masks the stack pointer into main RAM, so GCC folds the offset into the ARM load. The game's
+# stacks stay in main RAM (checked over a cold boot, the lobby and battle). EERECOMP_SPCHECK=1 keeps the checks.
+SP_EDITS = {
+    'recomp/codegen.cpp': [
+        (r'''struct UnitRow {''', r'''// ps2run_3ds_patch.py: loads and stores through the stack pointer skip the range check. The game's stacks are in main
+// RAM (every one in a cold boot, the lobby and battle), so sp_ld32(sp, offset) and the others mask the stack pointer
+// into RAM instead of testing the address, and GCC can fold the offset into the ARM load. EERECOMP_SPCHECK=1 keeps the
+// checks.
+std::string stack_access(std::string s) {
+    if (std::getenv("EERECOMP_SPCHECK")) return s;
+    static const char *const kNames[] = {"ld8", "ld16", "ld32", "ld64", "ld128", "st8", "st16", "st32", "st64", "st128"};
+    std::string out;
+    out.reserve(s.size() + s.size() / 16);
+    std::size_t at = 0;
+    for (std::size_t p = s.find("((", 0); p != std::string::npos; p = s.find("((", p + 1)) {
+        if (p < at) continue;
+        const std::size_t a = p + 1;   // the address: (c.r[29].w[0] + Nu), (c.r[29].w[0]) or (static_cast<std::uint32_t>(lK_29) + Nu)
+        std::size_t base_end;
+        if (!s.compare(a, 13, "(c.r[29].w[0]")) base_end = a + 13;
+        else if (!s.compare(a, 29, "(static_cast<std::uint32_t>(l")) {
+            std::size_t e = a + 29;
+            while (e < s.size() && (std::isdigit(static_cast<unsigned char>(s[e])) || s[e] == '_')) ++e;
+            if (s.compare(e - 3, 4, "_29)")) continue;
+            base_end = e + 1;
+        } else continue;
+        std::size_t n = p;   // the function name in front
+        while (n && (std::isalnum(static_cast<unsigned char>(s[n - 1])) || s[n - 1] == '_')) --n;
+        const std::string name = s.substr(n, p - n);
+        if (std::find(std::begin(kNames), std::end(kNames), name) == std::end(kNames)) continue;
+        out.append(s, at, n - at);
+        out += "sp_" + name + "(";
+        if (name.ends_with("128")) {   // the address is masked to 16 bytes after the add: keep it whole
+            at = a;
+            continue;
+        }
+        std::string offset = "0u";
+        std::size_t close = base_end;
+        if (!s.compare(base_end, 3, " + ")) {
+            std::size_t e = base_end + 3;
+            while (e < s.size() && std::isdigit(static_cast<unsigned char>(s[e]))) ++e;
+            if (e == base_end + 3 || s.compare(e, 2, "u)")) {   // not a plain offset: keep the checked access
+                out.resize(out.size() - name.size() - 4);
+                out += name + "(";
+                at = a;
+                continue;
+            }
+            offset = s.substr(base_end + 3, e + 1 - (base_end + 3));
+            close = e + 1;
+        }
+        if (s[close] != ')') {
+            out.resize(out.size() - name.size() - 4);
+            out += name + "(";
+            at = a;
+            continue;
+        }
+        out += s.substr(a + 1, base_end - a - 1) + ", " + offset;
+        at = close + 1;
+    }
+    out.append(s, at, std::string::npos);
+    return out;
+}
+
+struct UnitRow {'''),
+        (r'''local_budget(promote_loops(out_.str()))''', r'''stack_access(local_budget(promote_loops(out_.str())))'''),
+    ],
+    'runtime/include/ps2/memory.hpp': [
+        (r'''#undef PS2_BUD_REG
+''', r'''#undef PS2_BUD_REG
+
+// ps2run_3ds_patch.py: loads and stores through the guest stack pointer (eerecomp's stack_access). The stack pointer is
+// masked into main RAM instead of the address being tested, so the offset folds into the ARM load or store.
+inline std::uint8_t *stack_at(std::uint32_t sp, std::uint32_t offset) { return g_ram + static_cast<std::uint32_t>((sp & (kRamSize - 1u)) + offset); }
+#ifdef __3DS__
+#define PS2_SP_WATCH(sp, offset, n, v)
+#else
+#define PS2_SP_WATCH(sp, offset, n, v) if ((sp) + (offset) + (n) - 4u - g_swlo < g_swlen + (n) - 4u) [[unlikely]] store_watch_hit((sp) + (offset), n, &(v))
+#endif
+inline std::uint8_t sp_ld8(std::uint32_t sp, std::uint32_t offset) { return *stack_at(sp, offset); }
+inline std::uint16_t sp_ld16(std::uint32_t sp, std::uint32_t offset) { return load<std::uint16_t>(stack_at(sp, offset)); }
+inline std::uint32_t sp_ld32(std::uint32_t sp, std::uint32_t offset) { return load<std::uint32_t>(stack_at(sp, offset)); }
+inline std::uint64_t sp_ld64(std::uint32_t sp, std::uint32_t offset) { return load<std::uint64_t>(stack_at(sp, offset)); }
+inline void sp_st8(std::uint32_t sp, std::uint32_t offset, std::uint8_t v) { *stack_at(sp, offset) = v; }
+inline void sp_st16(std::uint32_t sp, std::uint32_t offset, std::uint16_t v) { store(stack_at(sp, offset), v); }
+inline void sp_st32(std::uint32_t sp, std::uint32_t offset, std::uint32_t v) {
+    PS2_SP_WATCH(sp, offset, 4u, v);
+    store(stack_at(sp, offset), v);
+}
+inline void sp_st64(std::uint32_t sp, std::uint32_t offset, std::uint64_t v) {
+    PS2_SP_WATCH(sp, offset, 8u, v);
+    store(stack_at(sp, offset), v);
+}
+inline void sp_ld128(std::uint32_t a, Reg128 &out) { std::memcpy(&out, g_ram + (a & (kRamSize - 1u)), 16); }
+inline void sp_st128(std::uint32_t a, const Reg128 &v) {
+    PS2_SP_WATCH(a, 0u, 16u, v);
+    std::memcpy(g_ram + (a & (kRamSize - 1u)), &v, 16);
+}
+#undef PS2_SP_WATCH
+'''),
+    ],
+}
+
+
+# Hot copies of busy game functions (tools/p3fes_eehot.py): a native whose name starts with hot_ is a second copy of the
+# code that starts there, with the guest registers in locals. Every build calls it, so the native build can check that
+# it does the same work to the cycle. -DPS2_NO_HOT leaves the calls out.
+HOT_EDITS = {
+    'recomp/codegen.cpp': [
+        (r"""                if (native->second.starts_with("loop_")) line(std::format("{{ void native_{0}(Cpu &); native_{0}(c); }}", native->second));
+                else line(std::format("{{ bool native_{0}(Cpu &); if (native_{0}(c)) {{ c.pc = c.r[31].w[0]; return; }} }}", native->second));
+""", r"""                if (native->second.starts_with("hot_")) {
+                    out_ << "#endif\n#ifndef PS2_NO_HOT\n";
+                    line(std::format("{{ bool {0}(Cpu &); if ({0}(c)) return; }}", native->second));
+                } else if (native->second.starts_with("loop_")) line(std::format("{{ void native_{0}(Cpu &); native_{0}(c); }}", native->second));
+                else line(std::format("{{ bool native_{0}(Cpu &); if (native_{0}(c)) {{ c.pc = c.r[31].w[0]; return; }} }}", native->second));
+"""),
+    ],
+    'recomp/main.cpp': [
+        (r"""        std::printf("code %zu instructions (%zu KiB), functions %zu, entries %zu, rejected seeds %zu\n",
+                    code, code * 4 / 1024, program.functions.size(), program.entries.size(), program.rejected.size());
+""", r"""        std::printf("code %zu instructions (%zu KiB), functions %zu, entries %zu, rejected seeds %zu\n",
+                    code, code * 4 / 1024, program.functions.size(), program.entries.size(), program.rejected.size());
+        if (const char *path = getenv("EERECOMP_FUNCTIONS")) {   // ps2run_3ds_patch.py: where functions start, for tools/p3fes_eehot.py
+            if (std::FILE *f = std::fopen(path, "w")) {
+                for (const std::uint32_t a : program.functions) std::fprintf(f, "%08X\n", a);
+                std::fclose(f);
+            }
+        }
+"""),
+    ],
+}
+
+
+# Unchanging VIF and texture data by address, with the game side's command pass replayed (2026-11-10).
+VIFADDR_EDITS = {
+    'runtime/src/gs/queue.hpp': [
+        (r"""extern bool g_quiet;         // ps2run_3ds_patch.py: nothing is drawn while this is set
+""", r"""bool unchanging(const std::uint8_t *data, std::uint32_t bytes);   // ps2run_3ds_patch.py: both take a place in main PS2 memory
+void rewritten(const std::uint8_t *data, std::uint32_t bytes);
+extern bool g_quiet;         // ps2run_3ds_patch.py: nothing is drawn while this is set
+"""),
+    ],
+    'runtime/src/gs/queue.cpp': [
+        (r"""#include "ps2/system.hpp"
+""", r"""#include "ps2/memory.hpp"
+#include "ps2/system.hpp"
+"""),
+        (r"""bool g_ee_skip = false;
+""", r"""bool g_ee_skip = false;
+
+// ps2run_3ds_patch.py: model and texture data that the game sends every picture from the same place, unchanged, need not be copied to
+// the VU thread, which can read PS2 memory itself. Copying it was the largest single cost on the game thread: about 230 cycles a
+// cache line. A block counts as unchanging once the same bytes have been seen four times running, and is then checked again every
+// 24 to 39 sends. The game also builds packets afresh for each picture, in buffers it uses again two pictures later, and in a still
+// scene those can look unchanging too. So a 4 KB page of PS2 memory that was ever seen to change, or that the game filled from the
+// scratchpad, never counts. What is left: if a block changes for the first time between two checks while the VU thread is more
+// than a picture behind, that one picture is drawn from the newer bytes. Build with -DPS2_VIF_COPY to copy everything as before.
+namespace {
+std::uint32_t g_rewritten[kRamSize / 4096 / 32];
+struct Unchanging {
+    const std::uint8_t *data;
+    std::uint32_t bytes, hash;
+    std::uint8_t same, rest;
+};
+Unchanging g_unchanging[16384];
+}
+
+void rewritten(const std::uint8_t *data, std::uint32_t bytes) {
+    const std::uint32_t first = static_cast<std::uint32_t>(data - g_ram) >> 12, last = static_cast<std::uint32_t>(data - g_ram + bytes - 1) >> 12;
+    for (std::uint32_t p = first; p <= last && p < kRamSize / 4096; ++p) g_rewritten[p >> 5] |= 1u << (p & 31u);
+}
+
+bool unchanging(const std::uint8_t *data, std::uint32_t bytes) {
+#ifdef PS2_VIF_COPY
+    return false;
+#else
+    Unchanging &e = g_unchanging[(static_cast<std::uint32_t>(data - g_ram) >> 4) * 2654435761u >> 18];
+    const bool known = e.data == data && e.bytes == bytes;
+    if (known && e.rest) {
+        --e.rest;
+        return true;
+    }
+    const std::uint32_t first = static_cast<std::uint32_t>(data - g_ram) >> 12, last = static_cast<std::uint32_t>(data - g_ram + bytes - 1) >> 12;
+    for (std::uint32_t p = first; p <= last; ++p)
+        if (g_rewritten[p >> 5] & (1u << (p & 31u))) return false;
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i + 4 <= bytes; i += 4) {
+        std::uint32_t w;
+        std::memcpy(&w, data + i, 4);
+        h = (h ^ w) * 16777619u;
+    }
+    if (known && h == e.hash) {
+        if (e.same < 3) ++e.same;
+        if (e.same >= 3) e.rest = static_cast<std::uint8_t>(24u + (h >> 28));
+    } else {
+        if (known) rewritten(data, bytes);
+        e = Unchanging{data, bytes, h, 0, 0};
+    }
+    return false;
+#endif
+}
+"""),
+    ],
+    'runtime/src/dmac.cpp': [
+        (r"""#include "gs/gs.hpp"
+""", r"""#include "gs/gs.hpp"
+#include "gs/queue.hpp"
+"""),
+        (r"""        std::memcpy(target(at), g_spr + from, static_cast<std::size_t>(n) * 16);
+""", r"""        std::memcpy(target(at), g_spr + from, static_cast<std::size_t>(n) * 16);
+#ifdef PS2_PICA
+        if (!(at & 0x80000000u)) gs::queue::rewritten(target(at), n * 16);   // ps2run_3ds_patch.py: the game builds its packets this way
+#endif
+"""),
+    ],
+    'runtime/src/gs/gif.cpp': [
+        (r"""    if (path == 3 && qwc >= 256 && gs::queue::g_ee_skip && data >= g_ram && data + qwc * 16u <= g_ram + kRamSize) {
+""", r"""    // A shown picture's goes the same way if the game has sent the same bytes from the same place several times running.
+    if (path == 3 && data >= g_ram && data + qwc * 16u <= g_ram + kRamSize &&
+        ((qwc >= 256 && gs::queue::g_ee_skip) || (qwc >= 16 && gs::queue::vu_active() && gs::queue::unchanging(data, qwc * 16u)))) {
+"""),
+    ],
+    'runtime/src/vif.cpp': [
+        (r"""Unit g_units[2];
+""", r"""// ps2run_3ds_patch.py: for run_unchanging, what the game side's commands touched. g_side: something outside the unit's registers (a
+// stop, the PATH3 mask, data for the GIF, or an unpack in mode 2, which adds to the row registers). g_wrote: which registers, as kW bits.
+bool g_side = false;
+std::uint32_t g_wrote = 0;
+Unit g_units[2];
+"""),
+        (r"""    const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
+    u.code = cmd;
+""", r"""    const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
+    if (is_shadow) {
+        if ((cmd & 0x80000000u) || op == 0x06 || op == 0x50 || op == 0x51) g_side = true;
+        switch (op) {
+        case 0x01: g_wrote |= 1u; break;
+        case 0x02: g_wrote |= 2u | 4u | 8u; break;
+        case 0x03: g_wrote |= 16u; break;
+        case 0x04: g_wrote |= 32u; break;
+        case 0x05: g_wrote |= 64u; break;
+        case 0x07: g_wrote |= 128u; break;
+        case 0x14: case 0x15: case 0x17: g_wrote |= unit ? 256u | 512u | 4u | 8u : 512u; break;
+        case 0x20: g_wrote |= 1024u; break;
+        case 0x30: g_wrote |= 2048u; break;
+        case 0x31: g_wrote |= 4096u; break;
+        default:
+            if ((op & 0x60u) == 0x60u) {
+                if (u.mode == 2) g_side = true;
+                g_wrote |= 8192u;
+            }
+            break;
+        }
+        g_wrote |= 16384u;
+    }
+    u.code = cmd;
+"""),
+        (r"""void keep_data(const std::uint32_t *words, std::size_t count) {
+""", r"""// ps2run_3ds_patch.py: unchanging data (see unchanging() in gs/queue.cpp) is the same commands every picture, so their effect on this
+// side's registers is the same too, given the registers they start from. That effect is kept and replayed, and the VU thread, which
+// still runs every command, gets the whole transfer as one address. Two thirds of this game's commands come this way, and parsing them
+// here cost more than copying them. What a transfer can read on this side is the cycle, the mode and the double-buffer registers, so
+// those and the data are the key. Only transfers that end on a whole command, with nothing changed outside the registers, are kept.
+enum : std::uint32_t { kWCycle = 1, kWOfst = 2, kWDbf = 4, kWTops = 8, kWBase = 16, kWItops = 32, kWMode = 64, kWMark = 128, kWTop = 256,
+                       kWItop = 512, kWMask = 1024, kWRow = 2048, kWCol = 4096, kWNum = 8192, kWCode = 16384 };
+struct Key {
+    std::uint32_t cycle, mode, base, ofst, tops, itops, dbf;
+    bool operator==(const Key &o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
+};
+Key key_of(const Unit &u) { return Key{u.cycle, u.mode, u.base, u.ofst, u.tops, u.itops, u.dbf ? 1u : 0u}; }
+struct Replay {
+    const std::uint8_t *data;
+    std::uint32_t qwc, wrote;
+    Key before;
+    std::uint32_t cycle, ofst, tops, base, itops, mode, mark, top, itop, mask, row[4], col[4], num, code;
+    bool dbf;
+};
+void record(Replay &r, const Unit &u) {
+    r.cycle = u.cycle; r.ofst = u.ofst; r.tops = u.tops; r.base = u.base; r.itops = u.itops; r.mode = u.mode; r.mark = u.mark;
+    r.top = u.top; r.itop = u.itop; r.mask = u.mask; r.num = u.num; r.code = u.code; r.dbf = u.dbf;
+    std::memcpy(r.row, u.row, sizeof r.row);
+    std::memcpy(r.col, u.col, sizeof r.col);
+}
+void replay(const Replay &r, Unit &u) {
+    const std::uint32_t w = r.wrote;
+    if (w & kWCycle) u.cycle = r.cycle;
+    if (w & kWOfst) u.ofst = r.ofst;
+    if (w & kWDbf) u.dbf = r.dbf;
+    if (w & kWTops) u.tops = r.tops;
+    if (w & kWBase) u.base = r.base;
+    if (w & kWItops) u.itops = r.itops;
+    if (w & kWMode) u.mode = r.mode;
+    if (w & kWMark) u.mark = r.mark;
+    if (w & kWTop) u.top = r.top;
+    if (w & kWItop) u.itop = r.itop;
+    if (w & kWMask) u.mask = r.mask;
+    if (w & kWRow) std::memcpy(u.row, r.row, sizeof r.row);
+    if (w & kWCol) std::memcpy(u.col, r.col, sizeof r.col);
+    if (w & kWNum) u.num = r.num;
+    if (w & kWCode) u.code = r.code;
+}
+constexpr std::uint32_t kReplays = 4096;
+Replay *g_replays = nullptr;   // 512 KB, from the heap on first use
+std::uint32_t replay_slot(const std::uint8_t *data, std::uint32_t qwc, const Key &k) {
+    std::uint32_t h = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(data)) * 2654435761u ^ qwc;
+    const auto *w = reinterpret_cast<const std::uint32_t *>(&k);
+    for (std::size_t i = 0; i < sizeof k / 4; ++i) h = (h ^ w[i]) * 16777619u;
+    return (h ^ (h >> 15)) & (kReplays - 1);
+}
+
+void send_address(const std::uint32_t *words, std::size_t count) {
+    if (g_kept_words) send_kept();
+    auto *record = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 8));
+    record[0] = static_cast<std::uint32_t>(count) | 0x80000000u;
+    record[1] = static_cast<std::uint32_t>(reinterpret_cast<const std::uint8_t *>(words) - g_ram);
+}
+
+// Returns false if the transfer does not qualify, and the caller goes on as before.
+bool run_unchanging(int unit, Unit &u, const std::uint8_t *data, std::uint32_t qwc) {
+    if (u.stalled || !u.pending.empty() || u.dropping || u.passing || qwc < 4 || data < g_ram || data + qwc * 16u > g_ram + kRamSize ||
+        !gs::queue::unchanging(data, qwc * 16u))
+        return false;
+    if (!g_replays) g_replays = new Replay[kReplays]();
+    const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+    const std::size_t count = static_cast<std::size_t>(qwc) * 4;
+    const Key before = key_of(u);
+    Replay &slot = g_replays[replay_slot(data, qwc, before)];
+    send_address(words, count);
+    if (slot.data == data && slot.qwc == qwc && slot.before == before) {
+        replay(slot, u);
+        return true;
+    }
+    g_side = false;
+    g_wrote = kWCode;   // a transfer of only padding still clears the code register
+    const std::size_t pos = run(unit, u, false, true, words, count);
+    if (pos < count) {
+        u.pending.assign(words + pos, words + count);
+    } else if (!g_side && !u.stalled) {
+        slot.data = data;
+        slot.qwc = qwc;
+        slot.wrote = g_wrote;
+        slot.before = before;
+        record(slot, u);
+    }
+    return true;
+}
+
+void keep_data(const std::uint32_t *words, std::size_t count) {
+"""),
+        (r"""    if (is_shadow && (gs::queue::g_ee_skip || u.dropping || u.passing)) {
+""", r"""    if (is_shadow && run_unchanging(unit, u, data, qwc)) return;   // ps2run_3ds_patch.py
+    bool by_address = is_shadow && (gs::queue::g_ee_skip || u.dropping || u.passing);
+    if (is_shadow && !by_address && qwc >= 8 && !u.stalled && u.pending.size() == 1 && data >= g_ram &&
+        data + qwc * 16u <= g_ram + kRamSize && gs::queue::unchanging(data, qwc * 16u)) {
+        // An unpack command at the end of the last transfer, which was copied across, and this unchanging transfer its data. The
+        // command runs here now, and the VU thread, which also holds it, gets the data as an address.
+        const std::uint32_t cmd = u.pending.front(), need = data_words(u, cmd);
+        if ((cmd & 0xE0000000u) == 0x60000000u && u.mode != 2 && need && need <= static_cast<std::size_t>(qwc) * 4) {
+            execute(unit, u, false, true, cmd, reinterpret_cast<const std::uint32_t *>(data));
+            u.pending.clear();
+            u.passing = need;
+            by_address = true;
+        }
+    }
+    if (by_address) {
+"""),
+    ],
+}
+
+
 def fail(msg):
     print("PATCH NOT APPLIED:", msg)
     raise SystemExit(1)
@@ -5019,7 +5389,7 @@ def fail(msg):
 originals = {}
 texts = {}
 pending = 0
-for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items()):
+for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items()):
     rel = key.split('#')[0]   # the part after # only keeps two lists for one file apart
     if rel in texts:
         t = texts[rel]
@@ -5030,7 +5400,7 @@ for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(),
         except OSError:
             fail("cannot read " + rel)
         # Unwind the later stages in memory so their inputs can be verified.
-        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()))):
+        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()))):
             if t.count(new) == 1:
                 t = t.replace(new, old)
                 pending -= 1

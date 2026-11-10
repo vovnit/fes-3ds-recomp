@@ -235,6 +235,9 @@ namespace {
 
 int g_pmu_a = -1, g_pmu_b = -1;
 u64 g_pmu_last[5];
+#ifdef PS2_PROF_ALL
+u64 g_prof_enters[40];   // how often each activity was switched to, so the cost of the switches themselves can be taken off
+#endif
 
 u64 pmu_read(PerfCounterRegister r) {
     u64 v = 0;
@@ -252,6 +255,15 @@ void pmu_start() {
     rc |= svcControlPerformanceCounter(&v, PERFCOUNTEROP_SET_EVENT, PERFCOUNTERREG_CORE_COUNT_REG_1, g_pmu_b);
     rc |= svcControlPerformanceCounter(&v, PERFCOUNTEROP_RESET, 0xFFFFFFFFu, 0xFFFFFFFFu);
     std::fprintf(stderr, "[pmu] events %d %d, setup %08lX\n", g_pmu_a, g_pmu_b, static_cast<unsigned long>(rc));
+#ifdef PS2_PROF_ALL
+    {
+        const u64 c0 = pmu_read(PERFCOUNTERREG_CORE_CYCLE_COUNTER), a0 = pmu_read(PERFCOUNTERREG_CORE_COUNT_REG_0), b0 = pmu_read(PERFCOUNTERREG_CORE_COUNT_REG_1);
+        for (int i = 0; i < 4096; ++i) ps2::prof::switch_events(ps2::prof::g_events_at);
+        const u64 c1 = pmu_read(PERFCOUNTERREG_CORE_CYCLE_COUNTER), a1 = pmu_read(PERFCOUNTERREG_CORE_COUNT_REG_0), b1 = pmu_read(PERFCOUNTERREG_CORE_COUNT_REG_1);
+        std::fprintf(stderr, "[pmu] 4096 switches cost cycles %llu a %llu b %llu\n", static_cast<unsigned long long>(c1 - c0),
+                     static_cast<unsigned long long>(a1 - a0), static_cast<unsigned long long>(b1 - b0));
+    }
+#endif
     ps2::iop_timing(true);
 }
 
@@ -273,6 +285,8 @@ void pmu_line() {
     for (int k = 0; k < kBuckets; ++k) {
         const u64 a = ps2::prof::g_events[k][0] - printed[k][0], b = ps2::prof::g_events[k][1] - printed[k][1];
         if (a || b) std::fprintf(g_perf, " ev_%s %llu %llu", kNames[k], static_cast<unsigned long long>(a), static_cast<unsigned long long>(b));
+        if (g_prof_enters[k]) std::fprintf(g_perf, " sw_%s %llu", kNames[k], static_cast<unsigned long long>(g_prof_enters[k]));
+        g_prof_enters[k] = 0;
         printed[k][0] = ps2::prof::g_events[k][0];
         printed[k][1] = ps2::prof::g_events[k][1];
     }
@@ -297,6 +311,7 @@ void switch_events(int to) {
         last[1] = b;
     }
     g_events_at = to;
+    ++g_prof_enters[to];
 }
 }
 #endif
