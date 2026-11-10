@@ -38,6 +38,8 @@
 #include <sys/stat.h>
 #include <vector>
 
+namespace gen { extern bool g_lossy; }   // native3ds.cpp
+
 extern "C" {
 // Program + these + the PS2 RAM must fit the 124 MB a New 3DS application gets.
 u32 __ctru_heap_size = 28u << 20;
@@ -458,6 +460,7 @@ void read_settings() {
         else if (!std::strcmp(key, "iopthread")) g_iop_thread = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "uncapped")) g_hold_speed = std::strtoul(value, nullptr, 10) == 0;
         else if (!std::strcmp(key, "mvdprobe")) g_mvd_probe = std::strtoul(value, nullptr, 10) != 0;
+        else if (!std::strcmp(key, "lossy")) gen::g_lossy = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "draw")) g_draw_every = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         else if (!std::strcmp(key, "shots")) {
             mkdir("sdmc:/p3fes/shots", 0777);

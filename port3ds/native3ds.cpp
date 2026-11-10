@@ -3,6 +3,7 @@
 // generated code declares them where it calls them. Each returns false for anything it does not cover, and the game's code runs.
 // The video routines were compared with the game's own code on every call for about 2,000 frames of the opening movie.
 #include "ps2/generated.hpp"
+#include "pica.hpp"
 #ifdef PS2_CHECK_NATIVES
 #include "ps2/system.hpp"
 #include <cstdio>
@@ -17,7 +18,18 @@ using namespace ps2;
 using u8 = std::uint8_t;
 using u32 = std::uint32_t;
 
+// Lossy cuts, on unless args.txt says lossy 0. The game works out a picture during the one before it, so these go by whether the
+// next picture will be skipped. They leave out work whose results only that picture would use: the bone animation below, and
+// the engine's render pipelines (native_skip_render). A skipped picture is never drawn, and the next shown one does all of it again.
+bool g_lossy = true;
+
 namespace {
+
+inline bool hidden() {
+    if (!g_lossy || !ps2::gs::pica::g_after_hidden) return false;
+    ps2::gs::pica::g_render_left_out = true;
+    return true;
+}
 
 constexpr u32 kEven = 0x00FF00FFu;
 
@@ -375,6 +387,11 @@ bool native_pose_blend(Cpu &c) {
         close = !(fp::key(bits) < static_cast<std::int32_t>(0x3F7FBE77u));
     }
 
+    if (hidden()) {
+        c.fcr31 = close ? (c.fcr31 & ~kFpuCondition) : (c.fcr31 | kFpuCondition);
+        c.budget -= spent + 17 + 5 + (close ? 0 : 160);
+        return true;
+    }
     float w0 = 1.0f - t, w1 = t;
     if (!close) {
         const u32 bits = std::bit_cast<u32>(dot), magnitude = bits & fp::kAbs;
@@ -486,6 +503,10 @@ bool native_pose_matrix(Cpu &c) {
     u8 *to_bytes = range(to_at, 64);
     const u8 *from_bytes = range(from_at, 36);
     if (!to_bytes || !from_bytes) return false;
+    if (hidden()) {
+        c.budget -= 60;
+        return true;
+    }
     auto *to = reinterpret_cast<Float *>(to_bytes);
     const auto *from = reinterpret_cast<const Float *>(from_bytes);
     const float x = from[2], y = from[3], z = from[4], w = from[5];
@@ -511,6 +532,17 @@ bool native_pose_matrix(Cpu &c) {
     return true;
 }
 
+// The engine's pipeline runner (RenderWare's RxPipelineExecute, it seems): it sets up a few globals and calls the pipeline's first
+// node, which runs the rest. It is how every model is drawn, at about a third of the game core's time in the lobby, and nothing but
+// the drawing reads what the nodes make. For a picture that will be skipped it returns at once, with its first argument as it does
+// when it succeeds. With the drawing in the same order on the Mac, pictures after such a gap match those of a full run exactly.
+bool native_skip_render(Cpu &c) {
+    if (!hidden()) return false;
+    c.r[2].d[0] = c.r[4].d[0];
+    c.budget -= 40;
+    return true;
+}
+
 // Functions named native_loop_ run at the top of a loop in the game and do all of its passes but the last. The game's own code then
 // does that one, which leaves every register as the game would, and they need not fit the whole loop's exit.
 
@@ -527,7 +559,7 @@ void native_loop_bone_matrices(Cpu &c) {
     alignas(16) float model[16], part[16];
     std::memcpy(model, &c.vu0.vf[13], 64);
     const auto *m = reinterpret_cast<const Float *>(model);
-    for (u32 i = 0; i < count; ++i, to += 64, rows += stride, basis += stride) {
+    for (u32 i = hidden() ? count : 0; i < count; ++i, to += 64, rows += stride, basis += stride) {
         const auto *b = reinterpret_cast<const Float *>(basis);
         const auto *a = reinterpret_cast<const Float *>(rows);
         auto *p = reinterpret_cast<Float *>(part);

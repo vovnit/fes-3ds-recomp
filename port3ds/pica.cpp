@@ -138,7 +138,7 @@ std::uint32_t g_last_triangle_serial = 0, g_last_triangle_setup = 0, g_last_tria
 std::uint32_t g_last_triangle_colour = 0;
 constexpr std::uint32_t kSkip = 1, kSkipping = 2, kDrawNothing = 4;
 std::uint32_t g_next_picture = 0, g_game_vblanks = 0;
-std::uint32_t g_draw_every = 0, g_picture = 0, g_skipped_in_row = 0, g_skip_run = 0, g_stat_skipped = 0;
+std::uint32_t g_draw_every = 0, g_picture = 0, g_skipped_in_row = 0, g_skip_run = 0, g_stat_skipped = 0, g_stat_forced = 0;
 u64 g_round_start = 0, g_round_blocked = 0, g_round_idle = 0, g_seen_blocked = 0, g_seen_idle = 0;
 std::uint32_t g_frame_number = 0;
 std::uint32_t g_stat_prim[8], g_stat_upload = 0;
@@ -1050,6 +1050,7 @@ void begin_frame() {
 bool active() { return g_active; }
 void set_present_every(std::uint32_t vblanks) { g_present_every = vblanks; }
 void set_shot_every(std::uint32_t frames) { g_shot_every = frames; }
+bool g_after_hidden = false, g_render_left_out = false;
 void set_draw_every(std::uint32_t pictures) { g_draw_every = pictures; }
 void set_stats(bool on) { g_stats = on; }
 void set_dump_frame(std::uint64_t frame) { g_dump_frame = frame; }
@@ -1245,10 +1246,20 @@ void choose_next_picture() {
             skip = true;
         }
     }
+    // The game builds a picture before this decision is made for it, and the lossy render cut (native_skip_render) goes by the
+    // guess below. Should a picture it left out come up to be shown after all, it is skipped instead, and the last one stays up.
+    if (g_render_left_out && !skip) {
+        skip = true;
+        ++g_stat_forced;
+    }
+    g_render_left_out = false;
     g_skipped_in_row = skip ? g_skipped_in_row + 1 : 0;
     g_stat_skipped += skip;
     const bool test_aid = skip && (g_debug & 4u);   // skip the drawing but still run the vector programs
     queue::g_ee_skip = skip && !test_aid;
+    // Whether the picture after this one will be skipped, as things stand. The game works it out during this one.
+    if (g_draw_every > 1) g_after_hidden = (g_picture + 1) % g_draw_every != 0;
+    else g_after_hidden = !g_draw_every && queue::vu_active() && !test_aid && g_skipped_in_row < g_skip_now;
     g_next_picture = (skip && !test_aid ? kSkip : 0u) | (test_aid ? kDrawNothing : 0u) | (g_skip_run || g_draw_every > 1 ? kSkipping : 0u);
 }
 
@@ -1312,9 +1323,9 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r) {
         u64 known = g_ticks[Vu] + g_ticks[Upload] + g_ticks[Iop] + g_ticks[Ipu];   // Gif is inside Vu
         static std::uint64_t last_interpreted = 0, last_clock = 0, last_idle = 0;
         static std::uint32_t last_frame = 0;
-        std::fprintf(stderr, "[pica] %lu game frames in %lu ms, %lu ms each, %lu pictures skipped\n", static_cast<unsigned long>(frame - last_frame), ms(total), frame != last_frame ? ms(total) / static_cast<unsigned long>(frame - last_frame) : 0ul, static_cast<unsigned long>(g_stat_skipped));
+        std::fprintf(stderr, "[pica] %lu game frames in %lu ms, %lu ms each, %lu pictures skipped (%lu of them with their render left out by mistake)\n", static_cast<unsigned long>(frame - last_frame), ms(total), frame != last_frame ? ms(total) / static_cast<unsigned long>(frame - last_frame) : 0ul, static_cast<unsigned long>(g_stat_skipped), static_cast<unsigned long>(g_stat_forced));
         last_frame = frame;
-        g_stat_skipped = 0;
+        g_stat_skipped = g_stat_forced = 0;
         const std::uint64_t interpreted = ps2::vu1_interpreted_calls();
         const std::uint64_t clock = ps2::now(), idled = ps2::idle_cycles();
         std::fprintf(stderr, "[pica] ee %llu K cycles, %llu K idle | prims pt %lu ln %lu strip %lu tri %lu tstrip %lu fan %lu sprite %lu | upload %lu KB\n", static_cast<unsigned long long>((clock - last_clock) / 1000u), static_cast<unsigned long long>((idled - last_idle) / 1000u),

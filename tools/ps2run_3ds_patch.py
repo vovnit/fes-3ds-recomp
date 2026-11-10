@@ -5380,6 +5380,162 @@ void keep_data(const std::uint32_t *words, std::size_t count) {
 }
 
 
+# Unchanging VIF transfers keep the records run_skipped sends (commands copied, long unpack data by address) and send them again,
+# instead of the whole transfer as one address, which let the VU thread read a buffer the game had already rebuilt and lose its place
+# in the commands (2026-11-10).
+VIFREC_EDITS = {
+    'runtime/src/vif.cpp': [
+        (r"""
+void send_kept() {
+""", r"""
+// ps2run_3ds_patch.py: while run_unchanging parses a transfer for the first time, the records it sends are also written here, so the
+// next time the same records can go again without parsing. g_capture_left runs out (and the transfer is not kept) if they do not fit.
+std::uint32_t *g_capture = nullptr;
+std::uint32_t g_capture_words = 0, g_capture_left = 0;
+bool g_capture_full = false;
+void capture(const std::uint32_t *record, std::uint32_t words) {
+    if (!g_capture) return;
+    if (words > g_capture_left) {
+        g_capture_full = true;
+        return;
+    }
+    std::memcpy(g_capture + g_capture_words, record, words * 4u);
+    g_capture_words += words;
+    g_capture_left -= words;
+}
+
+void send_kept() {
+"""),
+        (r"""        std::memcpy(record + 1, words, n * 4u);
+        words += n;
+""", r"""        std::memcpy(record + 1, words, n * 4u);
+        capture(record, 1u + n);
+        words += n;
+"""),
+        (r"""    std::uint32_t cycle, ofst, tops, base, itops, mode, mark, top, itop, mask, row[4], col[4], num, code;
+    bool dbf;
+""", r"""    std::uint32_t cycle, ofst, tops, base, itops, mode, mark, top, itop, mask, row[4], col[4], num, code;
+    std::uint32_t records, words, epoch;   // what to send the VU thread: g_records[records], words long, if epoch is still g_epoch
+    bool dbf;
+"""),
+        (r"""
+void send_address(const std::uint32_t *words, std::size_t count) {
+    if (g_kept_words) send_kept();
+    auto *record = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 8));
+    record[0] = static_cast<std::uint32_t>(count) | 0x80000000u;
+    record[1] = static_cast<std::uint32_t>(reinterpret_cast<const std::uint8_t *>(words) - g_ram);
+}
+
+// Returns false if the transfer does not qualify, and the caller goes on as before.
+bool run_unchanging(int unit, Unit &u, const std::uint8_t *data, std::uint32_t qwc) {
+    if (u.stalled || !u.pending.empty() || u.dropping || u.passing || qwc < 4 || data < g_ram || data + qwc * 16u > g_ram + kRamSize ||
+        !gs::queue::unchanging(data, qwc * 16u))
+        return false;
+    if (!g_replays) g_replays = new Replay[kReplays]();
+    const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+    const std::size_t count = static_cast<std::size_t>(qwc) * 4;
+    const Key before = key_of(u);
+    Replay &slot = g_replays[replay_slot(data, qwc, before)];
+    send_address(words, count);
+    if (slot.data == data && slot.qwc == qwc && slot.before == before) {
+        replay(slot, u);
+        return true;
+    }
+    g_side = false;
+    g_wrote = kWCode;   // a transfer of only padding still clears the code register
+    const std::size_t pos = run(unit, u, false, true, words, count);
+    if (pos < count) {
+        u.pending.assign(words + pos, words + count);
+    } else if (!g_side && !u.stalled) {
+        slot.data = data;
+        slot.qwc = qwc;
+        slot.wrote = g_wrote;
+        slot.before = before;
+        record(slot, u);
+""", r"""
+// The records each kept transfer sends, one after another; when full it starts again from the front and every kept transfer is
+// parsed once more. 256 KB, from the heap on first use.
+constexpr std::uint32_t kRecordWords = 65536, kKeptRecordWords = 4096;
+std::uint32_t *g_records = nullptr;
+std::uint32_t g_records_used = 0, g_epoch = 1;
+
+std::size_t run_skipped(int unit, Unit &u, const std::uint32_t *words, std::size_t count);
+
+// Returns false if the transfer does not qualify, and the caller goes on as before.
+//
+// The VU thread must get the same commands as this side: it reads PS2 memory later, and the game may have built something else in the
+// same place by then (it rewrites some buffers every picture). So, as in run_skipped, commands are copied and only long unpack data
+// goes as an address. The first time, run_skipped parses the transfer and the records it sends are kept; later the same records go
+// again. Sending the whole transfer as one address instead let the VU thread read a rebuilt buffer, lose its place in the commands,
+// stop at data it took for an interrupt command and hold every later transfer until memory ran out.
+bool run_unchanging(int unit, Unit &u, const std::uint8_t *data, std::uint32_t qwc) {
+    if (u.stalled || !u.pending.empty() || u.dropping || u.passing || qwc < 4 || data < g_ram || data + qwc * 16u > g_ram + kRamSize ||
+        !gs::queue::unchanging(data, qwc * 16u))
+        return false;
+    if (!g_replays) {
+        g_replays = new Replay[kReplays]();
+        g_records = new std::uint32_t[kRecordWords];
+    }
+    const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+    const std::size_t count = static_cast<std::size_t>(qwc) * 4;
+    const Key before = key_of(u);
+    Replay &slot = g_replays[replay_slot(data, qwc, before)];
+    if (g_kept_words) send_kept();
+    if (slot.data == data && slot.qwc == qwc && slot.before == before && slot.epoch == g_epoch) {
+        std::uint32_t at = slot.records, left = slot.words;
+        while (left) {   // in pieces no bigger than send_kept's
+            std::uint32_t n = 0;
+            while (n < left) {
+                const std::uint32_t r = g_records[at + n], size = r >> 31 ? 2u : 1u + r;
+                if (n && n + size > 1u + kCopiedWords) break;
+                n += size;
+            }
+            std::memcpy(gs::queue::vu().extend(gs::queue::kVif1Records, n * 4u), g_records + at, n * 4u);
+            at += n;
+            left -= n;
+        }
+        replay(slot, u);
+        return true;
+    }
+    // Records for a skipped picture leave out data that picture does not need, so they are not kept.
+    const bool keep_records = !gs::queue::g_ee_skip;
+    if (keep_records) {
+        if (kRecordWords - g_records_used < kKeptRecordWords) {
+            g_records_used = 0;
+            ++g_epoch;
+        }
+        g_capture = g_records + g_records_used;
+        g_capture_words = 0;
+        g_capture_left = kKeptRecordWords;
+        g_capture_full = false;
+    }
+    g_side = false;
+    g_wrote = kWCode;   // a transfer of only padding still clears the code register
+    const std::size_t pos = run_skipped(unit, u, words, count);
+    g_capture = nullptr;
+    if (pos < count) {
+        u.pending.assign(words + pos, words + count);
+    } else if (keep_records && !g_capture_full && !g_side && !u.stalled && !u.dropping && !u.passing) {
+        slot.data = data;
+        slot.qwc = qwc;
+        slot.wrote = g_wrote;
+        slot.before = before;
+        slot.records = g_records_used;
+        slot.words = g_capture_words;
+        slot.epoch = g_epoch;
+        g_records_used += g_capture_words;
+        record(slot, u);
+"""),
+        (r"""    record[1] = static_cast<std::uint32_t>(at - g_ram);
+}
+""", r"""    record[1] = static_cast<std::uint32_t>(at - g_ram);
+    capture(record, 2);
+}
+"""),
+    ],
+}
+
+
 def fail(msg):
     print("PATCH NOT APPLIED:", msg)
     raise SystemExit(1)
@@ -5389,7 +5545,7 @@ def fail(msg):
 originals = {}
 texts = {}
 pending = 0
-for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items()):
+for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items()):
     rel = key.split('#')[0]   # the part after # only keeps two lists for one file apart
     if rel in texts:
         t = texts[rel]
@@ -5400,7 +5556,7 @@ for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(),
         except OSError:
             fail("cannot read " + rel)
         # Unwind the later stages in memory so their inputs can be verified.
-        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()))):
+        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()))):
             if t.count(new) == 1:
                 t = t.replace(new, old)
                 pending -= 1
