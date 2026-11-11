@@ -26,7 +26,7 @@ void set_debug(std::uint32_t bits);              // test aid: 1 no depth test, 2
 
 void draw(const State &s, std::uint32_t serial, std::uint64_t clamp);
 extern bool g_after_hidden;      // set by next_picture(): the picture after the one it chose will be skipped
-extern bool g_render_left_out;   // set by native_skip_render: next_picture() must not show the picture being built
+extern bool g_render_left_out;   // set by lossy_return (native3ds.cpp): next_picture() must not show the picture being built
 std::uint32_t next_picture();   // on the game thread at each PS2 vblank: what the next picture is, passed on to vblank()
 void vblank(std::uint32_t frame, const DisplayRegs &regs, std::uint32_t picture);   // a PS2 vblank, with what was on show then
 void note_transfer(const State &s, std::uint64_t dir);   // a transfer into GS memory starts

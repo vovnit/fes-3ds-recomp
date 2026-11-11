@@ -20,7 +20,7 @@ using u32 = std::uint32_t;
 
 // Lossy cuts, on unless args.txt says lossy 0. The game works out a picture during the one before it, so these go by whether the
 // next picture will be skipped. They leave out work whose results only that picture would use: the bone animation below, and
-// the engine's render pipelines (native_skip_render). A skipped picture is never drawn, and the next shown one does all of it again.
+// the engine's render pipelines (lossy_return, for port3ds/lossy.txt). A skipped picture is never drawn, and the next shown one does all of it again.
 bool g_lossy = true;
 
 namespace {
@@ -532,14 +532,20 @@ bool native_pose_matrix(Cpu &c) {
     return true;
 }
 
-// The engine's pipeline runner (RenderWare's RxPipelineExecute, it seems): it sets up a few globals and calls the pipeline's first
-// node, which runs the rest. It is how every model is drawn, at about a third of the game core's time in the lobby, and nothing but
-// the drawing reads what the nodes make. For a picture that will be skipped it returns at once, with its first argument as it does
-// when it succeeds. With the drawing in the same order on the Mac, pictures after such a gap match those of a full run exactly.
-bool native_skip_render(Cpu &c) {
+// Hot copies of the functions in port3ds/lossy.txt start with this (tools/p3fes_eehot.py --lossy). For a picture that will be
+// skipped they return at once, with v0 = 0, or with v0 = a0 where the list says so; otherwise the copy runs as usual. The list:
+// - 0x004F2E70, the engine's pipeline runner (RenderWare's RxPipelineExecute, it seems), returns a0 when it succeeds. It sets up a few
+//   globals and calls the pipeline's first node, which runs the rest. Every model is drawn through it, and nothing but the drawing
+//   reads what the nodes make.
+// With it left out of three vblanks in four on the Mac, in the lobby, lockers and the first battle, every picture after such a gap
+// matched a full run exactly. Two more passed that test but are off in the list: 0x004916D0 (the scene's draw lists) turns the
+// dorm's floor white after a fade-in, and 0x004CF4C0 (called while objects are updated and drawn) changes a small patch of a face
+// in the lockers on the 3DS. Leaving out 0x00311730 or 0x00466EF0 changed later pictures on the Mac.
+bool lossy_return(Cpu &c, bool keep_a0) {
     if (!hidden()) return false;
-    c.r[2].d[0] = c.r[4].d[0];
+    c.r[2].d[0] = keep_a0 ? c.r[4].d[0] : 0;
     c.budget -= 40;
+    c.pc = c.r[31].w[0];
     return true;
 }
 

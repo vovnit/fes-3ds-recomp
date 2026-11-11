@@ -1246,7 +1246,7 @@ void choose_next_picture() {
             skip = true;
         }
     }
-    // The game builds a picture before this decision is made for it, and the lossy render cut (native_skip_render) goes by the
+    // The game builds a picture before this decision is made for it, and the lossy render cut (lossy_return) goes by the
     // guess below. Should a picture it left out come up to be shown after all, it is skipped instead, and the last one stays up.
     if (g_render_left_out && !skip) {
         skip = true;

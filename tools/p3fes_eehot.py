@@ -26,7 +26,7 @@ Steps, in the ps2-web-recomp folder (NAT is the natives list, here ../fes-pc-rec
      then make a native build of build/eehot-count and run the scene with PS2_EEHOT=games/p3fes/hot/NAME.txt set.
   3. The copies:
        python3 tools/p3fes_eehot.py make build/eehot-src generated/p3fes --profile games/p3fes/hot/*.txt \\
-           --natives NAT --natives-out build/eehot-natives.txt --functions build/eehot-functions.txt --gp 007D2CF0
+           --natives NAT --natives-out build/eehot-natives.txt --functions build/eehot-functions.txt --gp 007D2CF0 --lossy port3ds/lossy.txt
   4. The game with the calls to them:
        build/tools/eerecomp games/p3fes/disc/SLUS_216.21 --entries games/p3fes/entries.txt \\
            --natives build/eehot-natives.txt --out generated/p3fes
@@ -763,6 +763,8 @@ class Clone:
         if decl:
             out.append('    std::uint32_t %s;' % decl[:-2])
         out.append('    PS2_HOT_GATE(%d)' % number)
+        if self.label in LOSSY:   # port3ds/lossy.txt: return at once when the next picture is skipped
+            out.append('    PS2_HOT_LOSSY(%s)' % ('true' if LOSSY[self.label] else 'false'))
         out.append('    std::int32_t bud = c.budget;')
         if self.entry_load:
             out.append('    ' + load_code(self.entry_load).rstrip())
@@ -872,6 +874,8 @@ class Clone:
         return True
 
 
+LOSSY = {}   # label -> True when v0 is set to a0
+
 HEADER = '''// Made by tools/p3fes_eehot.py from your own disc: keep it private.
 #pragma once
 
@@ -895,6 +899,14 @@ extern int g_hot_lo, g_hot_hi;
 #define PS2_HOT_GATE(k) if ((k) < g_hot_lo || (k) >= g_hot_hi) return false;
 #else
 #define PS2_HOT_GATE(k)
+#endif
+
+// --lossy: on the 3DS, port3ds/native3ds.cpp says whether the copy returns at once (a0: with v0 = a0, else v0 = 0)
+#ifdef __3DS__
+bool lossy_return(ps2::Cpu &c, bool keep_a0);
+#define PS2_HOT_LOSSY(a0) if (lossy_return(c, a0)) return true;
+#else
+#define PS2_HOT_LOSSY(a0)
 #endif
 
 '''
@@ -1045,6 +1057,14 @@ def cmd_make(args):
         clones2[label] = c
     clones = clones2
 
+    if args.lossy:
+        for line in open(args.lossy):
+            line = line.split('#')[0].split()
+            if line:
+                LOSSY['L_' + line[0].upper()] = line[1] == 'a0'
+        lost = sorted(set(LOSSY) - set(clones))
+        if lost:
+            raise SystemExit('--lossy: these got no hot copy: ' + ', '.join(lost))
     texts = {}
     lines_total = 0
     for number, (label, c) in enumerate(sorted(clones.items())):
@@ -1189,6 +1209,7 @@ def main():
     mk.add_argument('--no-pointers', dest='pointers', action='store_false', help='only functions that are called directly')
     mk.add_argument('--functions', help='function starts, written by eerecomp when EERECOMP_FUNCTIONS=file is set')
     mk.add_argument('--skip', help='a file of addresses that get no copy')
+    mk.add_argument('--lossy', help='a file of addresses, then 0 or a0: their copies return at once for a skipped picture')
     mk.add_argument('--trust', type=int, default=0, help='1: do not write back registers a called function does not read; '
                     '2: also those a caller does not read after a return (not exact, see CALL_TEMPS in this file)')
     mk.add_argument('--trust-check', action='store_true', help='with --trust: write markers where a write-back was left out, for a native check run')

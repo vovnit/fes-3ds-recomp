@@ -1,0 +1,6 @@
+# Functions whose hot copies return at once when the next picture will be skipped (tools/p3fes_eehot.py --lossy; see lossy_return
+# in native3ds.cpp). Address, then what v0 is set to: 0, or a0. Text after # is ignored.
+004F2E70 a0
+# 004CF4C0 0   lockers 18.1 -> 17.6 ms on the console, battle 1.5% fewer cycles, lobby no change; but a distant character's face
+#              (a 20x20 patch) differs from the full run in the lockers in Azahar
+# 004916D0 0   left out: the dorm's floor comes up white after a fade-in (Azahar, dorm.state)
