@@ -58,6 +58,13 @@ PS2_WAKE_TRACE=30 with the store watch: the keyframe gap (frames 2669 -> 2893) i
 - **Reading:** same family as the opening stalls above: a script step waits for a character to be off screen. With the wider view he is not counted as off screen, or he is held at the edge, so he keeps playing the walk animation. Not confirmed.
 - **Tests so far (2 November 2026, current build):** stuck with widescreen on; stuck with only `ws10` off; stuck with every code part except `ws11` off (never turn `ws11` off: Fuuka stalls in the Morning scene). **Fine in 4:3.** So the wide view itself is the cause, not any one patch part.
 - **Confirmed (3 November 2026):** with `PS2_PATCH=007cad1c=3fd9999a/3faaaaab` (x field of view 1.70 instead of 1.7778) Akihiko walks off and the scene finishes. So the cause is the full-width 16:9 view: his walk-off point is inside it. Now the launcher default (`WS_PATCH` = 3fd9999a); true 16:9 is 3fe38e38. Cost: about 4% less visible at the sides and a slight sideways stretch. Proper fix would be the game's real off-screen test (not found).
+- **Search for the off-screen test (11 November 2026, disassembly only, nothing tested in the scene; there is no state saved there).** The game draws with RenderWare, and these addresses are its camera code:
+  - `RwCameraSetViewWindow` at 0x004c9f90: view window at camera+104/108, its inverse at +112/116. 0x001a4580 (the `ws11_zoom` target) feeds it x = FOV(007cad1c)·tan, y = tan.
+  - Camera sync at 0x004c9ad0 (set at 0x004ca100). It builds the 6 frustum planes at camera+148 (20 bytes each), the box at +268 and the corners at +292.
+  - `RwCameraFrustumTestSphere` at 0x004c9df0. Its 20 callers were all checked: every one is draw culling (field models 0x001a5000 to 0x001ad300, 0x00315d80, 0x003595d0, 0x00499398), not a scene step.
+  - The view matrix at camera+32 already holds the view window, so code that projects with it gets x/z·640 in 0..640 across the wide view. The helpers that do this (0x00329a60 tests 0..640 × 0..448; 0x002d20a0 tests −640..1280; 0x001dd530, 0x00250f80) widen together with the FOV. Their callers are effects and 2D markers; the scene's test was not among those read.
+  - No other code reads the current camera's frustum planes.
+  - Next step: a save state just before Akihiko walks off, then trace which of these runs while the scene waits.
 
 ## Which widescreen part cures the stalls (found 23 October 2026)
 Bisected in the PC window with `P3F_WS_OFF` and `PS2_POKE` lines in `~/.p3fes-window-env`, no rebuilds, watching the school gate scene (4/21):

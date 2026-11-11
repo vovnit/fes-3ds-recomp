@@ -49,10 +49,30 @@ target_compile_options(ps2runtime PRIVATE -Wno-unused-parameter)
 # version as third_party/wgpu-native) and point P3FES_WGPU_DIR at it. Without it the CPU renderer draws.
 set(P3FES_WGPU_DIR "" CACHE PATH "wgpu-native iOS release folder (include/ and lib/libwgpu_native.a)")
 if(P3FES_WGPU_DIR AND EXISTS "${P3FES_WGPU_DIR}/lib/libwgpu_native.a")
+    # Faster drawing (flip.cpp): the shader's per-pixel flip_fix block is taken out of a copy of gs.wgsl in the build folder,
+    # and draw() does the same once per triangle (the anchor for that is with the gpu.cpp ones below).
+    set(PS2_GS_SRC "${PS2_ROOT}/runtime/src/gs/gpu/gs.wgsl")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PS2_GS_SRC}")
+    file(READ "${PS2_GS_SRC}" PS2_GS_TEXT)
+    set(PS2_FLIP_BEGIN "            // flip_fix: a 1:1 textured axis whose coordinate runs backwards is moved one texel\n")
+    set(PS2_FLIP_END "            at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, z_at(p, fat(p + 25u) * w1 + fat(p + 26u) * w2));\n")
+    string(FIND "${PS2_GS_TEXT}" "${PS2_FLIP_BEGIN}" PS2_FLIP_AT)
+    string(FIND "${PS2_GS_TEXT}" "${PS2_FLIP_BEGIN}" PS2_FLIP_LAST REVERSE)
+    string(FIND "${PS2_GS_TEXT}" "${PS2_FLIP_END}" PS2_FLIP_END_AT)
+    string(FIND "${PS2_GS_TEXT}" "${PS2_FLIP_END}" PS2_FLIP_END_LAST REVERSE)
+    if(PS2_FLIP_AT EQUAL -1 OR NOT PS2_FLIP_AT EQUAL PS2_FLIP_LAST OR PS2_FLIP_END_AT EQUAL -1 OR NOT PS2_FLIP_END_AT EQUAL PS2_FLIP_END_LAST
+       OR PS2_FLIP_END_AT LESS PS2_FLIP_AT)
+        message(FATAL_ERROR "gs.wgsl changed: cannot find the one flip_fix block in the raster shader")
+    endif()
+    string(SUBSTRING "${PS2_GS_TEXT}" 0 ${PS2_FLIP_AT} PS2_GS_HEAD)
+    string(SUBSTRING "${PS2_GS_TEXT}" ${PS2_FLIP_END_AT} -1 PS2_GS_TAIL)
+    file(WRITE "${CMAKE_BINARY_DIR}/gs_ios.wgsl.new"
+        "${PS2_GS_HEAD}            // flip_fix: done once per triangle when draw() queues it (portios: flip.cpp)\n${PS2_GS_TAIL}")
+    file(COPY_FILE "${CMAKE_BINARY_DIR}/gs_ios.wgsl.new" "${CMAKE_BINARY_DIR}/gs_ios.wgsl" ONLY_IF_DIFFERENT)
     set(PS2_GS_WGSL "${CMAKE_BINARY_DIR}/gs_wgsl.cpp")
     add_custom_command(OUTPUT "${PS2_GS_WGSL}"
-        COMMAND ${CMAKE_COMMAND} -DSRC=${PS2_ROOT}/runtime/src/gs/gpu/gs.wgsl -DOUT=${PS2_GS_WGSL} -DNAME=kGsShader -P ${PS2_ROOT}/cmake/embed.cmake
-        DEPENDS ${PS2_ROOT}/runtime/src/gs/gpu/gs.wgsl ${PS2_ROOT}/cmake/embed.cmake)
+        COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_BINARY_DIR}/gs_ios.wgsl -DOUT=${PS2_GS_WGSL} -DNAME=kGsShader -P ${PS2_ROOT}/cmake/embed.cmake
+        DEPENDS ${CMAKE_BINARY_DIR}/gs_ios.wgsl ${PS2_ROOT}/cmake/embed.cmake)
     set(PS2_BLIT_WGSL "${CMAKE_BINARY_DIR}/blit_wgsl.cpp")
     add_custom_command(OUTPUT "${PS2_BLIT_WGSL}"
         COMMAND ${CMAKE_COMMAND} -DSRC=${PS2_ROOT}/runtime/src/gs/gpu/blit.wgsl -DOUT=${PS2_BLIT_WGSL} -DNAME=kBlitShader -P ${PS2_ROOT}/cmake/embed.cmake
@@ -91,15 +111,17 @@ if(P3FES_WGPU_DIR AND EXISTS "${P3FES_WGPU_DIR}/lib/libwgpu_native.a")
     # Resolution: the app picks the scale (ios_main.mm, PS2_SCALE); 4x lets an iPad's picture be as tall as its screen.
     set(PS2_SCALE_ANCHOR "g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);")
     set(PS2_SCISSOR_ANCHOR "    const int scax0 = static_cast<int>(setup[10] & 0xFFFFu), scax1 = static_cast<int>(setup[10] >> 16);\n")
-    foreach(anchor PS2_GPU_NS_ANCHOR PS2_DRAW_ANCHOR PS2_PRESENT_ANCHOR PS2_SCISSOR_ANCHOR PS2_SCALE_ANCHOR)
+    # Faster drawing: where draw() has filled in a triangle's corners (flip.cpp).
+    set(PS2_FLIP_ANCHOR "        for (int i = 0; i < 3; ++i) attrs(rec, i, v[i], fst, iip ? nullptr : &v[2]);\n")
+    foreach(anchor PS2_GPU_NS_ANCHOR PS2_DRAW_ANCHOR PS2_PRESENT_ANCHOR PS2_SCISSOR_ANCHOR PS2_SCALE_ANCHOR PS2_FLIP_ANCHOR)
         string(FIND "${PS2_GPU_TEXT}" "${${anchor}}" PS2_ANCHOR_AT)
         string(FIND "${PS2_GPU_TEXT}" "${${anchor}}" PS2_ANCHOR_LAST REVERSE)
         if(PS2_ANCHOR_AT EQUAL -1 OR NOT PS2_ANCHOR_AT EQUAL PS2_ANCHOR_LAST)
-            message(FATAL_ERROR "gpu.cpp changed: cannot find the one place for ${anchor} (widescreen)")
+            message(FATAL_ERROR "gpu.cpp changed: cannot find the one place for ${anchor}")
         endif()
     endforeach()
     string(REPLACE "${PS2_GPU_NS_ANCHOR}"
-        "\nfloat portios_aspect();   // portios: wide.cpp\nvoid portios_presented(std::uint32_t fbp);\nconst ps2::gs::Vertex *portios_widen(const ps2::gs::State &st, const ps2::gs::Vertex *v, int count, ps2::gs::Vertex *out);\nvoid portios_clip(int &x0, int &x1);\n${PS2_GPU_NS_ANCHOR}"
+        "\nfloat portios_aspect();   // portios: wide.cpp\nvoid portios_presented(std::uint32_t fbp);\nconst ps2::gs::Vertex *portios_widen(const ps2::gs::State &st, const ps2::gs::Vertex *v, int count, ps2::gs::Vertex *out);\nvoid portios_clip(int &x0, int &x1);\nvoid portios_flip(std::uint32_t *rec, const std::uint32_t *setup);   // portios: flip.cpp\n${PS2_GPU_NS_ANCHOR}"
         PS2_GPU_TEXT "${PS2_GPU_TEXT}")
     string(REPLACE "${PS2_DRAW_ANCHOR}" "${PS2_DRAW_ANCHOR}    Vertex portios_v[3];   // portios: wide.cpp\n    v = ::portios_widen(st, v, count, portios_v);\n"
         PS2_GPU_TEXT "${PS2_GPU_TEXT}")
@@ -108,10 +130,13 @@ if(P3FES_WGPU_DIR AND EXISTS "${P3FES_WGPU_DIR}/lib/libwgpu_native.a")
     string(REPLACE "${PS2_SCISSOR_ANCHOR}"
         "    int scax0 = static_cast<int>(setup[10] & 0xFFFFu), scax1 = static_cast<int>(setup[10] >> 16);\n    ::portios_clip(scax0, scax1);   // portios: wide.cpp\n"
         PS2_GPU_TEXT "${PS2_GPU_TEXT}")
+    string(REPLACE "${PS2_FLIP_ANCHOR}" "${PS2_FLIP_ANCHOR}        ::portios_flip(rec, setup);   // portios: flip.cpp\n"
+        PS2_GPU_TEXT "${PS2_GPU_TEXT}")
     string(REPLACE "${PS2_PRESENT_ANCHOR}" "${PS2_PRESENT_ANCHOR}    g_aspect = ::portios_aspect();   // portios: wide.cpp\n    ::portios_presented(src.fbp);\n"
         PS2_GPU_TEXT "${PS2_GPU_TEXT}")
     file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/gpu_ios.cpp" CONTENT "${PS2_GPU_TEXT}" @ONLY)
-    target_sources(ps2runtime PRIVATE "${CMAKE_BINARY_DIR}/gpu_ios.cpp" "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" "${CMAKE_CURRENT_SOURCE_DIR}/wide.cpp")
+    target_sources(ps2runtime PRIVATE "${CMAKE_BINARY_DIR}/gpu_ios.cpp" "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" "${CMAKE_CURRENT_SOURCE_DIR}/wide.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/flip.cpp")
     target_include_directories(ps2runtime PRIVATE "${PS2_ROOT}/runtime/src/gs/gpu" "${PS2_ROOT}/runtime/src/gs")
     target_compile_definitions(ps2runtime PUBLIC PS2_GPU)
     target_include_directories(ps2runtime PRIVATE "${P3FES_WGPU_DIR}/include")

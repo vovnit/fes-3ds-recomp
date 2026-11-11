@@ -127,8 +127,17 @@ the app starts, because the GPU renderer sets up its memory for one scale when t
 frames a second and the scale in the top left corner.
 
 The renderer imitates the PS2's GPU exactly, and its work grows with the square of the scale. In the Simulator on an M1 Pro
-(14 GPU cores), lockers scene, full screen: 60 fps at 1x and 2x, 42 at 3x, 26 at 4x, limited by the GPU (no CPU thread
-is busy). An M1 iPad has 8 GPU cores, so expect 2x to be about the most that keeps 60 there; the screen-matching scale is
+(14 GPU cores), lockers scene: 60 fps at 1x and 2x, 47 at 3x, 29 at 4x (42 and 26 before `flip.cpp`), limited by the GPU
+(no CPU thread is busy).
+
+Faster drawing (`flip.cpp`, 11 November 2026): the renderer's drawing pass is most of the GPU's work (about 80%). It
+checked every pixel of a textured triangle for a texture drawn backwards at 1:1 ("flip_fix"), work that is the same for
+the whole triangle. The iOS build now does it once per triangle on the CPU, and its copy of the shader leaves it out.
+Measured with the native build's GPU timestamps at 2x (M1 Pro): the drawing pass went from 13.1 to 12.1 ms a frame in the
+school lobby, 21.3 to 17.6 in the locker room and 15.6 to 12.7 in a battle. The pictures are the same: frames compared
+with the old shader are identical in the battle, and elsewhere differ by 1/255 in at most 62 pixels of 1.1 million (float
+rounding). Tried and dropped, because they were slower on this GPU: testing depth before working out colour and texture,
+and copying each tile's triangles into workgroup memory. An M1 iPad has 8 GPU cores, so expect 2x to be about the most that keeps 60 there; the screen-matching scale is
 likely too slow on both devices. The runtime allows up to 3x; the iOS copy of gpu.cpp allows 4x. Save states load at any
 scale (the runtime converts the picture memory).
 
@@ -226,6 +235,8 @@ Tested in the iOS Simulator (iPhone 18 Pro, iOS 27.2):
 - `CMakeLists.txt`: the runtime, the generated code and the app; `P3FES_WGPU_DIR` switches on GPU drawing (and the gpu.cpp copy)
 - `ios_main.mm`: the UIKit front end (disc lookup, frames, pacing, sound, input, save states, screen shape, menu)
 - `wide.cpp`: the screen shape in the renderer (narrows the 2D layer, gives `present()` the picture's shape)
+- `flip.cpp`: faster drawing (a per-pixel check of the GPU shader done once per triangle; CMakeLists.txt takes it out of
+  the iOS copy of `gs.wgsl`)
 - `touch.mm`: the on-screen controls
 - `webdav.mm`: save sync with a WebDAV server (memory card and save states)
 - `Info.plist.in`: app settings (Files app sharing, landscape, controllers)
