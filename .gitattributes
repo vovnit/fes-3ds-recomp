@@ -1,0 +1,3 @@
+# Windows batch files need CRLF (labels and goto break with LF). Stored as-is so raw downloads and zips keep them.
+*.bat -text
+*.cmd -text
