@@ -9,6 +9,7 @@
 #include <cstdio>
 #endif
 
+#include <algorithm>
 #include <bit>
 #include <cstring>
 
@@ -239,6 +240,71 @@ bool native_memcpy(Cpu &c) {
     std::memcpy(d, s, n);
     c.r[2].sd[0] = static_cast<std::int32_t>(to);
     c.budget -= 16 + static_cast<std::int32_t>(n >> 3);
+    return true;
+}
+
+// The function names below come from the public symbol lists of two related projects (snaku/Persona3-FES-Decompilation and
+// ppkkkkk/p3fes-recompiled), matched to the 8 recorded scene profiles: together these four were 3 to 5% of the game's
+// instructions in every scene.
+
+// Bytes from a to the end of the memory area it is in, as range() sees it.
+static u32 room(u32 a) {
+    if ((a >> 29) == 1) a &= 0x0FFFFFFFu;
+    if (a < kRamSize) return kRamSize - a;
+    if ((a >> 14) == (kScratchpadBase >> 14)) return kScratchpadSize - (a & (kScratchpadSize - 1));
+    return 0;
+}
+
+// _sceSDC and _sceIDC, the SDK's data-cache write-back and invalidate: both walk the 64 lines of a cache way and read the
+// tag of each. The runtime has no cache and its translation drops the cache instructions, so the walk only changes scratch
+// registers. This leaves them as the walk's last turn does and charges the walk's instructions (about 1,700 per call).
+bool native_cache_walk(Cpu &c) {
+    const std::uint64_t mask = 0xFFFFFFFFFFFFF000ull;   // a3 after lui 0xFFFF / ori 0xF000
+    const std::uint64_t tag = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(mfc0(c, 28u, 0u)))) & mask;
+    const std::uint64_t lo = c.r[4].d[0], hi = c.r[5].d[0];
+    std::int32_t charge = 4;
+    std::uint32_t above = 0;
+    for (u32 i = 0; i < 4096u; i += 64u) {
+        const auto x = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(static_cast<u32>(tag) + i)));
+        above = hi < x ? 1u : 0u;
+        const bool below = x < lo;
+        for (int half = 0; half < 2; ++half) charge += below ? 10 : above ? 12 : 15;
+        charge += 5;
+    }
+    charge += 2;
+    c.r[2].d[0] = 0;
+    set32(c.r[3], above);
+    set32(c.r[6], 4096u);
+    c.r[7].d[0] = mask;
+    c.budget -= charge;
+    return true;
+}
+
+// strcmp: 0 for equal strings, otherwise the difference of the first two bytes that differ, as unsigned bytes.
+bool native_strcmp(Cpu &c) {
+    const u32 a = c.r[4].w[0], b = c.r[5].w[0];
+    const u32 n = std::min(room(a), room(b));
+    if (!n) return false;
+    const u8 *p = range(a, n), *q = range(b, n);
+    u32 i = 0;
+    while (i < n && p[i] == q[i] && p[i]) ++i;
+    if (i == n) return false;   // ran to the end of memory: let the game's code do what it does there
+    set32(c.r[2], static_cast<u32>(p[i]) - static_cast<u32>(q[i]));
+    set32(c.r[3], p[i]);
+    c.budget -= ((a | b) & 7u) ? 10 + static_cast<std::int32_t>(8 * i) : 25 + static_cast<std::int32_t>(i + (i >> 1));
+    return true;
+}
+
+// memset: returns its first argument.
+bool native_memset(Cpu &c) {
+    const u32 to = c.r[4].w[0], n = c.r[6].w[0];
+    if (n) {
+        u8 *d = range(to, n);
+        if (!d) return false;
+        std::memset(d, static_cast<int>(c.r[5].w[0] & 0xFFu), n);
+    }
+    c.r[2].d[0] = c.r[4].d[0];
+    c.budget -= 10 + static_cast<std::int32_t>(n >> 3);
     return true;
 }
 

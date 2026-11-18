@@ -22,7 +22,11 @@
 004FE680 avg_chroma_x
 004FE750 avg_luma_xy
 004FE870 avg_chroma_xy
+005039B0 cache_walk
+00503AF0 cache_walk
 00521250 memcpy
+00521408 memset
+00524128 strcmp
 0053A410 adx_frames
 0053A9B8 adx_stereo
 00578160 find_code

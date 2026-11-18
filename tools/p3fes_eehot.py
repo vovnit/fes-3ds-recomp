@@ -26,7 +26,8 @@ Steps, in the ps2-web-recomp folder (NAT is the natives list, here ../fes-pc-rec
      then make a native build of build/eehot-count and run the scene with PS2_EEHOT=games/p3fes/hot/NAME.txt set.
   3. The copies:
        python3 tools/p3fes_eehot.py make build/eehot-src generated/p3fes --profile games/p3fes/hot/*.txt \\
-           --natives NAT --natives-out build/eehot-natives.txt --functions build/eehot-functions.txt --gp 007D2CF0 --lossy port3ds/lossy.txt
+           --natives NAT --natives-out build/eehot-natives.txt --functions build/eehot-functions.txt --gp 007D2CF0 --lossy port3ds/lossy.txt \\
+           --skip port3ds/hot_skip.txt
   4. The game with the calls to them:
        build/tools/eerecomp games/p3fes/disc/SLUS_216.21 --entries games/p3fes/entries.txt \\
            --natives build/eehot-natives.txt --out generated/p3fes
