@@ -1,6 +1,16 @@
 # Update log
 Newest first. The launcher shows the same list under Extra > Update log (the source is `CHANGES` in `tools/launcher/ui/index.html`; keep the two in step).
 
+## 0.67 · 18 Nov 2026 · Newer engine, related projects
+
+- **FIXED**  p3fes_win_setup.bat (BUILD THE PC WINDOW) had come in with Unix line endings, which can break the labels and jumps of a Windows batch file; it and three older .bat files have Windows line endings again, and the repository now keeps .bat files exactly as written so downloads and launcher updates cannot change them.
+- **NEW**  The newer PS2 Web Recomp (12 November 2026, 117 changes since the version we use) can be tried: p3fes_install.sh --engine next --dir ~/ps2-web-recomp-next. Every tool patch fits it and it builds and passes its own tests, but nobody has played it yet, so the default stays the tested version. It brings fixes we carried as patches (the PATH3 mask and the vector-unit branch delay, which our patches now leave to it), an interpreter for code the translation missed, timer and sound fixes and testing tools. What changed and what to check: docs/engine-update.md.
+- **NEW**  tools/p3fes_engine_check.py applies every tool patch to any PS2 Web Recomp version and says which do not fit; with --build it also builds that version and runs its own tests (no game data needed). The first thing to run when the engine changes.
+- **IMPROVED**  Browser game: the launcher now asks the game page for a 4:3 screen. Newer engine pages start at 16:9 and would stretch the picture with Widescreen off; older pages ignore it. Needs p3fes_launcher.py.
+- **IMPROVED**  ps2recomp_modswitch_patch.py changes nothing unless every edit fits; before, a project version it did not know could be left half patched.
+- **NEW**  tools/p3fes_symbols.py: function names from two public research projects (the snaku decompilation and the ppkkkkk recompilation), matched against the script function table of your own executable, with suggested names for tools/script_names.txt. The lists are downloaded to your computer, never into this repository. Script functions 10 and 11 are now guessed as random and sync.
+- **IMPROVED**  README: a Related projects section with the other projects around this game and the engine, and what we use from each.
+
 ## 0.66 · 17 Nov 2026 · Calendar moons, Aigis portrait, ATLUS after Return
 
 - **FIXED**  Calendar transition: the waning moon icons (the mirrored ones, e.g. 16 to 22 July) were about 2.5 original pixels left of their dates and weekdays; the waxing ones lined up. The moon picture is now moved back by 2.5 texels when it runs backwards (ps2gpu_moonfix_patch.py). Works in the PC window and the browser (rebuild both).

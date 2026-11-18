@@ -162,7 +162,7 @@ All tools need only Python 3.8 or later (no extra packages). Test them without a
 | `ps2run_sifquiet_patch.py` | Prints the harmless `[sif] command 0x........ has no handler` message once per command number instead of every time, for both the PC runner and the browser build. |
 | `ps2web_autosave_patch.py` | Full-state autosave for the browser build: the whole game is saved every 2 minutes and after each in-game save, and the start screen offers Resume to continue exactly where you were. An Autosave button lists, resumes and deletes the saves. See `docs/autosave.md`. |
 | `ps2web_autosaveopts_patch.py` | Autosave settings for the browser build: turn automatic saving off or pick the interval (1 to 30 minutes), turn off saving after each in-game save, and choose how many saves to keep. See `docs/autosave.md`. |
-| `p3fes_install.sh` | One-command install for newcomers (Ubuntu on Windows or Linux): installs packages, downloads the tested version of PS2 Web Recomp, applies every patch in order, builds from your own disc and writes `play.sh`. See [docs/install.md](docs/install.md). |
+| `p3fes_install.sh` | One-command install for newcomers (Ubuntu on Windows or Linux): installs packages, downloads the tested version of PS2 Web Recomp, applies every patch in order, builds from your own disc and writes `play.sh`. `--engine next` tries the newer engine version ([docs/engine-update.md](docs/engine-update.md)). See [docs/install.md](docs/install.md). |
 | `ps2run_tricenter_patch.py` | Opt-in test (`PS2_TRI_CENTER=1`, CPU drawing route): triangle textures are read at pixel centres, like the real chip, to test the dashed outlines on the Tartarus minimap tiles. |
 | `ps2run_flipfix_patch.py` | Opt-in test (`PS2_TRI_FLIPFIX=1`, CPU drawing route, use with `PS2_TRI_CENTER=1`): flipped minimap tiles are moved one texel so they line up with unflipped ones. |
 | `p3fes_pnach_apply.py` | Bakes PCSX2 `.pnach` code patches (such as gameplay mods, one or several with live on/off switches) into a copy of the boot program for recompiling, checks it against the original words named in the patch's comments, and lists the new code entry points. See [docs/mods.md](docs/mods.md). |
@@ -182,6 +182,8 @@ All tools need only Python 3.8 or later (no extra packages). Test them without a
 | `p3fes_vu.py` | `scan` reports how the boot executable uses the PS2 vector units: VU0 macro-mode instructions, VU microcode blocks and microprogram uploads (numbers and addresses only). |
 | `p3fes_bf.py` | The `.BF` scripts: `survey`, `analyse`, `messages`, `listing` (one script as readable statements), `msgcheck`, `balance`, `export` (every script as readable text), `context` (sample call sites of one function), `disasm` (raw instructions), `hex`; and for the boot executable: `functions`, `peek`, `code` (MIPS), `limit`, `lui`, `switch`, `ref`, `comm` (the script function table). |
 | `p3fes_textsurvey.py` | Surveys the message files and file-type counts of an extracted folder. |
+| `p3fes_symbols.py` | `fetch` downloads the public function lists of two related projects (see [Related projects](#related-projects)) to your PC; `comm` names the handler of every script function in your own boot executable and suggests names for `script_names.txt`; `find` says which function holds an address. |
+| `p3fes_engine_check.py` | Applies every tool patch to a clean copy of any PS2 Web Recomp version and lists the ones that do not fit; `--build` also builds it and runs its own tests. See [docs/engine-update.md](docs/engine-update.md). |
 
 ## Quick start (Windows)
 1. Install Python from python.org (tick "Add python.exe to PATH"). In a Command Prompt, use `py` instead of `python`.
@@ -230,8 +232,24 @@ In short: the game is one code image with no overlays, built on Sony's PS2 SDK a
 - **Format researchers:** scripts (`.BF`) are not decoded yet; the `.BED` effect parameter fields and the sound sequence details (timing, pitch, envelopes, pan, control events) are only partly known. The model chunks whose meaning is unknown are listed in [docs/formats.md](docs/formats.md#not-understood-yet).
 - Open an issue before starting large work so we do not duplicate effort.
 
-## Related work
-An independent matching-decompilation project for this game exists at https://github.com/snaku/Persona3-FES-Decompilation. We are not affiliated with it and have not coordinated with its authors. A native port would build on that kind of work, so we hope to cooperate in future.
+## Related projects
+We are not affiliated with any of these projects and have not coordinated with their authors; this is what each is and what we use from it.
+
+**The engine and what is built on it**
+| Project | What it is | What we use |
+| --- | --- | --- |
+| [snuri00/ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) (MIT) | Static recompiler and PS2 runtime for the browser and a native window. | Everything runs on it: `p3fes_install.sh` downloads it and applies our patches. A newer version than the tested one can be tried with `--engine next` ([docs/engine-update.md](docs/engine-update.md)); two of our fixes (PATH3 mask, VU branch delay) are part of it now. |
+| [exoteric33/ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) | A fork of that engine aimed at native Windows and Linux (Direct3D 12 or Vulkan) with many games tested, Persona 4 among them. | Nothing yet: it has moved too far for our patches (27 of 68 fit) and its vector-unit fixes are written for its own compiler. Worth watching for fixes to bring over. |
+| [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp) (GPL-3.0) | Another static recompiler for PS2 programs. | Compared when the approach was chosen ([docs/phase1-decisions.md](docs/phase1-decisions.md)). |
+
+**Other work on this game**
+| Project | What it is | What we use |
+| --- | --- | --- |
+| [Virtual-AK/fes-pc-recomp](https://github.com/Virtual-AK/fes-pc-recomp) | The original home of this project; the launcher updates from it by default. | This repository follows it. |
+| [snaku/Persona3-FES-Decompilation](https://github.com/snaku/Persona3-FES-Decompilation) | A matching decompilation of the NTSC-U executable. A native port would build on that kind of work, so we hope to cooperate in future. | Its function list (names only, downloaded to your PC by `p3fes_symbols.py fetch`) to name script functions. |
+| [ppkkkkk/p3fes-recompiled](https://github.com/ppkkkkk/p3fes-recompiled) (GPL-3.0) | A separate static recompilation of this game on PS2Recomp with the PCSX2 graphics renderer; it reaches the story and Tartarus. | Its function map (names only, downloaded the same way), and its notes on the sound-effect modules (the game loads the synthesizer module twice) as a reference if sound effects ever go quiet. |
+| [LeOn0408/p3fes-recomp](https://github.com/LeOn0408/p3fes-recomp) | Packages this project's patches as a WebAssembly build that can be put inside any web app (notes in Russian). | Its notes on hosting the browser build (range requests, the cross-origin headers, HTTPS for phones). |
+| [hessef/p3d](https://github.com/hessef/p3d) | A planned port of this game to the Nintendo 3DS, as a series of learning projects (early: the first graphics project is done). | Nothing yet. |
 
 ## License
 The tools and documentation are released under the MIT license (see LICENSE).

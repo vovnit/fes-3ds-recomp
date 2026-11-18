@@ -69,3 +69,11 @@ Every patch still accepts the older text; where upstream changed the text, the p
 5. Sound effects and music over a long session (IOP timer and SPU2 changes).
 6. Essential Mods with switches (the mod-switch translator patch on the newer translator).
 If all of that holds, `PIN` can move to `PIN_NEXT`.
+
+## Other engines
+[exoteric33/ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) is a fork of the same engine for native Windows and
+Linux (Direct3D 12 or Vulkan), with Persona 4 among its tested games. Checked on 18 November 2026 with `p3fes_engine_check.py`:
+27 of our 68 patches fit it, so it is not a drop-in replacement. Its recent vector-unit fixes (the EFU stall for WAITP, a delay slot
+that is also a jump target, programs keyed by their code) are written for its own restructured VU compiler; on our engine the
+compiled VU1 programs are checked against the interpreter before they are trusted, which catches that kind of fault. They stay on
+the list of things to bring over if a fault shows up in this game.

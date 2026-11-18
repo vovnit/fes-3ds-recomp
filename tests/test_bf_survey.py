@@ -123,7 +123,7 @@ fl = bytearray(hdr + secs + lab('p', 0) + lab('l', 5) + ins_f)
 struct.pack_into('<I', fl, 4, len(fl) - 8); struct.pack_into('<I', fl, 0x20 + 40, 6)
 fl = bytes(fl)
 B.NAMES[9] = 'renamed'
-ok0 = ok0 and B.func_name(9) == 'renamed' and B.func_name(10) == 'common_10'
+ok0 = ok0 and B.func_name(9) == 'renamed' and B.func_name(18) == 'common_18'
 B.NAMES.clear()
 # inlining: PUSHIS 5, COMM 7, PUSHREG 0, EQ, IF  ->  if (5 == common_7()):  (function 7 taking 0 values here)
 ins_i = struct.pack('<9I', 7, 29 | (5 << 16), 8 | (7 << 16), 4, 22, 28, 9, 0, 0)[:28]
