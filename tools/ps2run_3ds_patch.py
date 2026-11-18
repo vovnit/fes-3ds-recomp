@@ -5892,6 +5892,87 @@ SPLIT_SKIP_EDITS = {
     ],
 }
 
+# SAMPLE=1 (port3ds/Makefile): the sampler also notes which compiled VU program the VU thread is running (2026-11-18).
+SAMPLE_EDITS = {
+    'runtime/include/ps2/system.hpp': [
+        ('''#else
+#define PS2_PROF(counter)
+#endif
+''', '''#else
+#define PS2_PROF(counter)
+#define PS2_PROF_EXTRA(k)
+#define PS2_SAMPLE_VU(fn)
+#endif
+'''),
+    ],
+    'runtime/src/vu_micro.cpp': [
+        ('''            else fn(g_vu1, g_vu1_mem);
+''', '''            else {
+                PS2_SAMPLE_VU(reinterpret_cast<std::uintptr_t>(fn));   // ps2run_3ds_patch.py
+                fn(g_vu1, g_vu1_mem);
+            }
+'''),
+        ('''    run_fast(unit, pc);
+}
+''', '''    PS2_SAMPLE_VU(std::uintptr_t{1});
+    run_fast(unit, pc);
+}
+'''),
+    ],
+    # What the VU thread's queue loop does between programs, for the sampler only (PS2_PROF_EXTRA is empty otherwise, and with
+    # PROF=1 it counts only on the game thread). x0 to x3 are taken by port3ds/pica.cpp.
+    'runtime/src/system.cpp': [
+        ('''            case gs::queue::kVif1Records: vif::transfer_records(payload, h.bytes); break;
+            case gs::queue::kGifAddress: {
+                const std::uint8_t *data;
+                std::memcpy(&data, payload, sizeof data);
+                gif::vu_path3(data, h.arg1);
+                break;
+            }
+''', '''            case gs::queue::kVif1Records: {
+                PS2_PROF_EXTRA(4);   // ps2run_3ds_patch.py
+                vif::transfer_records(payload, h.bytes);
+                break;
+            }
+            case gs::queue::kGifAddress: {
+                PS2_PROF_EXTRA(5);
+                const std::uint8_t *data;
+                std::memcpy(&data, payload, sizeof data);
+                gif::vu_path3(data, h.arg1);
+                break;
+            }
+'''),
+        ('''            case gs::queue::kGif:
+                if (h.arg0 == 3) gif::vu_path3(payload, h.arg1);
+#ifdef PS2_PICA
+                else gif::render(static_cast<int>(h.arg0), payload, h.arg1);
+''', '''            case gs::queue::kGif:
+                if (h.arg0 == 3) {
+                    PS2_PROF_EXTRA(5);
+                    gif::vu_path3(payload, h.arg1);
+                }
+#ifdef PS2_PICA
+                else {
+                    PS2_PROF_EXTRA(6);
+                    gif::render(static_cast<int>(h.arg0), payload, h.arg1);
+                }
+'''),
+        ('''            default:
+                if (gs::queue::g_split_pica)
+                    gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes);
+                else gs::serve(h.type, h.arg0, payload);
+                break;
+''', '''            default: {
+                PS2_PROF_EXTRA(7);
+                if (gs::queue::g_split_pica)
+                    gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes);
+                else gs::serve(h.type, h.arg0, payload);
+                break;
+            }
+'''),
+    ],
+}
+
 
 def fail(msg):
     print("PATCH NOT APPLIED:", msg)
@@ -5903,7 +5984,7 @@ originals = {}
 texts = {}
 pending = 0
 
-for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items(), *IOPAHEAD_EDITS.items(), *STALE_EDITS.items(), *MOVIE_EDITS.items(), *SPLIT_SKIP_EDITS.items()):
+for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items(), *IOPAHEAD_EDITS.items(), *STALE_EDITS.items(), *MOVIE_EDITS.items(), *SPLIT_SKIP_EDITS.items(), *SAMPLE_EDITS.items()):
     rel = key.split('#')[0]   # the part after # only keeps two lists for one file apart
     if rel in texts:
         t = texts[rel]
@@ -5914,7 +5995,7 @@ for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(),
         except OSError:
             fail("cannot read " + rel)
         # Unwind the later stages in memory so their inputs can be verified.
-        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()), *IOPAHEAD_EDITS.get(rel, ()), *STALE_EDITS.get(rel, ()), *MOVIE_EDITS.get(rel, ()), *SPLIT_SKIP_EDITS.get(rel, ()))):
+        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()), *IOPAHEAD_EDITS.get(rel, ()), *STALE_EDITS.get(rel, ()), *MOVIE_EDITS.get(rel, ()), *SPLIT_SKIP_EDITS.get(rel, ()), *SAMPLE_EDITS.get(rel, ()))):
             if t.count(new) == 1:
                 t = t.replace(new, old)
                 pending -= 1

@@ -331,22 +331,48 @@ void switch_events(int to) {
 
 #ifdef PS2_HOT_SAMPLE
 // SAMPLE=1: every 250 microseconds a thread on another core notes which copy from tools/p3fes_eehot.py the game thread is in (the
-// innermost one; code without a copy counts for the copy that called it) and, with PROF=1, which activity. Every 10 seconds it
-// appends what it counted to sdmc:/p3fes/samples.txt: "period N", then "copy activity count" lines (copy 0 is outside every copy,
-// activity 14 is the game code itself and 15 to 24 are PS2_PROF_EXTRA 0 to 9,
-// see prof.hpp), and starts again.
+// innermost one; code without a copy counts for the copy that called it) and which activity, and which compiled VU program the VU
+// thread is running and its activity. Every 10 seconds it appends what it counted to sdmc:/p3fes/samples.txt and starts again:
+// "period N", then "copy activity count" lines for the game thread (copy 0 is outside every copy) and "vu program activity count"
+// lines for the VU thread (program is a function address in build/3ds/p3fes.map, 1 the interpreter, 0 none). Activities are
+// prof.hpp's counters: 14 is outside every activity, 15 to 24 are PS2_PROF_EXTRA 0 to 9, 31 not known (PROF=1, VU thread).
+// tools/p3fes_samples.py reads it.
 namespace gen {
 volatile std::uint16_t g_hot_now;
 }
-#ifndef PS2_PROF_ALL
 namespace ps2::prof {
-volatile std::uint8_t g_where = Count;
-void *g_game_thread = nullptr;
-}
+#ifndef PS2_PROF_ALL
+volatile std::uint8_t g_where = Count, g_where_vu = Count;
+void *g_game_thread = nullptr, *g_vu_thread = nullptr;
 #endif
+volatile std::uintptr_t g_vu_program = 0;
+}
 namespace {
-constexpr int kSampleCopies = 1024, kSampleActs = 32;
+constexpr int kSampleCopies = 1024, kSampleActs = 32, kSamplePrograms = 512;
 std::uint32_t g_samples[kSampleCopies][kSampleActs];
+struct ProgramSamples {
+    std::uintptr_t fn;
+    std::uint32_t n[kSampleActs];
+};
+ProgramSamples g_program_samples[kSamplePrograms];
+
+std::uint32_t g_no_program[kSampleActs];
+
+void count_program(std::uintptr_t fn, int act) {
+    if (!fn) {
+        ++g_no_program[act];
+        return;
+    }
+    for (std::uint32_t i = static_cast<std::uint32_t>(fn >> 2) * 2654435761u >> 23, tries = 0; tries < kSamplePrograms;
+         i = (i + 1) & (kSamplePrograms - 1), ++tries) {
+        ProgramSamples &p = g_program_samples[i];
+        if (p.fn == fn || !p.fn) {
+            p.fn = fn;
+            ++p.n[act];
+            return;
+        }
+    }
+}
 
 void sampler(void *) {
     std::FILE *f = std::fopen("sdmc:/p3fes/samples.txt", "w");
@@ -357,19 +383,27 @@ void sampler(void *) {
         svcSleepThread(250000);
         const int k = gen::g_hot_now & (kSampleCopies - 1);
 #ifdef PS2_PROF_ALL
-        const int act = ps2::prof::g_events_at & (kSampleActs - 1);
+        const int act = ps2::prof::g_events_at & (kSampleActs - 1), vu_act = kSampleActs - 1;
 #else
-        const int act = ps2::prof::g_where & (kSampleActs - 1);
+        const int act = ps2::prof::g_where & (kSampleActs - 1), vu_act = ps2::prof::g_where_vu & (kSampleActs - 1);
 #endif
         ++g_samples[k][act];
+        count_program(ps2::prof::g_vu_program, vu_act);
         if (svcGetSystemTick() < next) continue;
         next += period;
         std::fprintf(f, "period %d\n", n++);
         for (int i = 0; i < kSampleCopies; ++i)
             for (int j = 0; j < kSampleActs; ++j)
                 if (g_samples[i][j]) std::fprintf(f, "%d %d %lu\n", i, j, static_cast<unsigned long>(g_samples[i][j]));
+        for (int j = 0; j < kSampleActs; ++j)
+            if (g_no_program[j]) std::fprintf(f, "vu 00000000 %d %lu\n", j, static_cast<unsigned long>(g_no_program[j]));
+        for (const ProgramSamples &p : g_program_samples)
+            for (int j = 0; j < kSampleActs; ++j)
+                if (p.n[j]) std::fprintf(f, "vu %08lX %d %lu\n", static_cast<unsigned long>(p.fn), j, static_cast<unsigned long>(p.n[j]));
         std::fflush(f);
         std::memset(g_samples, 0, sizeof g_samples);
+        std::memset(g_program_samples, 0, sizeof g_program_samples);
+        std::memset(g_no_program, 0, sizeof g_no_program);
     }
     std::fclose(f);
 }
@@ -606,6 +640,9 @@ void gs_main(void *) {
 
 // The VU worker owns the vector programs, and also draws when there is no separate GS worker.
 void vu_main(void *) {
+#if defined(PS2_HOT_SAMPLE) && !defined(PS2_PROF_ALL)
+    ps2::prof::g_vu_thread = getThreadLocalStorage();
+#endif
     if (wait_worker(g_worker_start) != WorkerState::Ready) return;
     const bool ready = g_split_gs || start_gpu();
     g_vu_ready.store(ready ? WorkerState::Ready : WorkerState::Failed);

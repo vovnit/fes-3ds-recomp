@@ -289,6 +289,7 @@ int uniform_alpha_pass(const std::uint16_t *indices, std::uint32_t count) {
 }
 
 void flush_batch() {
+    PS2_PROF_EXTRA(1);
     const std::uint32_t count = g_index_used - g_index_first;
     if (!count) return;
     if (g_bound_base != g_index_base) {
@@ -366,6 +367,7 @@ std::uint32_t sample_texels(std::uint32_t bp, std::uint32_t bw, std::uint32_t ps
 }
 
 void decode(Texture &e, const State &st, std::uint32_t cpsm, std::uint32_t csa, std::uint32_t ta0, std::uint32_t ta1, bool aem) {
+    PS2_PROF_EXTRA(2);
     const u64 start = svcGetSystemTick();
     const int w = e.tex.width, h = e.tex.height;
     const int gw = 1 << e.tw, gh = 1 << e.th;
@@ -1078,6 +1080,7 @@ void apply_state(const State &st, const Context &c, std::uint64_t attr) {
 }
 
 bool ensure_state(const State &st, const Context &c, std::uint64_t attr) {
+    PS2_PROF_EXTRA(3);
     const std::uint64_t key[13] = {st.fogcol, attr & ~7ull, c.frame, c.zbuf, c.test, c.alpha, c.scissor, c.tex0, c.tex1, c.clamp, st.texa, c.xyoffset, st.pabe};
     if (!g_key_valid || g_key_clut != g_clut_stamp || g_key_stamp != g_stamp || std::memcmp(key, g_key, sizeof key)) {
         std::memcpy(g_key, key, sizeof key);
@@ -1441,6 +1444,7 @@ void shutdown() {
 }
 
 void draw(const State &st, std::uint32_t serial, std::uint64_t clamp) {
+    PS2_PROF_EXTRA(0);   // for SAMPLE=1: shapes in, x1 to x3 below are apart
     if (g_draw_nothing || (!queue::g_split_pica && queue::g_quiet)) return;
     if (!g_frame_open) begin_frame();
     // Every register that can change the batch moves g_setup_generation, so a run of shapes checks just this one number.

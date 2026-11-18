@@ -43,28 +43,44 @@ struct Extra {
     }
 };
 #elif defined(PS2_HOT_SAMPLE)
-// SAMPLE=1 without PROF=1: the activity now on the game thread (Count is the game code itself, Count + 1 + k is PS2_PROF_EXTRA(k)),
-// read by the sampler in main3ds.cpp. Only a store, so these cost almost nothing.
+// SAMPLE=1 without PROF=1: the activity now on the game thread and on the VU thread (Count is outside every activity: the game code,
+// or on the VU thread its queue loop; Count + 1 + k is PS2_PROF_EXTRA(k)), read by the sampler in main3ds.cpp. Only a store, so
+// these cost almost nothing.
 inline constexpr int kExtra = 10;
-extern volatile std::uint8_t g_where;
-extern void *g_game_thread;
-inline bool on_game_thread() {
+extern volatile std::uint8_t g_where, g_where_vu;
+extern void *g_game_thread, *g_vu_thread;
+inline volatile std::uint8_t *where_slot() {
     void *tls;
     asm("mrc p15, 0, %0, c13, c0, 3" : "=r"(tls));
-    return tls == g_game_thread;
+    return tls == g_game_thread ? &g_where : tls == g_vu_thread ? &g_where_vu : nullptr;
 }
+inline bool on_game_thread() { return where_slot() == &g_where; }
 struct Where {
-    int outer = -1;
-    explicit Where(int k) {
-        if (on_game_thread()) {
-            outer = g_where;
-            g_where = static_cast<std::uint8_t>(k);
+    volatile std::uint8_t *slot;
+    std::uint8_t outer = 0;
+    explicit Where(int k) : slot(where_slot()) {
+        if (slot) {
+            outer = *slot;
+            *slot = static_cast<std::uint8_t>(k);
         }
     }
     ~Where() {
-        if (outer >= 0) g_where = static_cast<std::uint8_t>(outer);
+        if (slot) *slot = outer;
     }
 };
+#endif
+
+#ifdef PS2_HOT_SAMPLE
+// The compiled VU program now running (its function's address; 1 for the interpreter), for the sampler. PS2_SAMPLE_VU in run_entry.
+extern volatile std::uintptr_t g_vu_program;
+struct VuProgram {
+    std::uintptr_t outer;
+    explicit VuProgram(std::uintptr_t fn) : outer(g_vu_program) { g_vu_program = fn; }
+    ~VuProgram() { g_vu_program = outer; }
+};
+#define PS2_SAMPLE_VU(fn) ps2::prof::VuProgram ps2_sample_vu(fn)
+#else
+#define PS2_SAMPLE_VU(fn)
 #endif
 
 // Reading the clock is a system call, and thousands of these run per game frame. So a normal build times only the two waits, which

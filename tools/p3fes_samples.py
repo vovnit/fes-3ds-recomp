@@ -66,11 +66,16 @@ def main():
     ap.add_argument('--to', type=int, default=1 << 30)
     ap.add_argument('--names', nargs='*', default=[])
     ap.add_argument('--top', type=int, default=40)
+    ap.add_argument('--map', default=os.path.join(os.path.dirname(__file__), '..', '..', 'ps2-web-recomp', 'build', '3ds', 'p3fes.map'),
+                    help="the build's linker map, to name the VU thread's programs (use the map of the build that ran)")
     a = ap.parse_args()
 
     per = collections.Counter()
     acts = collections.Counter()
     by = collections.defaultdict(collections.Counter)
+    vu = collections.Counter()
+    vu_acts = collections.Counter()
+    vu_by = collections.defaultdict(collections.Counter)
     period = -1
     for line in open(a.samples):
         x = line.split()
@@ -78,6 +83,12 @@ def main():
             period = int(x[1])
             continue
         if not a.first <= period <= a.to:
+            continue
+        if x[0] == 'vu':
+            fn, act, n = int(x[1], 16), int(x[2]), int(x[3])
+            vu[fn] += n
+            vu_acts[act] += n
+            vu_by[fn][act] += n
             continue
         k, act, n = int(x[0]), int(x[1]), int(x[2])
         per[k] += n
@@ -103,6 +114,34 @@ def main():
         rest = ', '.join('%s %.1f' % (ACTS[i] if i < len(ACTS) else str(i), 100.0 * n / total)
                          for i, n in by[k].most_common(3) if i != GAME)
         print('  %5.2f%%  %5.2f%%  %s  %-36s %s' % (100.0 * v / total, 100.0 * game / total, where, nm, rest))
+    if vu:
+        vu_report(vu, vu_acts, vu_by, a.map, a.top)
+
+
+def act_name(i):
+    return 'outside' if i == GAME else ACTS[i] if i < len(ACTS) else '?' if i == 31 else str(i)
+
+
+def vu_report(vu, acts, by, map_path, top):
+    """The VU thread: which compiled program it was running, and in which activity (vu = inside the program, gif = what its XGKICKs
+    sent, x0 to x3 the renderer: shapes, GPU batches, texture decoding, state; outside = its queue loop with no program running)."""
+    syms = {}
+    try:
+        for line in open(map_path):
+            m = re.match(r'^\s{16}0x([0-9a-f]{8,16})\s{2,}(?:gen::)?([A-Za-z_][\w:]*)', line)
+            if m:
+                syms[int(m.group(1), 16)] = m.group(2)
+    except OSError:
+        pass
+    total = sum(vu.values())
+    print('\nVU thread: %d samples' % total)
+    print('by activity: ' + ', '.join('%s %.1f%%' % (act_name(i), 100.0 * v / total) for i, v in acts.most_common()))
+    print('  share   in program  program')
+    for fn, v in vu.most_common(top):
+        nm = '(no program)' if fn == 0 else '(interpreter)' if fn == 1 else syms.get(fn, '%08X' % fn)
+        inside = by[fn].get(0, 0)
+        rest = ', '.join('%s %.1f' % (act_name(i), 100.0 * n / total) for i, n in by[fn].most_common(4) if i != 0)
+        print('  %5.2f%%  %5.2f%%      %-26s %s' % (100.0 * v / total, 100.0 * inside / total, nm, rest))
 
 
 if __name__ == '__main__':
