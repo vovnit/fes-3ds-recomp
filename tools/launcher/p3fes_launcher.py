@@ -3318,7 +3318,9 @@ def web_pokes_param(ovl, mod=False):
 def web_params(cfg=None):
     """Settings that the browser game reads from its page address: widescreen, volumes (only when below 100) and the speedrun clock."""
     cfg = cfg if cfg is not None else load_cfg()
-    q = ""
+    # newer PS2 Web Recomp pages (after 18 Oct 2026) start at 16:9 and tell the game the TV is wide; the game draws 4:3 either way,
+    # so ask for 4:3 and let PS2_ASPECT (our widescreen) shape the picture. Older pages ignore the word.
+    q = "&aspect=4:3"
     if cfg.get("widescreen"):
         q += "&PS2_ASPECT=%s&PS2_PATCH=%s" % (urllib.parse.quote("16:9", safe=""), urllib.parse.quote(WS_PATCH, safe=""))
     for key, var in (("vol_master", "PS2_VOL_MASTER"), ("vol_fx", "PS2_VOL_FX"), ("vol_music", "PS2_VOL_MUSIC"), ("vol_voice", "PS2_VOL_VOICE")):

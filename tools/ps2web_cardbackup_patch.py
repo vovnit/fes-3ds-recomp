@@ -161,6 +161,11 @@ document.getElementById('backups').addEventListener('click', bkShow);
 '''
 IMPORT_OLD = "  if (!confirm('Replace the memory card in slot 1 with ' + file.name + '? The page reloads to use it.')) return;\n  try {\n    FS.writeFile(CARD_FILE, data);"
 IMPORT_NEW = "  if (!confirm('Replace the memory card in slot 1 with ' + file.name + '? The page reloads to use it.')) return;\n  await backupCard('before import');\n  try {\n    FS.writeFile(CARD_FILE, data);"
+# ps2-web-recomp after 26 Oct 2026 keeps the card buttons in a Menu panel, marked host-only (hidden for a guest player 2)
+HOST = BUTTON_OLD.replace('id="import-card" type=', 'id="import-card" class="host-only" type=')
+if s.count(BUTTON_OLD) != 1 and s.count(HOST) == 1:
+    BUTTON_NEW = HOST + BUTTON_NEW[len(BUTTON_OLD):]   # our buttons stay plain, so the patches that come after find them
+    BUTTON_OLD = HOST
 for o in [BUTTON_OLD, STORE_OLD, INIT_OLD, BLOCK_ANCHOR, IMPORT_OLD]:
     if s.count(o) != 1:
         print("PATCH NOT APPLIED: shell.html does not look like the expected source"); raise SystemExit(1)

@@ -9,6 +9,10 @@ import sys
 
 p = sys.argv[1] if len(sys.argv) > 1 else "recomp/vurecomp.cpp"
 s = open(p, newline="").read()
+if 'branch_delay_exempt' in s:
+    # ps2-web-recomp has the branch VI delay itself since 7b6b604 / 18ad888 (18 Oct 2026): a conditional branch reads the integer
+    # registers from before the previous instruction unless that one only read flags
+    print("not needed: this ps2-web-recomp already gives VU branches the VI delay (upstream 7b6b604)"); raise SystemExit
 if "ovi[16]" in s:
     print("already patched")
     raise SystemExit

@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory() as d:
 print("ok   browser widescreen and speedrun patches apply once, are idempotent and refuse unknown source")
 
 import p3fes_launcher as L
-assert L.web_params({}) == ""
+assert L.web_params({}) == "&aspect=4:3"   # newer engine pages start at 16:9 otherwise
 q = L.web_params({"widescreen": True, "vol_music": 40, "speedrun": True, "speedrun_zero_web": True})
 assert "PS2_ASPECT=16%3A9" in q and "PS2_PATCH=007cad1c%3D3fd9999a%2F3faaaaab" in q and "PS2_VOL_MUSIC=40" in q and "PS2_VOL_MASTER" not in q
 assert "speedrun=1" in q and "srzero=1" in q

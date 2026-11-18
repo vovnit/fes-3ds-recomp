@@ -16,6 +16,10 @@
 #           --new-patches    apply only the tool patches not applied yet, then stop (the launcher uses this after an update)
 #           --dir PATH       install somewhere other than ~/ps2-web-recomp
 #           --name NAME      game name (default p3fes)
+#           --engine WHICH   which PS2 Web Recomp version a NEW project folder gets: tested (default, played through the opening,
+#                            town and first floors), next (12 Nov 2026: every patch fits and the engine builds and passes its own
+#                            tests, but nobody has played it yet; see docs/engine-update.md) or a commit id. An existing folder
+#                            keeps its version: use --dir for a second folder to try another one.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -25,13 +29,15 @@ ISO=""
 PATCHES_ONLY=0
 NEW_ONLY=0
 PIN=c628ae843209f6e4cef34ec04efb6267a1618882   # tested version of snuri00/ps2-web-recomp (16 Oct 2026)
+PIN_NEXT=d8a0a452274447b8e1da984bba1a82f7716e3e8f   # newer version: all patches fit and it builds, not played yet (12 Nov 2026)
 while [ $# -gt 0 ]; do
   case "$1" in
     --patches-only) PATCHES_ONLY=1 ;;
     --new-patches) NEW_ONLY=1 ;;
     --dir) DIR="$2"; shift ;;
     --name) NAME="$2"; shift ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    --engine) case "$2" in tested) ;; next) PIN="$PIN_NEXT" ;; *) PIN="$2" ;; esac; shift ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     -*) echo "Unknown option $1"; exit 2 ;;
     *) ISO="$1" ;;
   esac
@@ -68,8 +74,8 @@ if [ -d "$DIR/scripts" ]; then
 else
   git clone https://github.com/snuri00/ps2-web-recomp.git "$DIR" || fail "download failed. Check your internet connection and try again."
   # the tool patches were written and tested against this exact version of the project
-  git -C "$DIR" checkout -q "$PIN" || fail "could not select the tested project version ($PIN)."
-  echo "using the tested version $PIN"
+  git -C "$DIR" checkout -q "$PIN" || fail "could not select the project version ($PIN)."
+  echo "using version $PIN"
 fi
 cd "$DIR" || fail "cannot open $DIR"
 

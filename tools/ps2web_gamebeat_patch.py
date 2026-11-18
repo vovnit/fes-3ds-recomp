@@ -25,6 +25,9 @@ NEW = """<script>
 })();
 </script>
 """ + OLD
+if s.count(OLD) != 1 and s.count('</body>') == 1 and '<template id="engine">{{{ SCRIPT }}}</template>' in s:
+    # ps2-web-recomp after 26 Oct 2026 keeps the engine script in a template and starts it later: put ours at the end of the page
+    NEW, OLD = NEW[:-len(OLD)] + '</body>', '</body>'
 if s.count(OLD) != 1:
     print("PATCH NOT APPLIED: web/shell.html does not look like the expected source"); raise SystemExit(1)
 s = s.replace(OLD, NEW)

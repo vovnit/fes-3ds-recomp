@@ -23,8 +23,11 @@ def rd(p):
     return s.replace('\r\n', '\n'), '\r\n' in s
 
 
+PENDING = []   # files are written only once every edit has fitted, so a source this patch does not know is left untouched
+
+
 def wr(p, s, crlf):
-    open(p, 'w', newline='').write(s.replace('\n', '\r\n') if crlf else s)
+    PENDING.append((p, s.replace('\n', '\r\n') if crlf else s))
 
 
 def sub(s, old, new, what, count=1):
@@ -221,7 +224,8 @@ s = sub(s, '''            if (options_.probes.count(a)) line(std::format("probe(
 s = sub(s, '    std::uint32_t pending_{};\n    std::ostringstream out_;\n',
         '    std::uint32_t pending_{};\n    std::map<std::uint32_t, CodegenOptions::Variant> variants_;\n    std::map<std::uint32_t, std::uint32_t> view_;\n    std::ostringstream out_;\n', CPP)
 
-s = sub(s, '#include "codegen.hpp"\n\n#include <bit>', '#include "codegen.hpp"\n\n#include <algorithm>\n#include <bit>', CPP)
+if '#include <algorithm>\n' not in s:   # newer ps2-web-recomp includes it already
+    s = sub(s, '#include "codegen.hpp"\n\n#include <bit>', '#include "codegen.hpp"\n\n#include <algorithm>\n#include <bit>', CPP)
 
 s = sub(s, '#include \\"ps2/generated.hpp\\"\\n\\nnamespace gen {\\n";', '#include \\"ps2/generated.hpp\\"\\n\\nextern std::uint32_t ps2_mods;\\nextern void (*ps2_apply_mods_hook)(std::uint8_t *);\\nvoid ps2_apply_mods(std::uint8_t *);\\n\\nnamespace gen {\\n";', CPP)
 
@@ -243,8 +247,13 @@ wr(CPP, s, crlf)
 
 # ---------------------------------------------------------------------------------------------------------------- main.cpp
 s, crlf = rd(MAIN)
-s = sub(s, '''int usage() {
-    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--probes file] [--out dir] [--stats]\\n");''', '''struct Variants {
+# newer ps2-web-recomp (after 16 Oct 2026) lists more options (--overlays, --templates): our two go at the end of whatever is there
+_u = re.findall(r'int usage\(\) \{\n    std::fprintf\(stderr, "usage: eerecomp <elf> [^"]*\[--stats\]\\n"\);', s)
+_USAGE = _u[0] if len(_u) == 1 else '''int usage() {
+    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--probes file] [--out dir] [--stats]\\n");'''
+_e = re.findall(r'    std::string elf_path = argv\[1\], entries_path, out, probes_path, modules_dir[^;\n]*;', s)
+_ELF = _e[0] if len(_e) == 1 else '    std::string elf_path = argv[1], entries_path, out, probes_path, modules_dir;'
+s = sub(s, _USAGE, '''struct Variants {
     std::map<std::uint32_t, CodegenOptions::Variant> code;
     std::vector<CodegenOptions::DataWrite> data;
 };
@@ -291,9 +300,8 @@ Program merge_programs(const Program &a, const Program &b) {
     return m;
 }
 
-int usage() {
-    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--probes file] [--out dir] [--stats] [--variants file --vanilla elf]\\n");''', MAIN)
-s = sub(s, '    std::string elf_path = argv[1], entries_path, out, probes_path, modules_dir;', '    std::string elf_path = argv[1], entries_path, out, probes_path, modules_dir, variants_path, vanilla_path;', MAIN)
+''' + _USAGE.replace('[--stats]\\n"', '[--stats] [--variants file --vanilla elf]\\n"'), MAIN)
+s = sub(s, _ELF, _ELF[:-1] + ', variants_path, vanilla_path;', MAIN)
 s = sub(s, '        else if (arg == "--modules" && i + 1 < argc) modules_dir = argv[++i];', '''        else if (arg == "--modules" && i + 1 < argc) modules_dir = argv[++i];
         else if (arg == "--variants" && i + 1 < argc) variants_path = argv[++i];
         else if (arg == "--vanilla" && i + 1 < argc) vanilla_path = argv[++i];''', MAIN)
@@ -334,4 +342,6 @@ s = sub(s, '''        std::memset(g_ram + vaddr + filesz, 0, memsz - filesz);
 }
 ''', SYS)
 wr(SYS, s, crlf)
+for p, t in PENDING:
+    open(p, 'w', newline='').write(t)
 print("patched (%s)" % MARK)

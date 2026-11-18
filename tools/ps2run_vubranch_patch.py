@@ -10,6 +10,10 @@ Safe to run twice. Rebuild afterwards (native: ninja -C build/native-p3fes ps2ru
 import sys
 p = sys.argv[1] if len(sys.argv) > 1 else 'runtime/src/vu_micro.cpp'
 s = open(p).read()
+if 'branch_delay_exempt' in s:
+    # ps2-web-recomp has the branch VI delay itself since 7b6b604 / 18ad888 (18 Oct 2026): a conditional branch reads the integer
+    # registers from before the previous instruction unless that one only read flags
+    print("not needed: this ps2-web-recomp already gives VU branches the VI delay (upstream 7b6b604)"); raise SystemExit
 if 'g_branch_old' in s:
     print("already patched"); raise SystemExit
 G = 'Vu0Regs g_vu1;\n'

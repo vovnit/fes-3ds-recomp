@@ -50,6 +50,13 @@ if '// ps2run_poke_patch.py: PS2_POKE' in t:
     print("already patched")
     raise SystemExit
 if t.count(OLD) != 1:
+    # newer ps2-web-recomp (after 16 Oct 2026) has a line between the copy and the clear (a write watch): allow one such line
+    import re
+    m = re.findall(r'        std::memcpy\(g_ram \+ vaddr, data\.data\(\) \+ offset, filesz\);\n(?:        [^\n]*\n)?'
+                   r'        std::memset\(g_ram \+ vaddr \+ filesz, 0, memsz - filesz\);\n    \}\n', t)
+    if len(m) == 1:
+        NEW, OLD = m[0] + NEW[len(OLD):], m[0]
+if t.count(OLD) != 1:
     print("PATCH NOT APPLIED: " + REL + " does not look like the expected source")
     raise SystemExit(1)
 t = t.replace(OLD, NEW)

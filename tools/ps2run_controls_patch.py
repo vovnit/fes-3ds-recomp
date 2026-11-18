@@ -43,6 +43,10 @@ R_OLD = """        rx = axis(pad, SDL_CONTROLLER_AXIS_RIGHTX);
 R_NEW = """        if (rx == 0x80) rx = axis(pad, SDL_CONTROLLER_AXIS_RIGHTX);
         if (ry == 0x80) ry = axis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
 """
+# ps2-web-recomp after dedfbf4 (12 Nov 2026) already moved the stick off the arrows, to I J K L
+S_OLD2 = S_OLD.replace("LEFT]", "J]").replace("RIGHT]", "L]").replace("UP]", "I]").replace("DOWN]", "K]")
+if s.count(S_OLD) != 1 and s.count(S_OLD2) == 1:
+    S_OLD = S_OLD2
 for o in [K_OLD, S_OLD, R_OLD]:
     if s.count(o) != 1:
         print("PATCH NOT APPLIED: host/window.cpp does not look like the expected source"); raise SystemExit(1)

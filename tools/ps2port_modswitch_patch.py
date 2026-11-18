@@ -17,6 +17,13 @@ if [ -f "$game/variants.txt" ] && [ -f "$game/vanilla.elf" ]; then variants=(--v
 translate() { "$tools/eerecomp" "$elf" --entries "$game/entries.txt" "${modules[@]}" "${variants[@]}" --out "$generated" | tail -1; }
 """
 if s.count(OLD) != 1:
+    # newer ps2-web-recomp passes more lists (overlays, templates): add ours before --out, whatever comes before it
+    import re
+    m = re.findall(r'translate\(\) \{ "\$tools/eerecomp" "\$elf" --entries "\$game/entries.txt" "\$\{modules\[@\]\}"[^\n]*? --out "\$generated" \| tail -1; \}\n', s)
+    if len(m) == 1:
+        OLD = m[0]
+        NEW = NEW[:NEW.index('translate() {')] + OLD.replace(' --out "$generated"', ' "${variants[@]}" --out "$generated"')
+if s.count(OLD) != 1:
     print("PATCH NOT APPLIED: scripts/port.sh does not look like the expected source"); raise SystemExit(1)
 open(p, 'w', newline='').write((s.replace(OLD, NEW)).replace('\n', '\r\n') if crlf else s.replace(OLD, NEW))
 print("patched (1 edit)")

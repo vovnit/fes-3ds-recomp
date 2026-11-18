@@ -56,6 +56,12 @@ JS_NEW = """<script>
 })();
 </script>
 """ + JS_OLD
+# ps2-web-recomp after 26 Oct 2026: the stage also holds a <video> for a guest player, and the engine script sits in a template
+DIV_OLD2 = '<div id="stage"><canvas id="canvas" tabindex="0"></canvas><video id="remote" playsinline></video></div>\n'
+if s.count(DIV_OLD) != 1 and s.count(DIV_OLD2) == 1:
+    DIV_NEW, DIV_OLD = DIV_OLD2 + DIV_NEW[len(DIV_OLD):], DIV_OLD2
+if s.count(JS_OLD) != 1 and s.count('</body>') == 1 and '<template id="engine">{{{ SCRIPT }}}</template>' in s:
+    JS_NEW, JS_OLD = JS_NEW[:-len(JS_OLD)] + '</body>', '</body>'
 for old in (CSS_OLD, DIV_OLD, JS_OLD):
     if s.count(old) != 1:
         print("PATCH NOT APPLIED: web/shell.html does not look like the expected source"); raise SystemExit(1)

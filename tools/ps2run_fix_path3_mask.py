@@ -22,6 +22,9 @@ def need(s, old, what):
         print("PATCH NOT APPLIED:", what); raise SystemExit(1)
 
 gif = load('gs/gif.cpp'); hpp = load('gs/gif.hpp'); sysc = load('system.cpp'); dmac = load('dmac.cpp')
+if 'void vif1_idle()' in gif and 'g_pend3' not in gif:
+    # ps2-web-recomp has its own PATH3 mask rule since e615191 (22 Oct 2026, data held in the VU thread, one packet per mask pulse)
+    print("not needed: this ps2-web-recomp already holds PATH3 data while MSKPATH3 masks it (upstream e615191)"); raise SystemExit
 done = []
 
 hdr = 'void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {\n'

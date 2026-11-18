@@ -105,9 +105,27 @@ for rel, _ in EDITS:
 
 WEB_MARK = 'ps2run_widescreen_web_patch.py'   # that patch removes the browser guard from the call, so SYS_CALL_NEW is gone on purpose
 
+# ps2-web-recomp after c0f476e (18 Oct 2026) has its own 16:9 switch (--widescreen, g_options.widescreen) and PCSX2 patch lines
+# applied every frame. Here the picture shape still follows PS2_ASPECT, and starts from 16:9 when that switch is on; the code
+# ends up the same as on the older source, so the patches after this one (fill window, browser) fit both.
+GPU_V1_OLD2 = ('        const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;\n'
+               '        const float vw = std::min(w, h * aspect), vh = vw / aspect;\n')
+GPU_V2_OLD2 = ('    const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;\n'
+               '    const float vw = std::min(sw, sh * aspect), vh = vw / aspect;\n')
+GPU_ENV_NEW2 = '    if (g_options.widescreen) g_aspect = 16.0f / 9.0f;\n' + GPU_ENV_NEW
+SYS_CALL_OLD2 = '    apply_presses();\n    apply_patches(false);\n    if (g_options.on_vblank) g_options.on_vblank();\n'
+SYS_CALL_NEW2 = '    apply_presses();\n#ifndef __EMSCRIPTEN__\n    ws_apply();\n#endif\n    apply_patches(false);\n    if (g_options.on_vblank) g_options.on_vblank();\n'
+_g = texts['runtime/src/gs/gpu/gpu.cpp'].replace('\r\n', '\n')
+_s = texts['runtime/src/system.cpp'].replace('\r\n', '\n')
+if GPU_V1_OLD not in _g and (GPU_V1_OLD2 in _g or GPU_ENV_NEW2 in _g):
+    EDITS[0] = ('runtime/src/gs/gpu/gpu.cpp', [(GPU_VAR_OLD, GPU_VAR_NEW), (GPU_V1_OLD2, GPU_V1_NEW), (GPU_V2_OLD2, GPU_V2_NEW),
+                                            (GPU_ENV_OLD, GPU_ENV_NEW2)])
+if SYS_CALL_OLD not in _s and SYS_CALL_NEW not in _s:
+    EDITS[1] = ('runtime/src/system.cpp', [(SYS_INC_OLD, SYS_INC_NEW), (SYS_FN_OLD, SYS_FN_NEW), (SYS_CALL_OLD2, SYS_CALL_NEW2)])
+
 
 def has(t, old, new):
-    return new in t or (new == SYS_CALL_NEW and WEB_MARK in t)
+    return new in t or (new in (SYS_CALL_NEW, SYS_CALL_NEW2) and WEB_MARK in t)
 
 
 if all(has(texts[rel].replace('\r\n', '\n'), None, new) for rel, edits in EDITS for _, new in edits):

@@ -170,6 +170,16 @@ for rel, _ in EDITS:
     except OSError:
         fail("cannot read " + rel)
 
+# newer ps2-web-recomp (after 16 Oct 2026) has more usage lines after --load-state: add ours as a line of its own after that one
+_m = texts['host/main.cpp'].replace('\r\n', '\n')
+if MAIN_USE_OLD not in _m and MAIN_USE_NEW not in _m:
+    import re
+    _l = re.findall(r'\n( *"              \[--save-state frame:file\] \[--load-state file\][^\n]*\\n"\n)', _m)
+    if len(_l) == 1:
+        _ours = '                 "              [--autosave dir] [--autosave-every minutes] [--autosave-keep n] [--autosave-card 0|1]\\n"\n'
+        MAIN_USE_OLD, MAIN_USE_NEW = _l[0], _l[0] + _ours
+        EDITS[2][1][0] = (MAIN_USE_OLD, MAIN_USE_NEW)
+
 if all(new in texts[rel] for rel, edits in EDITS for _, new in edits):
     print("already patched")
     raise SystemExit

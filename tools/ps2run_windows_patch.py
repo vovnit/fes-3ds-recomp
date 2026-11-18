@@ -51,10 +51,51 @@ EDITS = {
     ],
 }
 
+# ps2-web-recomp after 16 Oct 2026 (a macOS Metal target, more tools built with -Wall): where an edit above does not fit,
+# these smaller edits do the same job. Key: (file, number of the edit above).
+_W = '-Wall -Wextra)\n'
+_P = '${PS2_WARN})\n'
+ALT = {
+    ('CMakeLists.txt', 1): [('    target_compile_options(eerecomp PRIVATE ' + _W, '    target_compile_options(eerecomp PRIVATE ' + _P),
+                            ('    target_compile_options(eetemplates PRIVATE ' + _W, '    target_compile_options(eetemplates PRIVATE ' + _P),
+                            ('    target_compile_options(vurecomp PRIVATE ' + _W, '    target_compile_options(vurecomp PRIVATE ' + _P)],
+    ('CMakeLists.txt', 2): [('target_compile_options(ps2runtime PRIVATE ' + _W, 'target_compile_options(ps2runtime PRIVATE ' + _P),
+                            ('if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")\n',
+                             'if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a" OR EXISTS "${PS2_WGPU_DIR}/lib/wgpu_native.dll.lib")\n')],
+    ('runtime/include/ps2/system.hpp', 0): [('    enum Kind { X11, Wayland, Canvas, Metal } kind = X11;\n',
+                                             '    enum Kind { X11, Wayland, Canvas, Metal, Win32 } kind = X11;\n')],
+    ('runtime/src/gs/gpu/gpu.hpp', 0): [('    enum Kind { X11, Wayland, Canvas, Metal } kind;\n', '    enum Kind { X11, Wayland, Canvas, Metal, Win32 } kind;\n')],
+    ('runtime/src/gs/gpu/gpu.cpp', 0): [
+        ('    WGPUSurfaceSourceMetalLayer metal = WGPU_SURFACE_SOURCE_METAL_LAYER_INIT;\n',
+         '    WGPUSurfaceSourceMetalLayer metal = WGPU_SURFACE_SOURCE_METAL_LAYER_INIT;\n'
+         '    WGPUSurfaceSourceWindowsHWND win32 = WGPU_SURFACE_SOURCE_WINDOWS_HWND_INIT;\n'),
+        ('        wayland.surface = target.surface;\n        sd.nextInChain = &wayland.chain;\n    } else {\n',
+         '        wayland.surface = target.surface;\n        sd.nextInChain = &wayland.chain;\n'
+         '    } else if (target.kind == SurfaceTarget::Win32) {\n'
+         '        // display carries the HINSTANCE, window carries the HWND (set by host/window.cpp)\n'
+         '        win32.hinstance = target.display;\n'
+         '        win32.hwnd = reinterpret_cast<void *>(static_cast<std::uintptr_t>(target.window));\n'
+         '        sd.nextInChain = &win32.chain;\n    } else {\n')],
+    ('host/window.cpp', 0): [
+        ('#include <SDL_syswm.h>\n#include <sys/resource.h>\n#include <unistd.h>\n',
+         '#include <SDL_syswm.h>\n#ifdef _WIN32\n#define NOMINMAX\n#define WIN32_LEAN_AND_MEAN\n#include <windows.h>\n#include <psapi.h>\n'
+         '#else\n#include <sys/resource.h>\n#include <unistd.h>\n#endif\n'),
+        ('#include <thread>\n#include <deque>\n', '#include <functional>\n#include <thread>\n#include <deque>\n')],
+}
+
 
 def main():
     done = skipped = 0
     for rel, pairs in EDITS.items():
+        work0 = open(os.path.join(root, rel), newline="").read().replace("\r\n", "\n") if os.path.isfile(os.path.join(root, rel)) else ""
+        expanded = []
+        for k, (old, new) in enumerate(pairs):
+            alt = ALT.get((rel, k))
+            if alt and work0.count(old) != 1 and new not in work0 and all(work0.count(o) == 1 or n in work0 for o, n in alt):
+                expanded += alt
+            else:
+                expanded.append((old, new))
+        pairs = expanded
         path = os.path.join(root, rel)
         if not os.path.isfile(path):
             print("PATCH NOT APPLIED: %s not found (run in the ps2-web-recomp folder)" % rel)
@@ -66,10 +107,13 @@ def main():
             skipped += len(pairs)
             continue
         for old, new in pairs:
-            if work.count(old) != 1:
+            if work.count(old) != 1 and new not in work:
                 print("PATCH NOT APPLIED: %s does not look like the expected source" % rel)
                 return 1
         for old, new in pairs:
+            if new in work:
+                skipped += 1
+                continue
             work = work.replace(old, new, 1)
             done += 1
         if crlf:

@@ -7,7 +7,7 @@ Safe to run twice. Rebuild afterwards (ninja -C build/native-p3fes ps2run, or sc
 import sys
 p = sys.argv[1] if len(sys.argv) > 1 else 'runtime/src/iop/sif.cpp'
 s = open(p).read()
-if 'has no handler (shown once)' in s:
+if 'has no handler (shown once)' in s or 'seenCommands[32]' in s:
     print("already patched"); raise SystemExit
 OLD = """            std::fprintf(stderr, "[sif] command 0x%08X has no handler\\n", h->cid);
 """
@@ -20,7 +20,14 @@ NEW = """            static std::uint32_t seenCommands[32];
                 std::fprintf(stderr, "[sif] command 0x%08X has no handler (shown once)\\n", h->cid);
             }
 """
+import re
 if s.count(OLD) != 1:
-    print("PATCH NOT APPLIED: runtime/src/iop/sif.cpp does not look like the expected source"); raise SystemExit(1)
+    # newer ps2-web-recomp (after 16 Oct 2026) also prints the EE buffer: keep its words, add the once-only check around them
+    m = re.findall(r'( *)(std::fprintf\(stderr, "\[sif\] command 0x%08X has no handler)([^"]*)(\\n", h->cid[^;]*;\n)', s)
+    if len(m) != 1:
+        print("PATCH NOT APPLIED: runtime/src/iop/sif.cpp does not look like the expected source"); raise SystemExit(1)
+    ind, head, rest, tail = m[0]
+    OLD = ind + head + rest + tail
+    NEW = NEW.replace(' (shown once)\\n", h->cid);\n', rest + ' (shown once)' + tail)
 open(p, 'w').write(s.replace(OLD, NEW, 1))
 print("patched (the no-handler message is shown once per command)")
