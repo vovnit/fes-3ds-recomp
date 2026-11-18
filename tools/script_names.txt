@@ -8,6 +8,9 @@
 7 flag_test?           # (flag number); the result is read from reg0; used as test, then set or clear
 8 flag_set?            # (flag number); flag numbers are sums such as 1024 + 16
 9 flag_clear?          # (flag number)
+10 random?            # (max): the public symbol lists name the handlers of scrCommonCommand.c in address order BIT_CHK, (unnamed), BIT_OFF,
+                      # RAND, SYNC, WAIT, which matches 7, 8, 9 and 12 above, so 10 is probably RAND; tools/p3fes_symbols.py comm checks it
+11 sync?              # no values; probably scrCommand_SYNC by the same order (see 10)
 12 wait_frames         # (frames): 1 inside wait loops, 30 between two messages
 28 message_set_var?    # (a, value, slot): fills a placeholder of the next message
 308 status_show?       # named H_FRStatusDisp in the executable; (member)
