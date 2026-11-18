@@ -106,7 +106,7 @@ earlier = {}
 for name in ("EDITS", "PERF_EDITS", "SPLIT_GS_EDITS"):
     for key, edits in perf[name].items():
         earlier.setdefault(key.split("#")[0], []).append(edits)
-for stage in ("STACK_EDITS", "NARROW_EDITS", "LOOP_EDITS", "SP_EDITS", "HOT_EDITS", "VIFADDR_EDITS", "VIFREC_EDITS"):
+for stage in ("STACK_EDITS", "NARROW_EDITS", "LOOP_EDITS", "SP_EDITS", "HOT_EDITS", "VIFADDR_EDITS", "VIFREC_EDITS", "IOPAHEAD_EDITS", "STALE_EDITS", "MOVIE_EDITS", "SPLIT_SKIP_EDITS"):
     for rel, edits in perf[stage].items():
         for old, _ in edits:
             inserted = any(old in new for group in earlier.get(rel, ()) for _, new in group)

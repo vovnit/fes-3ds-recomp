@@ -10,6 +10,8 @@
                                                  (sent zlib-packed, or plain to a build from before that)
     python3 p3fes_3ds_link.py settings "a;b"     writes args.txt, one setting per ; (an empty string clears it) and restarts
     python3 p3fes_3ds_link.py run                restarts the game
+    python3 p3fes_3ds_link.py movies <folder>    sends the movie files made by p3fes_3ds_movies.py (it restarts the game without
+                                                 movies first, so that none is open, and clears args.txt at the end)
 
 Anyone on the network can do this: the link has no password. The old game is kept as /3ds/p3fes.3dsx.bak on the card.
 Use --host for another address and --port for another port.
@@ -113,11 +115,57 @@ def fetch(link, folder):
     print("Copied %d files to %s" % (copied, folder))
 
 
+def again(args, tries=40):
+    """A new link once the game is back after a restart."""
+    for _ in range(tries):
+        time.sleep(3)
+        try:
+            link = Link(args.host, args.port, timeout=60)
+            if link.ask("PING"):
+                return link
+        except OSError:
+            pass
+    raise OSError("the game did not come back")
+
+
+def send_movies(link, args):
+    folder = args.values[0]
+    names = sorted(n for n in os.listdir(folder) if n.endswith(".p3v")) + ["movies.cut"]
+    if not os.path.exists(os.path.join(folder, "movies.cut")):
+        print("No movies.cut in", folder)
+        return 1
+    if link.put("/p3fes/args.txt", b"movies 0\n") != "OK":
+        print("This build of the game does not take settings")
+        return 1
+    link.ask("RUN")
+    total = sum(os.path.getsize(os.path.join(folder, n)) for n in names)
+    sent, started = 0, time.time()
+    for name in names:
+        with open(os.path.join(folder, name), "rb") as f:
+            data = f.read()
+        for attempt in range(3):
+            try:
+                reply = again(args).put("/p3fes/movies/" + name, data)
+            except OSError as e:
+                reply = str(e)
+            if reply == "OK":
+                break
+        if reply != "OK":
+            print(name, reply)
+            return 1
+        sent += len(data)
+        print("%-12s %5.1f of %.1f MB, %.0f s" % (name, sent / 1e6, total / 1e6, time.time() - started), flush=True)
+    link = again(args)
+    print(link.put("/p3fes/args.txt", b""))
+    print(link.ask("RUN"))
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Read test results from the New 3DS build over the network.")
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int, default=PORT)
-    parser.add_argument("command", choices=("status", "fetch", "press", "shots", "draw", "quit", "install", "settings", "run"))
+    parser.add_argument("command", choices=("status", "fetch", "press", "shots", "draw", "quit", "install", "settings", "run", "movies"))
     parser.add_argument("values", nargs="*")
     args = parser.parse_args()
     try:
@@ -151,6 +199,8 @@ def main():
             print(link.ask("RUN"))
         elif args.command == "run":
             print(link.ask("RUN"))
+        elif args.command == "movies":
+            return send_movies(link, args)
         else:
             print(link.ask("QUIT"))
     except OSError as e:

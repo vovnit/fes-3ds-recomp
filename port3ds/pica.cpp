@@ -6,7 +6,12 @@
 //
 // Differences from the real GS that are accepted for now: no destination alpha test, no dithering, no mipmaps, and reads
 // of the frame buffer by the game see old GS memory. Wrap modes with a region clamp to the edge of the whole texture.
+//
+// A full PS2 picture is drawn at the top screen's own 400x240, so it goes up without scaling. With the 3D slider up, such a
+// target has a separate texture for each eye. Every batch is drawn twice, shifted sideways by its
+// depth (see the "eye" uniform in gs.v.pica).
 #include "pica.hpp"
+#include "movie3ds.hpp"
 #include "prof.hpp"
 
 #include "gs/gs.hpp"
@@ -19,6 +24,7 @@
 #include "gs_v_shbin.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -31,8 +37,17 @@ std::uint64_t idle_cycles();
 }
 
 namespace ps2::prof {
-std::uint64_t g_ticks[Count];
+std::atomic<std::uint32_t> g_ticks[Count];
 }
+
+extern "C" bool FesOverlapInit(std::size_t);
+extern "C" bool FesOverlapBegin(bool, bool);
+extern "C" void FesOverlapCommandStats(u32*, unsigned*);
+extern "C" void FesOverlapWait();
+extern "C" u64 FesOverlapWaitTicks();
+extern "C" void FesOverlapEnd(u8);
+
+namespace movie { bool overlap_needs_wait(); }
 
 namespace ps2::gs::pica {
 
@@ -48,6 +63,7 @@ struct DrawVertex {
 constexpr std::uint32_t kRingBytes = 11u << 19;   // 5.5 MB: the assembly hall has 54,000 triangles
 constexpr std::uint32_t kRingVertices = kRingBytes / sizeof(DrawVertex);
 constexpr int kTargetWidth = 512, kTargetHeight = 256;
+constexpr int kScreenWidth = 400, kScreenHeight = 240;
 constexpr int kMaxTargets = 8;
 constexpr int kMaxTextures = 512;
 constexpr std::size_t kCommandBuffer = 0x100000;
@@ -58,8 +74,11 @@ struct Target {
     std::uint32_t fbp = 0;   // in pages
     int gs_width = 0, gs_height = 0;
     float sx = 1.0f, sy = 1.0f;
+    int width = 0;       // of one eye's picture in the texture
     C3D_Tex tex;
+    C3D_Tex right_tex;
     C3D_RenderTarget *rt = nullptr;
+    C3D_RenderTarget *right_rt = nullptr;
     std::uint32_t last_used = 0;
 };
 
@@ -67,6 +86,7 @@ struct Texture {
     bool used = false;
     std::uint32_t tbp = 0, tbw = 0, psm = 0, tw = 0, th = 0, clut = 0, texa = 0;
     int half = 0;
+    int uniform_alpha = -2;   // -2 not checked, -1 varies
     std::uint32_t stamp = 0, hash = 0, sample = 0;
     std::uint32_t last_used = 0;
     C3D_Tex tex;
@@ -74,12 +94,11 @@ struct Texture {
 
 bool g_active = false;
 bool g_frame_open = false;
-u32 *g_frame_commands = nullptr;
 DVLB_s *g_dvlb = nullptr;
 shaderProgram_s g_program;
 C3D_AttrInfo g_attr;
 C3D_BufInfo g_buf;
-int g_uniform_scale = -1, g_uniform_offset = -1;
+int g_uniform_scale = -1, g_uniform_offset = -1, g_uniform_eye = -1;
 
 DrawVertex *g_ring = nullptr;
 std::uint16_t *g_indices = nullptr;
@@ -87,10 +106,34 @@ std::uint32_t g_ring_used = 0, g_flushed_to = 0;
 std::uint32_t g_index_used = 0, g_index_first = 0, g_index_flushed = 0;
 std::uint32_t g_index_base = 0, g_bound_base = 0;
 
-C3D_RenderTarget *g_screen = nullptr;
-void *g_depth = nullptr;
+constexpr std::uint32_t kSliceVertices = kRingVertices / 2;
+static_assert((kSliceVertices * sizeof(std::uint16_t)) % 32 == 0);
+DrawVertex *g_vertex_storage = nullptr;
+std::uint16_t *g_index_storage = nullptr;
+std::uint32_t g_slice_capacity = kRingVertices;
+unsigned g_slices = 3, g_slice = 0;
+bool g_overlap_ready = false, g_overlap_picture = false;
+unsigned g_overflow_waits = 0;
+u64 g_profile_begin = 0;
+
+C3D_RenderTarget *g_screen = nullptr, *g_screen_right = nullptr;
+void *g_depth = nullptr, *g_right_depth = nullptr;
+// Stereo: g_stereo says new full-size targets have a second eye. g_eye_shift is the sideways shift, in clip units, between the
+// nearest and the farthest depth; g_eye_now is that for the batch being collected, zero for flat shapes such as menus.
+bool g_stereo = false, g_two_screens = false;
+std::uint32_t g_stereo_strength = 5;
+float g_eye_shift = 0.0f, g_eye_now = 0.0f;
+// The depth that sits on the screen's surface: the scene lies behind it, and anything nearer (the game draws some of its panels
+// with a depth test, right at the front) stays on it. Measured in the lobby, the dorm and a battle: nearly all of a scene's
+// corners fall in the far three sixteenths of the depth range.
+constexpr float kEyeDepth = -0.1875f;
+u32 g_scissor[4];
+int g_clip_left, g_clip_right, g_clip_top, g_clip_bottom;
+bool g_in_depth = false;
+std::uint32_t g_depth_seen[16];   // test aid ("debug 8"): how many 3D triangle corners fell in each sixteenth of the depth range
 Target g_targets[kMaxTargets];
-Target *g_current = nullptr;
+Target *g_current = nullptr, *g_source = nullptr;   // drawn on, and read as the texture, by the batch being collected
+float g_bound_sx = 0.0f, g_bound_sy = 0.0f;
 Texture g_textures[kMaxTextures];
 constexpr unsigned kTextureHashBuckets = 256;
 std::uint16_t g_texture_hash_head[kTextureHashBuckets], g_texture_hash_next[kMaxTextures];
@@ -123,6 +166,9 @@ std::uint64_t g_key[13];
 std::uint32_t g_key_clut = 0, g_key_stamp = 0;
 bool g_key_valid = false;
 bool g_textured = false;
+Texture *g_alpha_texture = nullptr;
+bool g_alpha_from_texture = false;
+int g_alpha_function = 0;
 float g_u_scale = 1.0f, g_v_scale = 1.0f, g_v_offset = 0.0f;
 float g_s_scale = 1.0f, g_t_scale = 1.0f;
 bool g_fst = false, g_iip = false;
@@ -138,8 +184,10 @@ std::uint32_t g_last_triangle_serial = 0, g_last_triangle_setup = 0, g_last_tria
 std::uint32_t g_last_triangle_colour = 0;
 constexpr std::uint32_t kSkip = 1, kSkipping = 2, kDrawNothing = 4;
 std::uint32_t g_next_picture = 0, g_game_vblanks = 0;
-std::uint32_t g_draw_every = 0, g_picture = 0, g_skipped_in_row = 0, g_skip_run = 0, g_stat_skipped = 0, g_stat_forced = 0;
-u64 g_round_start = 0, g_round_blocked = 0, g_round_idle = 0, g_seen_blocked = 0, g_seen_idle = 0;
+std::uint32_t g_draw_every = 0, g_picture = 0, g_skipped_in_row = 0, g_skip_run = 0;
+std::atomic<std::uint32_t> g_stat_skipped{0}, g_stat_forced{0};
+u64 g_round_start = 0, g_round_blocked = 0, g_round_idle = 0;
+std::uint32_t g_seen_blocked = 0, g_seen_idle = 0;
 std::uint32_t g_frame_number = 0;
 std::uint32_t g_stat_prim[8], g_stat_upload = 0;
 u64 g_stat_decode_ticks = 0;
@@ -179,6 +227,67 @@ void flush_ring() {
     }
 }
 
+void set_eye(bool right);
+
+// Return 1 if the whole batch passes, 0 if it fails, and -1 if it needs both draws.
+// Only classify constant alpha inputs with an unambiguous combiner result.
+int uniform_alpha_pass(const std::uint16_t *indices, std::uint32_t count) {
+    int texel = 0;
+    if (g_alpha_from_texture) {
+        if (!g_alpha_texture) return -1;   // another render target
+        int &alpha = g_alpha_texture->uniform_alpha;
+        if (alpha == -2) {
+            const auto &tex = g_alpha_texture->tex;
+            const auto *pixels = static_cast<const std::uint32_t *>(tex.data);
+            alpha = pixels[0] & 255;
+            const std::uint32_t n = static_cast<std::uint32_t>(tex.width) * tex.height;
+            for (std::uint32_t i = 1; i < n; ++i) {
+                if (static_cast<int>(pixels[i] & 255) == alpha) continue;
+                alpha = -1;
+                break;
+            }
+        }
+        if (alpha < 0) return -1;
+        texel = alpha;
+    }
+    int vertex = 0;
+    if (!g_alpha_from_texture || g_alpha_function == 0 || g_alpha_function == 2) {
+        const DrawVertex *base = g_ring + g_index_base;
+        vertex = base[indices[0]].a;
+        for (std::uint32_t i = 1; i < count; ++i)
+            if (base[indices[i]].a != vertex) return -1;
+    }
+    int low = vertex * 2, high = low;
+    if (g_alpha_from_texture) {
+        switch (g_alpha_function) {
+        case 0: {
+            const int product = texel * vertex;
+            // Account for quantization before the two combiner scales.
+            low = (product >> 8) * 4;
+            high = ((product + 254) / 255) * 4;
+            break;
+        }
+        case 2: low = high = 2 * (texel + vertex); break;
+        default: low = high = 2 * texel; break;
+        }
+    }
+    low = std::min(low, 255);
+    high = std::min(high, 255);
+    const int reference = g_split.reference;
+    switch (g_split.pass) {
+    case GPU_LESS: return high < reference ? 1 : low >= reference ? 0 : -1;
+    case GPU_LEQUAL: return high <= reference ? 1 : low > reference ? 0 : -1;
+    case GPU_EQUAL:
+    case GPU_NOTEQUAL:
+        if (low == high || reference < low || reference > high)
+            return (low == reference) == (g_split.pass == GPU_EQUAL);
+        return -1;
+    case GPU_GEQUAL: return low >= reference ? 1 : high < reference ? 0 : -1;
+    case GPU_GREATER: return low > reference ? 1 : high <= reference ? 0 : -1;
+    default: return -1;
+    }
+}
+
 void flush_batch() {
     const std::uint32_t count = g_index_used - g_index_first;
     if (!count) return;
@@ -189,7 +298,14 @@ void flush_batch() {
         g_bound_base = g_index_base;
     }
     const auto *indices = g_indices + g_index_first;
-    if (g_split.on) {
+    const int pass = g_split.on ? uniform_alpha_pass(indices, count) : -1;
+    const bool split = g_split.on && pass < 0;
+    if (pass >= 0) {
+        C3D_AlphaTest(false, GPU_ALWAYS, 0);
+        C3D_DepthTest(g_split.depth, g_split.depth_test,
+                      static_cast<GPU_WRITEMASK>(pass ? g_split.pass_writes : g_split.fail_writes));
+    }
+    if (split) {
         C3D_AlphaTest(true, g_split.pass, g_split.reference);
         C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.pass_writes));
         C3D_DrawElements(GPU_TRIANGLES, static_cast<int>(count), C3D_UNSIGNED_SHORT, indices);
@@ -197,11 +313,23 @@ void flush_batch() {
         C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.fail_writes));
     }
     C3D_DrawElements(GPU_TRIANGLES, static_cast<int>(count), C3D_UNSIGNED_SHORT, indices);
+    if (g_current && g_current->right_rt) {
+        set_eye(true);
+        if (split) {
+            C3D_AlphaTest(true, g_split.pass, g_split.reference);
+            C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.pass_writes));
+            C3D_DrawElements(GPU_TRIANGLES, static_cast<int>(count), C3D_UNSIGNED_SHORT, indices);
+            C3D_AlphaTest(true, g_split.fail, g_split.reference);
+            C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.fail_writes));
+        }
+        C3D_DrawElements(GPU_TRIANGLES, static_cast<int>(count), C3D_UNSIGNED_SHORT, indices);
+        set_eye(false);
+    }
     g_index_first = g_index_used;
     ++g_stat_draws;
     if (C3D_GetCmdBufUsage() > 0.75f) {
         flush_ring();
-        C3D_FrameSplit(0);
+        C3D_FrameSplit(GX_CMDLIST_FLUSH);
         ++g_stat_splits;
     }
 }
@@ -375,6 +503,7 @@ void index_texture(Texture &e) {
 }
 
 void free_texture(Texture &e) {
+    if (g_overlap_picture && e.last_used + 1u == g_frame) FesOverlapWait();
     if (e.hash) {
         const auto slot = static_cast<std::uint16_t>(&e - g_textures + 1);
         auto *link = &g_texture_hash_head[texture_hash_bucket(e.hash)];
@@ -494,6 +623,7 @@ Texture *find_texture(const State &st, const Context &c, bool three_d) {
     slot->tw = tw;
     slot->th = th;
     slot->half = half;
+    slot->uniform_alpha = -2;
     slot->clut = clut;
     slot->texa = texa;
     slot->stamp = g_stamp;
@@ -510,19 +640,57 @@ int fit_size(int gs_size, int largest) {
     return size;
 }
 
-void release_target(Target &t) {
-    C3D_RenderTargetDelete(t.rt);
-    C3D_TexDelete(&t.tex);
+// citro3d stops the program if a render target is deleted while a frame is open, and the frame's commands may still draw on it or
+// read it. Keep a target given up mid-frame until the next picture. C3D_RenderTargetDelete waits for queued GPU work. The new
+// target needs VRAM of its own meanwhile; if there is none, its shapes are left out for that one frame.
+struct Retired {
+    C3D_RenderTarget *rt;
+    C3D_Tex tex;
+};
+Retired g_retired[kMaxTargets * 2];
+int g_retired_count = 0;
+
+void delete_retired() {
+    for (int i = 0; i < g_retired_count; ++i) {
+        C3D_RenderTargetDelete(g_retired[i].rt);
+        C3D_TexDelete(&g_retired[i].tex);
+    }
+    g_retired_count = 0;
+}
+
+bool release_target(Target &t) {
+    if (g_frame_open) {
+        if (g_retired_count + (t.right_rt ? 2 : 1) > kMaxTargets * 2) return false;
+        g_retired[g_retired_count++] = Retired{t.rt, t.tex};
+        if (t.right_rt) g_retired[g_retired_count++] = Retired{t.right_rt, t.right_tex};
+    } else {
+        C3D_RenderTargetDelete(t.rt);
+        C3D_TexDelete(&t.tex);
+        if (t.right_rt) {
+            C3D_RenderTargetDelete(t.right_rt);
+            C3D_TexDelete(&t.right_tex);
+        }
+    }
     t.rt = nullptr;
+    t.right_rt = nullptr;
     t.used = false;
+    return true;
 }
 
 // A target's texture is the true size of the PS2 picture, up to 512x256. A smaller picture sampled as a texture must clamp at
-// its own edge, as it does on the GS, not run on into unused texels.
+// its own edge, as it does on the GS, not run on into unused texels. A picture wider than the top screen is drawn at the top
+// screen's size instead: 640x448 becomes 400x240, which goes up without scaling.
+void set_scale(Target &t, int gs_width, int gs_height) {
+    t.gs_width = gs_width;
+    t.gs_height = gs_height;
+    t.sx = std::min(1.0f, static_cast<float>(std::min(t.width, kScreenWidth)) / static_cast<float>(gs_width));
+    t.sy = std::min(1.0f, static_cast<float>(std::min<int>(t.tex.height, kScreenHeight)) / static_cast<float>(gs_height));
+}
+
 bool create_target(Target &t, std::uint32_t fbp, int gs_width, int gs_height) {
     const int width = fit_size(gs_width, kTargetWidth), height = fit_size(gs_height, kTargetHeight);
-    if (!C3D_TexInitVRAM(&t.tex, static_cast<u16>(width), static_cast<u16>(height), GPU_RGBA8)) return false;
     const bool full = width == kTargetWidth && height == kTargetHeight;
+    if (!C3D_TexInitVRAM(&t.tex, static_cast<u16>(width), static_cast<u16>(height), GPU_RGBA8)) return false;
     t.rt = C3D_RenderTargetCreateFromTex(&t.tex, GPU_TEXFACE_2D, 0, full ? C3D_DEPTHTYPE(-1) : C3D_DEPTHTYPE(GPU_RB_DEPTH24));
     if (!t.rt) {
         C3D_TexDelete(&t.tex);
@@ -530,12 +698,20 @@ bool create_target(Target &t, std::uint32_t fbp, int gs_width, int gs_height) {
     }
     if (full) C3D_FrameBufDepth(&t.rt->frameBuf, g_depth, GPU_RB_DEPTH24);
     C3D_RenderTargetClear(t.rt, C3D_CLEAR_ALL, 0, 0);
+    if (full && g_stereo) {
+        if (!g_right_depth) g_right_depth = vramAlloc(C3D_CalcDepthBufSize(width, height, GPU_RB_DEPTH24));
+        if (g_right_depth && C3D_TexInitVRAM(&t.right_tex, static_cast<u16>(width), static_cast<u16>(height), GPU_RGBA8)) {
+            t.right_rt = C3D_RenderTargetCreateFromTex(&t.right_tex, GPU_TEXFACE_2D, 0, C3D_DEPTHTYPE(-1));
+            if (t.right_rt) {
+                C3D_FrameBufDepth(&t.right_rt->frameBuf, g_right_depth, GPU_RB_DEPTH24);
+                C3D_RenderTargetClear(t.right_rt, C3D_CLEAR_ALL, 0, 0);
+            } else C3D_TexDelete(&t.right_tex);
+        }
+    }
     t.used = true;
     t.fbp = fbp;
-    t.gs_width = gs_width;
-    t.gs_height = gs_height;
-    t.sx = std::min(1.0f, static_cast<float>(width) / static_cast<float>(gs_width));
-    t.sy = std::min(1.0f, static_cast<float>(height) / static_cast<float>(gs_height));
+    t.width = width;
+    set_scale(t, gs_width, gs_height);
     t.last_used = g_frame;
     return true;
 }
@@ -546,15 +722,12 @@ Target *find_target(std::uint32_t fbp, int gs_width, int gs_height) {
         if (t.used && t.fbp == fbp) {
             if (gs_width > t.gs_width || gs_height > t.gs_height) {
                 const int w = std::max(gs_width, t.gs_width), h = std::max(gs_height, t.gs_height);
-                if (fit_size(w, kTargetWidth) != t.tex.width || fit_size(h, kTargetHeight) != t.tex.height) {
+                if (fit_size(w, kTargetWidth) != t.width || fit_size(h, kTargetHeight) != t.tex.height) {
                     if (g_current == &t) g_current = nullptr;
-                    release_target(t);
+                    if (!release_target(t)) return nullptr;
                     return create_target(t, fbp, w, h) ? &t : nullptr;
                 }
-                t.gs_width = w;
-                t.gs_height = h;
-                t.sx = std::min(1.0f, static_cast<float>(t.tex.width) / static_cast<float>(w));
-                t.sy = std::min(1.0f, static_cast<float>(t.tex.height) / static_cast<float>(h));
+                set_scale(t, w, h);
             }
             t.last_used = g_frame;
             return &t;
@@ -565,15 +738,31 @@ Target *find_target(std::uint32_t fbp, int gs_width, int gs_height) {
     if (free_slot && create_target(*free_slot, fbp, gs_width, gs_height)) return free_slot;
     if (!oldest) return nullptr;
     if (g_current == oldest) g_current = nullptr;
-    release_target(*oldest);
+    if (!release_target(*oldest)) return nullptr;
     return create_target(*oldest, fbp, gs_width, gs_height) ? oldest : nullptr;
 }
 
-void bind_target(Target *t) {
-    g_current = t;
-    C3D_FrameDrawOn(t->rt);
-    C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_scale, 2.0f * t->sx / t->tex.width, -2.0f * t->sy / t->tex.height, 1.0f, 0.0f);
+void set_eye(bool right) {
+    const Target &t = *g_current;
+    if (t.right_rt) {
+        C3D_FrameDrawOn(right ? t.right_rt : t.rt);
+        if (g_source && g_source->right_rt) C3D_TexBind(0, right ? &g_source->right_tex : &g_source->tex);
+    }
+    C3D_SetScissor(GPU_SCISSOR_NORMAL, g_scissor[0], g_scissor[1], g_scissor[2], g_scissor[3]);
     C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_offset, -1.0f, 1.0f, 0.0f, 0.0f);
+    const float shift = t.right_rt ? (right ? g_eye_now : -g_eye_now) : 0.0f;
+    C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_eye, shift, -shift * kEyeDepth, kEyeDepth, 0.0f);
+}
+
+void bind_target(Target *t) {
+    const bool changed = g_current != t;
+    if (changed) C3D_FrameDrawOn(t->rt);
+    if (changed || t->sx != g_bound_sx || t->sy != g_bound_sy) {
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_scale, 2.0f * t->sx / t->tex.width, -2.0f * t->sy / t->tex.height, 1.0f, 0.0f);
+        g_bound_sx = t->sx;
+        g_bound_sy = t->sy;
+    }
+    g_current = t;
 }
 
 // GS fog mixes each pixel towards a colour by a value that comes with each vertex. The GPU has only one colour to carry per vertex,
@@ -725,12 +914,19 @@ void set_tests(const Context &c, bool abe) {
 void set_scissor(const Context &c, const Target &t) {
     const int x0 = static_cast<int>(c.scissor & 0x7FFu), x1 = static_cast<int>((c.scissor >> 16) & 0x7FFu);
     const int y0 = static_cast<int>((c.scissor >> 32) & 0x7FFu), y1 = static_cast<int>((c.scissor >> 48) & 0x7FFu);
-    const int tw = t.tex.width, th = t.tex.height;
+    const int tw = t.width, th = t.tex.height;
     const int left = std::clamp(static_cast<int>(std::floor(static_cast<float>(x0) * t.sx)), 0, tw);
     const int right = std::clamp(static_cast<int>(std::ceil(static_cast<float>(x1 + 1) * t.sx)), 0, tw);
     const int top = std::clamp(static_cast<int>(std::floor(static_cast<float>(y0) * t.sy)), 0, th);
-    const int bottom = std::clamp(static_cast<int>(std::ceil(static_cast<float>(y1 + 1) * t.sy)), 0, th);
-    C3D_SetScissor(GPU_SCISSOR_NORMAL, static_cast<u32>(left), static_cast<u32>(top), static_cast<u32>(right), static_cast<u32>(bottom));
+    const bool full_height = y0 == 0 && y1 >= t.gs_height - 1;
+    // A full-height GS scissor includes the entire scaled picture at the top
+    // of the texture. Cover the backing texture too so PICA keeps those rows.
+    const int bottom = full_height ? th :
+        std::clamp(static_cast<int>(std::ceil(static_cast<float>(y1 + 1) * t.sy)), 0, th);
+    g_scissor[0] = static_cast<u32>(left);
+    g_scissor[1] = static_cast<u32>(top);
+    g_scissor[2] = static_cast<u32>(right);
+    g_scissor[3] = static_cast<u32>(bottom);
 }
 
 void dump_batch(const State &st, const Context &c, std::uint64_t attr, std::uint32_t verts) {
@@ -793,8 +989,7 @@ void apply_state(const State &st, const Context &c, std::uint64_t attr) {
         g_skip_batch = true;
         return;
     }
-    if (t != g_current) bind_target(t);
-    else bind_target(t);   // the scale may have changed
+    bind_target(t);
 
     const bool tme = attr & 0x10u;
     const bool abe = attr & 0x40u;
@@ -810,8 +1005,22 @@ void apply_state(const State &st, const Context &c, std::uint64_t attr) {
     const bool by_source_alpha = ((c.alpha >> 4) & 3u) == 0u;
     set_blend(abe && !((st.pabe & 1u) && by_source_alpha) && !(g_debug & 2u), c.alpha);
     set_scissor(c, *t);
+    // Shapes drawn with a real depth test are the 3D scene. Everything else (menus, text, fades) stays on the screen's surface.
+    const bool in_depth = ((c.test >> 16) & 1u) && ((c.test >> 17) & 3u) >= 2u;
+    g_eye_now = in_depth ? g_eye_shift : 0.0f;
+    g_in_depth = in_depth;
+    // Invert the viewport transform for a conservative reject in GS 12.4
+    // coordinates. Leave a pixel for rounding and expand for either eye.
+    const float eye_margin = t->right_rt ? g_eye_now * -kEyeDepth * t->width * 0.5f : 0.0f;
+    g_clip_left = g_ofx + static_cast<int>(std::floor((g_scissor[0] - 1.0f - eye_margin) * 16.0f / t->sx));
+    g_clip_right = g_ofx + static_cast<int>(std::ceil((g_scissor[2] + 1.0f + eye_margin) * 16.0f / t->sx));
+    g_clip_top = g_ofy + static_cast<int>(std::floor((g_scissor[1] - 1.0f) * 16.0f / t->sy));
+    g_clip_bottom = g_ofy + static_cast<int>(std::ceil((g_scissor[3] + 1.0f) * 16.0f / t->sy));
+    g_source = nullptr;
 
     g_textured = false;
+    g_alpha_from_texture = false;
+    g_alpha_texture = nullptr;
     if (tme) {
         const std::uint32_t tbp = static_cast<std::uint32_t>(c.tex0) & 0x3FFFu;
         const std::uint32_t tw = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 26) & 0xFu, 10u);
@@ -826,12 +1035,14 @@ void apply_state(const State &st, const Context &c, std::uint64_t attr) {
         if (source) {
             // Drawing with a picture that was rendered earlier.
             tex = &source->tex;
+            g_source = source;
             g_u_scale = source->sx / source->tex.width;
             g_v_scale = -source->sy / source->tex.height;
             g_v_offset = 1.0f;
             g_s_scale = static_cast<float>(1 << tw) * source->sx / source->tex.width;
             g_t_scale = static_cast<float>(1 << th) * source->sy / source->tex.height;
         } else if (Texture *e = find_texture(st, c, !g_fst)) {
+            g_alpha_texture = e;
             tex = &e->tex;
             const float full_width = static_cast<float>(e->tex.width << e->half), full_height = static_cast<float>(e->tex.height << e->half);
             g_u_scale = 1.0f / full_width;
@@ -846,8 +1057,14 @@ void apply_state(const State &st, const Context &c, std::uint64_t attr) {
             const GPU_TEXTURE_FILTER_PARAM filter = bilinear ? GPU_LINEAR : GPU_NEAREST;
             C3D_TexSetFilter(tex, filter, filter);
             C3D_TexSetWrap(tex, wms == 0 ? GPU_REPEAT : GPU_CLAMP_TO_EDGE, wmt == 0 ? GPU_REPEAT : GPU_CLAMP_TO_EDGE);
+            if (source && source->right_rt) {
+                C3D_TexSetFilter(&source->right_tex, filter, filter);
+                C3D_TexSetWrap(&source->right_tex, wms == 0 ? GPU_REPEAT : GPU_CLAMP_TO_EDGE, wmt == 0 ? GPU_REPEAT : GPU_CLAMP_TO_EDGE);
+            }
             C3D_TexBind(0, tex);
             g_textured = true;
+            g_alpha_from_texture = tcc;
+            g_alpha_function = tfx;
             set_texenv(true, tfx, tcc);
         } else {
             g_skip_batch = true;
@@ -857,6 +1074,7 @@ void apply_state(const State &st, const Context &c, std::uint64_t attr) {
         C3D_TexBind(0, nullptr);
         set_texenv(false, 0, false);
     }
+    set_eye(false);
 }
 
 bool ensure_state(const State &st, const Context &c, std::uint64_t attr) {
@@ -894,6 +1112,29 @@ inline void write_vertex(DrawVertex *o, float x, float y, const Vertex &z_from, 
     }
 }
 
+void use_geometry_slice(unsigned slice, std::uint32_t capacity) {
+    g_slice = slice;
+    g_slice_capacity = capacity;
+    g_ring = g_vertex_storage + slice * kSliceVertices;
+    g_indices = g_index_storage + slice * kSliceVertices;
+    g_ring_used = g_flushed_to = 0;
+    g_index_used = g_index_first = g_index_flushed = g_index_base = 0;
+    g_bound_base = UINT32_MAX;
+    g_last_triangle_end = 0;
+}
+
+bool reserve_geometry(std::uint32_t indices) {
+    if (g_slice_capacity - g_index_used >= indices) return true;
+    if (!g_overlap_picture || g_slices == 3) return false;
+    flush_batch();
+    flush_ring();
+    FesOverlapWait();
+    ++g_overflow_waits;
+    g_slices = 3;
+    use_geometry_slice(g_slice ^ 1u, kSliceVertices);
+    return true;
+}
+
 // Indices are relative to one span of the vertex ring. A full span ends the current batch.
 void reserve_indices(unsigned vertices) {
     if (g_ring_used - g_index_base + vertices <= 65536u) return;
@@ -906,7 +1147,26 @@ std::uint16_t vertex_index(std::uint32_t vertex) {
     return static_cast<std::uint16_t>(vertex - g_index_base);
 }
 
+bool same_position(const Vertex &a, const Vertex &b) {
+    // Depth affects the stereo offset, and Q affects the shader's clip-space position.
+    return a.x == b.x && a.y == b.y && a.z == b.z && a.q == b.q;
+}
+
+bool outside_scissor(const Vertex *v) {
+    const int x0 = static_cast<int>(v[0].x), x1 = static_cast<int>(v[1].x), x2 = static_cast<int>(v[2].x);
+    const int y0 = static_cast<int>(v[0].y), y1 = static_cast<int>(v[1].y), y2 = static_cast<int>(v[2].y);
+    return (x0 < g_clip_left && x1 < g_clip_left && x2 < g_clip_left) ||
+           (x0 > g_clip_right && x1 > g_clip_right && x2 > g_clip_right) ||
+           (y0 < g_clip_top && y1 < g_clip_top && y2 < g_clip_top) ||
+           (y0 > g_clip_bottom && y1 > g_clip_bottom && y2 > g_clip_bottom);
+}
+
 void add_triangle(const Vertex *v, unsigned type, std::uint32_t serial) {
+    // Strip connectors often repeat a vertex. Identical projected vertices have no area in either eye.
+    if (same_position(v[0], v[1]) || same_position(v[1], v[2]) || same_position(v[0], v[2]) || outside_scissor(v)) {
+        g_last_triangle_end = 0;
+        return;
+    }
     reserve_indices(3);
     const bool reuse = type >= 4 && g_index_used >= 3 && g_last_triangle_end == g_index_used &&
         g_last_triangle_setup == g_setup_seen && g_last_triangle_serial + 1u == serial;
@@ -938,6 +1198,7 @@ void add_triangle(const Vertex *v, unsigned type, std::uint32_t serial) {
         }
         g_ring_used += 3;
     }
+    if ((g_debug & 8u) && g_in_depth) ++g_depth_seen[std::min(15, static_cast<int>(-g_ring[g_ring_used - 1].z * 16.0f))];
     g_index_used += 3;
     g_last_triangle_end = g_index_used;
     g_last_triangle_serial = serial;
@@ -962,22 +1223,21 @@ void add_quad(float x0, float y0, float x1, float y1, const Vertex &a, const Ver
     g_ring_used += 4;
 }
 
-void show_target(Target *t, const DisplayRegs &r, int circuit) {
-    const std::uint64_t disp = r.display[circuit];
-    const std::uint32_t magh = (static_cast<std::uint32_t>(disp >> 23) & 0xFu) + 1, magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
-    const float dw = static_cast<float>((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / static_cast<float>(magh);
-    float dh = static_cast<float>((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / static_cast<float>(magv);
-    if (dw < 1.0f || dh < 1.0f) return;
-    C3D_FrameDrawOn(g_screen);
+// One picture onto one of the top screen's two buffers: u0 to u1 across, the top row at v = 1 and the bottom at v1.
+void show_texture(C3D_RenderTarget *screen, C3D_Tex *tex, float u0, float u1, float v1, GPU_TEXTURE_FILTER_PARAM filter) {
+    C3D_FrameDrawOn(screen);
+    g_current = nullptr;
+    g_split.on = false;
     C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_scale, 1.0f, 1.0f, 1.0f, 0.0f);
     C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_offset, 0.0f, 0.0f, 0.0f, 0.0f);
+    C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_eye, 0.0f, 0.0f, -1.0f, 0.0f);
     C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
     C3D_AlphaTest(false, GPU_ALWAYS, 0);
     C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
     C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
-    C3D_TexSetFilter(&t->tex, GPU_LINEAR, GPU_LINEAR);
-    C3D_TexSetWrap(&t->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
-    C3D_TexBind(0, &t->tex);
+    C3D_TexSetFilter(tex, filter, filter);
+    C3D_TexSetWrap(tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    C3D_TexBind(0, tex);
     C3D_TexEnv *env = C3D_GetTexEnv(0);
     C3D_TexEnvInit(env);
     C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
@@ -985,13 +1245,12 @@ void show_target(Target *t, const DisplayRegs &r, int circuit) {
     C3D_TexEnvInit(C3D_GetTexEnv(1));
     set_fog(false, 0);
 
-    if (kRingVertices - g_index_used < 6) return;
+    if (!reserve_geometry(6)) return;
     reserve_indices(4);
-    const float u1 = dw * t->sx / t->tex.width, v1 = 1.0f - dh * t->sy / t->tex.height;
     // The top screen is mounted sideways: the screen's left edge is the buffer's top.
     const float px[4] = {1.0f, 1.0f, -1.0f, -1.0f};    // screen top left, top right, bottom left, bottom right
     const float py[4] = {1.0f, -1.0f, 1.0f, -1.0f};
-    const float su[4] = {0.0f, u1, 0.0f, u1};
+    const float su[4] = {u0, u1, u0, u1};
     const float sv[4] = {1.0f, 1.0f, v1, v1};
     const int order[6] = {0, 1, 2, 2, 1, 3};
     DrawVertex *o = g_ring + g_ring_used;
@@ -1001,20 +1260,44 @@ void show_target(Target *t, const DisplayRegs &r, int circuit) {
         g_indices[g_index_used++] = vertex_index(g_ring_used + corner);
     g_ring_used += 4;
     flush_batch();
+    g_key_valid = false;
+}
+
+void show_target(Target *t, const DisplayRegs &r, int circuit) {
+    const std::uint64_t disp = r.display[circuit];
+    const std::uint32_t magh = (static_cast<std::uint32_t>(disp >> 23) & 0xFu) + 1, magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
+    const float dw = static_cast<float>((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / static_cast<float>(magh);
+    float dh = static_cast<float>((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / static_cast<float>(magv);
+    if (dw < 1.0f || dh < 1.0f) return;
+    const float across = dw * t->sx, down = dh * t->sy;
+    const float u1 = across / t->tex.width, v1 = 1.0f - down / t->tex.height;
+    // A picture that is already the screen's size goes up texel for texel.
+    const bool exact = std::fabs(across - kScreenWidth) < 0.5f && std::fabs(down - kScreenHeight) < 0.5f;
+    const GPU_TEXTURE_FILTER_PARAM filter = exact ? GPU_NEAREST : GPU_LINEAR;
+    show_texture(g_screen, &t->tex, 0.0f, u1, v1, filter);
+    if (g_two_screens) show_texture(g_screen_right, t->right_rt ? &t->right_tex : &t->tex, 0.0f, u1, v1, filter);
 }
 
 u8 *g_shot_pixels = nullptr;
 
-void save_shot() {
+void save_shot(C3D_RenderTarget *screen, const char *ending) {
     u8 *pixels = g_shot_pixels;
     if (!pixels) return;
     const u32 dims = GX_BUFFER_DIM(240, 400);
     const u32 flags = GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) | GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) |
                       GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) | GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO);
-    C3D_SyncDisplayTransfer(static_cast<u32 *>(g_screen->frameBuf.colorBuf), dims, reinterpret_cast<u32 *>(pixels), dims, flags);
+    // Outside an open frame citro3d waits for this transfer before returning.
+    C3D_SyncDisplayTransfer(static_cast<u32 *>(screen->frameBuf.colorBuf), dims, reinterpret_cast<u32 *>(pixels), dims, flags);
     GSPGPU_InvalidateDataCache(pixels, 240 * 400 * 3);
     char name[64];
-    std::snprintf(name, sizeof name, "sdmc:/p3fes/shots/frame_%05llu.ppm", static_cast<unsigned long long>(g_frame_number));
+    if (g_debug & 32u) {
+        const char *suffix = g_overlap_picture ? (g_debug & 128u ? "stock_small" : "stock") : "stock_control";
+        std::snprintf(name, sizeof name, "sdmc:/p3fes/shots/frame_%05llu%s_%s.ppm",
+                      static_cast<unsigned long long>(g_frame_number), ending, suffix);
+    } else {
+        std::snprintf(name, sizeof name, "sdmc:/p3fes/shots/frame_%05llu%s.ppm",
+                      static_cast<unsigned long long>(g_frame_number), ending);
+    }
     std::FILE *f = std::fopen(name, "wb");
     if (!f) return;
     std::fprintf(f, "P6\n400 240\n255\n");
@@ -1031,15 +1314,37 @@ void save_shot() {
     std::fclose(f);
 }
 
-// The GPU starts on a picture only when C3D_FrameEnd runs, and C3D_FrameBegin then waits until it has finished. So the next frame
-// opens when something is next drawn: until then the skipped pictures carry on while the GPU works, and nothing waits for a vblank.
+// Start recording at the first shape of a drawn picture. The overlap path can record in the other slice of the geometry
+// rings while the GPU finishes the preceding picture. Submission still follows the preceding display transfer.
 void begin_frame() {
     g_last_triangle_end = 0;
-    C3D_FrameBegin(0);
+    delete_retired();
+    // The 3D slider is read once a frame. Moving it from or to zero changes the shape of the full-size targets, so they are made
+    // anew: one picture is drawn onto empty ones.
+    const float slider = g_debug & 32u ? 1.0f : osGet3DSliderState();
+    g_two_screens = slider > 0.0f;
+    const bool stereo = g_two_screens && g_stereo_strength;
+    if (stereo != g_stereo) {
+        for (Target &t : g_targets)
+            if (t.used) release_target(t);
+        g_stereo = stereo;
+    }
+    // At the slider's top and strength 5 the farthest things sit 10 screen pixels apart between the eyes: 5 each way.
+    g_eye_shift = stereo ? slider * static_cast<float>(g_stereo_strength) * (0.005f / -kEyeDepth) : 0.0f;
+    const u64 start = svcGetSystemTick();
+    const unsigned previous = g_slices;
+    g_overlap_picture = g_frame && g_overlap_ready && !(g_debug & 64u) && FesOverlapBegin(previous == 3, g_debug & 128u);
+    if (g_overlap_picture) {
+        const unsigned slice = previous == 1 ? 1 : 0;
+        use_geometry_slice(slice, kSliceVertices);
+        g_slices = 1u << slice;
+    } else {
+        C3D_FrameBegin(0);
+        use_geometry_slice(0, kRingVertices);
+        g_slices = 3;
+    }
+    g_profile_begin += svcGetSystemTick() - start;
     g_frame_open = true;
-    GPUCMD_GetBuffer(&g_frame_commands, nullptr, nullptr);
-    g_ring_used = g_flushed_to = 0;
-    g_index_used = g_index_first = g_index_flushed = g_index_base = 0;
     g_current = nullptr;
     g_key_valid = false;
     ++g_frame;
@@ -1057,6 +1362,8 @@ void set_dump_frame(std::uint64_t frame) { g_dump_frame = frame; }
 void set_hide(std::uint32_t from, std::uint32_t to) { g_hide_from = from, g_hide_to = to; }
 void set_skip_attr(std::uint32_t attr) { g_skip_attr = attr; }
 void set_debug(std::uint32_t bits) { g_debug = bits; }
+void set_stereo(std::uint32_t strength) { g_stereo_strength = std::min<std::uint32_t>(strength, 10u); }
+std::uint32_t stereo() { return g_stereo_strength; }
 
 bool init() {
     if (!C3D_Init(kCommandBuffer)) {
@@ -1069,6 +1376,7 @@ bool init() {
     C3D_BindProgram(&g_program);
     g_uniform_scale = shaderInstanceGetUniformLocation(g_program.vertexShader, "scale");
     g_uniform_offset = shaderInstanceGetUniformLocation(g_program.vertexShader, "offset");
+    g_uniform_eye = shaderInstanceGetUniformLocation(g_program.vertexShader, "eye");
 
     AttrInfo_Init(&g_attr);
     AttrInfo_AddLoader(&g_attr, 0, GPU_FLOAT, 4);
@@ -1077,8 +1385,10 @@ bool init() {
     AttrInfo_AddLoader(&g_attr, 3, GPU_UNSIGNED_BYTE, 4);
     C3D_SetAttrInfo(&g_attr);
 
-    g_ring = static_cast<DrawVertex *>(linearAlloc(kRingBytes));
-    g_indices = static_cast<std::uint16_t *>(linearAlloc(kRingVertices * sizeof(*g_indices)));
+    g_vertex_storage = g_ring = static_cast<DrawVertex *>(linearAlloc(kRingBytes));
+    g_index_storage = g_indices = static_cast<std::uint16_t *>(linearAlloc(kRingVertices * sizeof(*g_indices)));
+    g_overlap_ready = FesOverlapInit(kCommandBuffer);
+    std::fprintf(stderr, "[overlap] recording buffer %s\n", g_overlap_ready ? "ready" : "unavailable");
     if (!g_ring || !g_indices) {
         std::fprintf(stderr, "[pica] no memory for vertex or index data\n");
         return false;
@@ -1090,13 +1400,15 @@ bool init() {
 
     g_depth = vramAlloc(C3D_CalcDepthBufSize(kTargetWidth, kTargetHeight, GPU_RB_DEPTH24));
     g_screen = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, -1);
-    if (!g_depth || !g_screen) {
+    g_screen_right = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, -1);
+    if (!g_depth || !g_screen || !g_screen_right) {
         std::fprintf(stderr, "[pica] no video memory\n");
         return false;
     }
-    C3D_RenderTargetSetOutput(g_screen, GFX_TOP, GFX_LEFT,
-                              GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) | GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) |
-                                  GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) | GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
+    constexpr u32 kToScreen = GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) | GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) |
+                              GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) | GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO);
+    C3D_RenderTargetSetOutput(g_screen, GFX_TOP, GFX_LEFT, kToScreen);
+    C3D_RenderTargetSetOutput(g_screen_right, GFX_TOP, GFX_RIGHT, kToScreen);
     C3D_CullFace(GPU_CULL_NONE);
 
     for (int i = 0; i < 64; ++i) {
@@ -1124,12 +1436,12 @@ bool init() {
 void shutdown() {
     if (!g_active) return;
     g_active = false;
-    if (g_frame_open) C3D_FrameEnd(0);
+    if (g_frame_open) FesOverlapEnd(0);
     C3D_Fini();
 }
 
 void draw(const State &st, std::uint32_t serial, std::uint64_t clamp) {
-    if (g_draw_nothing || queue::g_quiet) return;
+    if (g_draw_nothing || (!queue::g_split_pica && queue::g_quiet)) return;
     if (!g_frame_open) begin_frame();
     // Every register that can change the batch moves g_setup_generation, so a run of shapes checks just this one number.
     if (!g_key_valid || g_setup_seen != g_setup_generation) {
@@ -1150,7 +1462,7 @@ void draw(const State &st, std::uint32_t serial, std::uint64_t clamp) {
     ++g_stat_shapes;
     ++g_stat_prim[st.prim & 7u];
     ++g_shapes_since_present;
-    if (kRingVertices - g_index_used < 8) {
+    if (!reserve_geometry(8)) {
         if (!g_ring_warned) std::fprintf(stderr, "[pica] vertex ring full, dropping shapes\n");
         g_ring_warned = true;
         return;
@@ -1218,6 +1530,13 @@ void note_clut() { ++g_clut_stamp; }
 
 namespace {
 
+bool skip_fixed_picture(std::uint32_t picture, std::uint32_t interval) {
+    // Alternate gaps of one and three pictures at half rate so both PS2
+    // framebuffers get refreshed. The game-side prediction uses this too.
+    if (interval == 2) return (picture & 2u) != 0;
+    return picture % interval != 0;
+}
+
 // With the game on one core and the drawing on another, a queue of about one picture sits between them. The game is held up only
 // when that queue is full, so time spent waiting on either side of it says which side is short of time. One drawn picture and the
 // skipped ones after it make a round: when the game had to wait, the next round skips one more, up to one drawn in four, and when
@@ -1227,7 +1546,7 @@ void choose_next_picture() {
     ++g_picture;
     bool skip = false;
     if (g_draw_every > 1) {
-        skip = g_picture % g_draw_every != 0;
+        skip = skip_fixed_picture(g_picture, g_draw_every);
     } else if (!g_draw_every && queue::vu_active()) {
         if (g_skipped_in_row >= g_skip_now) {
             const u64 now = svcGetSystemTick();
@@ -1250,15 +1569,15 @@ void choose_next_picture() {
     // guess below. Should a picture it left out come up to be shown after all, it is skipped instead, and the last one stays up.
     if (g_render_left_out && !skip) {
         skip = true;
-        ++g_stat_forced;
+        g_stat_forced.fetch_add(1, std::memory_order_relaxed);
     }
     g_render_left_out = false;
     g_skipped_in_row = skip ? g_skipped_in_row + 1 : 0;
-    g_stat_skipped += skip;
+    if (skip) g_stat_skipped.fetch_add(1, std::memory_order_relaxed);
     const bool test_aid = skip && (g_debug & 4u);   // skip the drawing but still run the vector programs
     queue::g_ee_skip = skip && !test_aid;
     // Whether the picture after this one will be skipped, as things stand. The game works it out during this one.
-    if (g_draw_every > 1) g_after_hidden = (g_picture + 1) % g_draw_every != 0;
+    if (g_draw_every > 1) g_after_hidden = skip_fixed_picture(g_picture + 1, g_draw_every);
     else g_after_hidden = !g_draw_every && queue::vu_active() && !test_aid && g_skipped_in_row < g_skip_now;
     g_next_picture = (skip && !test_aid ? kSkip : 0u) | (test_aid ? kDrawNothing : 0u) | (g_skip_run || g_draw_every > 1 ? kSkipping : 0u);
 }
@@ -1269,17 +1588,20 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r);
 
 // The game thread decides, as it starts each picture, so it can leave out what a skipped picture will not use.
 std::uint32_t next_picture() {
-    // Split mode draws every picture, even if a live DRAW command asks to skip.
-    if (queue::g_split_pica) return 0;
     if (!g_present_every || ++g_game_vblanks % g_present_every) return g_next_picture;
     using namespace ps2::prof;
-    const u64 blocked = g_ticks[Full], idle = g_ticks[Wait];   // the stats line clears these
-    if (blocked > g_seen_blocked) g_round_blocked += blocked - g_seen_blocked;
-    if (idle > g_seen_idle) g_round_idle += idle - g_seen_idle;
+    const auto blocked = g_ticks[Full].load(std::memory_order_relaxed);
+    const auto idle = g_ticks[Wait].load(std::memory_order_relaxed);
+    g_round_blocked += blocked - g_seen_blocked;
+    g_round_idle += idle - g_seen_idle;
     g_seen_blocked = blocked;
     g_seen_idle = idle;
     choose_next_picture();
     return g_next_picture;
+}
+
+void advance_vu_picture(std::uint32_t picture) {
+    queue::g_vu_skip_picture = picture & kSkip;
 }
 
 void vblank(std::uint32_t frame, const DisplayRegs &r, std::uint32_t picture) {
@@ -1289,7 +1611,7 @@ void vblank(std::uint32_t frame, const DisplayRegs &r, std::uint32_t picture) {
     if (g_shapes_since_present) show_picture(frame, r);
     g_skipping = picture & kSkipping;
     g_draw_nothing = picture & kDrawNothing;
-    if (!queue::g_split_pica) queue::g_skip_picture = picture & kSkip;
+    queue::g_skip_picture = picture & kSkip;
 }
 
 namespace {
@@ -1298,7 +1620,14 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r) {
     PS2_PROF(ps2::prof::Present);
     const int circuit = (r.pmode & 2u) ? 1 : (r.pmode & 1u) ? 0 : -1;
     flush_batch();
-    if (circuit >= 0) {
+    if (g_overlap_picture && movie::overlap_needs_wait()) FesOverlapWait();
+    if (const movie::Picture ours = movie::picture(free_oldest); ours.playing) {
+        // One of the build's own movie pictures instead of the game's black one. Until the first is ready, what was up stays up.
+        if (ours.tex) {
+            show_texture(g_screen, ours.tex, 0.0f, static_cast<float>(kScreenWidth) / 512.0f, 1.0f - static_cast<float>(kScreenHeight) / 256.0f, GPU_NEAREST);
+            if (g_two_screens) show_texture(g_screen_right, ours.tex, 0.0f, static_cast<float>(kScreenWidth) / 512.0f, 1.0f - static_cast<float>(kScreenHeight) / 256.0f, GPU_NEAREST);
+        }
+    } else if (circuit >= 0) {
         const std::uint32_t fbp = static_cast<std::uint32_t>(r.dispfb[circuit]) & 0x1FFu;
         for (Target &t : g_targets)
             if (t.used && t.fbp == fbp) {
@@ -1308,38 +1637,51 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r) {
                 Target *show = &t;
                 if (g_skipping && t.last_used != g_frame)
                     for (Target &o : g_targets)
-                        if (o.used && o.last_used == g_frame && o.tex.width == t.tex.width && o.tex.height == t.tex.height) show = &o;
+                        if (o.used && o.last_used == g_frame && o.width == t.width && o.tex.height == t.tex.height) show = &o;
                 show_target(show, r, circuit);
                 break;
             }
     }
     flush_ring();
+    if (g_debug & 8u) {
+        std::fprintf(stderr, "[pica] depths, far to near:");
+        for (std::uint32_t &n : g_depth_seen) {
+            std::fprintf(stderr, " %lu", static_cast<unsigned long>(n));
+            n = 0;
+        }
+        std::fputc('\n', stderr);
+    }
     if (g_stats) {
         static u64 last = svcGetSystemTick();
         const u64 now = svcGetSystemTick();
         const auto ms = [](u64 ticks) { return static_cast<unsigned long>(ticks / static_cast<u64>(CPU_TICKS_PER_MSEC)); };
         using namespace ps2::prof;
         const u64 total = now - last;
-        u64 known = g_ticks[Vu] + g_ticks[Upload] + g_ticks[Iop] + g_ticks[Ipu];   // Gif is inside Vu
+        static std::uint32_t previous_ticks[Count]{};
+        u64 ticks[Count];
+        for (int i = 0; i < Count; ++i) {
+            const auto current = g_ticks[i].load(std::memory_order_relaxed);
+            ticks[i] = current - previous_ticks[i];
+            previous_ticks[i] = current;
+        }
+        u64 known = ticks[Vu] + ticks[Upload] + ticks[Iop] + ticks[Ipu];   // Gif is inside Vu
         static std::uint64_t last_interpreted = 0, last_clock = 0, last_idle = 0;
         static std::uint32_t last_frame = 0;
-        std::fprintf(stderr, "[pica] %lu game frames in %lu ms, %lu ms each, %lu pictures skipped (%lu of them with their render left out by mistake)\n", static_cast<unsigned long>(frame - last_frame), ms(total), frame != last_frame ? ms(total) / static_cast<unsigned long>(frame - last_frame) : 0ul, static_cast<unsigned long>(g_stat_skipped), static_cast<unsigned long>(g_stat_forced));
+        std::fprintf(stderr, "[pica] %lu game frames in %lu ms, %lu ms each, %lu pictures skipped (%lu of them with their render left out by mistake)\n", static_cast<unsigned long>(frame - last_frame), ms(total), frame != last_frame ? ms(total) / static_cast<unsigned long>(frame - last_frame) : 0ul, static_cast<unsigned long>(g_stat_skipped.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long>(g_stat_forced.exchange(0, std::memory_order_relaxed)));
         last_frame = frame;
-        g_stat_skipped = g_stat_forced = 0;
         const std::uint64_t interpreted = ps2::vu1_interpreted_calls();
         const std::uint64_t clock = ps2::now(), idled = ps2::idle_cycles();
         std::fprintf(stderr, "[pica] ee %llu K cycles, %llu K idle | prims pt %lu ln %lu strip %lu tri %lu tstrip %lu fan %lu sprite %lu | upload %lu KB\n", static_cast<unsigned long long>((clock - last_clock) / 1000u), static_cast<unsigned long long>((idled - last_idle) / 1000u),
                      static_cast<unsigned long>(g_stat_prim[0]), static_cast<unsigned long>(g_stat_prim[1]), static_cast<unsigned long>(g_stat_prim[2]), static_cast<unsigned long>(g_stat_prim[3]), static_cast<unsigned long>(g_stat_prim[4]), static_cast<unsigned long>(g_stat_prim[5]), static_cast<unsigned long>(g_stat_prim[6]), static_cast<unsigned long>(g_stat_upload >> 10));
-        std::fprintf(stderr, "[pica] vif %lu (with vu) dma %lu events %lu (with iop, present) kernel %lu present %lu | vu thread idle %lu, ee thread blocked %lu\n", ms(g_ticks[Vif]), ms(g_ticks[Dma]), ms(g_ticks[Events]), ms(g_ticks[Kernel]), ms(g_ticks[Present]), ms(g_ticks[Wait]), ms(g_ticks[Full]));
+        std::fprintf(stderr, "[pica] vif %lu (with vu) dma %lu events %lu (with iop, present) kernel %lu present %lu | vu thread idle %lu, ee thread blocked %lu\n", ms(ticks[Vif]), ms(ticks[Dma]), ms(ticks[Events]), ms(ticks[Kernel]), ms(ticks[Present]), ms(ticks[Wait]), ms(ticks[Full]));
         last_clock = clock;
         last_idle = idled;
         std::fprintf(stderr, "[pica] frame %llu: %lu ms: game %lu vu %lu (gif %lu of it, interpreted calls %lu) upload %lu draw %lu iop %lu (spu %lu) ipu %lu | %lu shapes %lu draws %lu changes %lu splits %lu decoded %lu texels %lu reused %lu missing %lu verts, %lu KB free\n",
-                     static_cast<unsigned long long>(frame), ms(total), ms(total > known ? total - known : 0), ms(g_ticks[Vu]), ms(g_ticks[Gif]), static_cast<unsigned long>(interpreted - last_interpreted), ms(g_ticks[Upload]), ms(g_ticks[Draw]), ms(g_ticks[Iop]),
-                     ms(g_ticks[Spu]), ms(g_ticks[Ipu]), static_cast<unsigned long>(g_stat_shapes), static_cast<unsigned long>(g_stat_draws), static_cast<unsigned long>(g_stat_state),
+                     static_cast<unsigned long long>(frame), ms(total), ms(total > known ? total - known : 0), ms(ticks[Vu]), ms(ticks[Gif]), static_cast<unsigned long>(interpreted - last_interpreted), ms(ticks[Upload]), ms(ticks[Draw]), ms(ticks[Iop]),
+                     ms(ticks[Spu]), ms(ticks[Ipu]), static_cast<unsigned long>(g_stat_shapes), static_cast<unsigned long>(g_stat_draws), static_cast<unsigned long>(g_stat_state),
                      static_cast<unsigned long>(g_stat_splits), static_cast<unsigned long>(g_stat_decoded), static_cast<unsigned long>(g_stat_decode_texels), static_cast<unsigned long>(g_stat_reused), static_cast<unsigned long>(g_stat_missing),
                      static_cast<unsigned long>(g_ring_used), static_cast<unsigned long>(linearSpaceFree() >> 10));
         last_interpreted = interpreted;
-        std::memset(g_ticks, 0, sizeof g_ticks);
         last = svcGetSystemTick();
     }
     g_batch_number = 0;
@@ -1349,17 +1691,27 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r) {
     g_shapes_since_present = 0;
     std::memset(g_stat_prim, 0, sizeof g_stat_prim);
     g_stat_upload = 0;
-    // With no flags, C3D_FrameEnd would flush the whole of linear memory. Textures and the vertex ring are flushed as they are
-    // written, so only the commands are left.
-    u32 *commands;
-    u32 offset;
-    GPUCMD_GetBuffer(&commands, nullptr, &offset);
-    GSPGPU_FlushDataCache(g_frame_commands, static_cast<u32>(commands + offset - g_frame_commands) * sizeof(u32));
-    C3D_FrameEnd(GX_CMDLIST_FLUSH);
+    // GX flushes the finalized command list. Textures and vertex data have already been flushed.
+    FesOverlapEnd(GX_CMDLIST_FLUSH);
     g_frame_open = false;
+    if ((g_debug & 32u) && (g_frame % 15) == 0) {
+        static u64 previous_wait = 0;
+        const u64 total_wait = FesOverlapWaitTicks();
+        u32 peak; unsigned expansions;
+        FesOverlapCommandStats(&peak, &expansions);
+        std::fprintf(stderr, "[overlap] frame %lu mode %d begin %.3f wait %.3f record %.3f splits %u cmd_bytes %u expansions %u\n",
+                     static_cast<unsigned long>(frame), g_overlap_picture,
+                     static_cast<double>(g_profile_begin) / (15 * CPU_TICKS_PER_MSEC),
+                     static_cast<double>(total_wait - previous_wait) / (15 * CPU_TICKS_PER_MSEC),
+                     C3D_GetProcessingTime(), g_overflow_waits, peak * 4u, expansions);
+        previous_wait = total_wait;
+        g_profile_begin = 0;
+        g_overflow_waits = 0;
+    }
     if (g_shot_every && frame % g_shot_every < g_present_every) {
-        begin_frame();   // the picture has to be finished before it can be copied
-        save_shot();
+        const bool both = g_two_screens;
+        save_shot(g_screen, "");
+        if (both) save_shot(g_screen_right, "_r");
     }
 }
 

@@ -10,6 +10,7 @@ void start();                                     // after the SD card is ready;
 void poll(std::uint64_t frame);                   // once per vblank on the main thread
 void stop();
 bool wants_exit();                                // a QUIT or RUN came in
+void restart();                                   // as if RUN had come in: used to load a saved state from the bottom screen
 void chain_restart();                             // after RUN: the next start of this title loads the game again
 std::uint16_t buttons(std::uint64_t frame);       // PS2 pad bits pressed from the Mac
 

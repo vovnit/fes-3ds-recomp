@@ -3,9 +3,12 @@
 ;   v1 = colour, v2 = texture coordinates, v3 = GS fog value as a coordinate into the fog ramp
 ; scale and offset turn x, y, z into clip space for the current render target. x, y and z are then multiplied by w, so the
 ; GPU's perspective divide gives back the same screen position while interpolating the colour and coordinates with perspective.
+; eye moves a shape sideways by its depth, for the picture each eye gets with the 3D slider up: x times the depth, plus y.
+; Depth runs from 0 (far) to -1 (near), and anything nearer than eye.z counts as eye.z, so it does not move at all.
 
 .fvec scale
 .fvec offset
+.fvec eye
 
 .constf ones(1.0, 1.0, 1.0, 1.0)
 ; Byte attributes arrive as 0 to 255, not 0 to 1.
@@ -24,6 +27,10 @@
 .proc main
     mul r0.xyz, scale.xyz, inpos.xyz
     add r0.xyz, offset.xyz, r0.xyz
+    max r2, eye.zzzz, r0.zzzz
+    mul r2, eye.xxxx, r2
+    add r2, eye.yyyy, r2
+    add r0.x, r0.xxxx, r2.xxxx
     mov r0.w, inpos.w
     mul r1, ones, inpos.wwww
     mul outpos.xyz, r1.xyz, r0.xyz

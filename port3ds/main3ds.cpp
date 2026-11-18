@@ -9,16 +9,22 @@
 //                               "interp 1" (vector unit interpreter), "dump N" (log every GPU batch of game frame N),
 //                               "record sdmc:/p3fes/vu1" (save vector programs that are not compiled yet),
 //                               "vuthread 0" (run the vector programs and drawing on the same core as the game),
-//                               "splitgs 1" or "splitgs 2" (run drawing on core 0 or core 1 with "draw 1"),
+//                               "splitgs 1" or "splitgs 2" (run drawing on core 0 or core 1),
 //                               "draw N" (draw one picture in N; the default 0 draws what keeps up with the game),
 //                               "uncapped 1" (let a light scene run faster than the PS2, to measure how much room is left),
 //                               "hide A-B" (leave out batches A up to B of each picture, to find which one draws something),
 //                               "pmu 0 8" (hardware counters of the game's core in perf.txt, by event number, see below),
-//                               "link 0" (no wireless test link)
+//                               "link 0" (no wireless test link), "stereo N" (depth of the 3D picture, 0 to 10),
+//                               "movies 0" (the game's own movies, not the 400x240 copies in sdmc:/p3fes/movies),
+//                               "saveat N" (test aid: save a state to slot 1 at game frame N, as the bottom screen's Save does)
+//   sdmc:/p3fes/slot1.state     states saved from the bottom screen (slot1 to slot3), packed
+//   sdmc:/p3fes/next.txt        settings for the next start only: the bottom screen's Load writes "load slotN.state" here
 //   sdmc:/p3fes/log.txt         everything the runtime prints
 //   sdmc:/p3fes/perf.txt        one line of timing every 30 game frames
+#include "movie3ds.hpp"
 #include "pica.hpp"
 #include "remote3ds.hpp"
+#include "ipu/ipu.hpp"
 #include "ps2/disc.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
@@ -37,6 +43,10 @@
 #include <string>
 #include <sys/stat.h>
 #include <vector>
+
+namespace ps2::gs {
+extern std::uint32_t g_max_vu_lag;   // runtime/src/gs/gs.cpp
+}
 
 namespace gen { extern bool g_lossy; }   // native3ds.cpp
 
@@ -154,6 +164,7 @@ std::size_t read_disc(std::uint64_t offset, void *out, std::size_t size) {
         if (R_FAILED(FSFILE_Read(p.file, &got, at - p.start, to + done, want)) || got == 0) break;
         done += got;
     }
+    movie::disc_read(offset, to, done);
     return done;
 }
 
@@ -320,14 +331,23 @@ void switch_events(int to) {
 
 namespace {
 
-// The game counts vblanks, so without this a scene lighter than one vblank of work plays fast. Two frames of credit even out a slow one.
+// The game counts vblanks, so without this a scene lighter than one vblank of work plays fast. Four frames of credit even out slow
+// ones: with two, the lobby at about 19 ms a frame still slept 45 ms in every 30 frames, after the faster stretches between slow
+// ones, because a slow stretch had used up more credit than two frames.
 void hold_speed() {
-    constexpr u64 kClock = SYSCLOCK_ARM11, kFrame = kClock * 1001 / 60000;
+    constexpr u64 kClock = SYSCLOCK_ARM11, kFrame = kClock * 1001 / 60000, kCredit = 4;
     static u64 due = 0;
     const u64 now = svcGetSystemTick();
-    due = std::max(due, now - std::min(now, 2 * kFrame)) + kFrame;
+    due = std::max(due, now - std::min(now, kCredit * kFrame)) + kFrame;
     if (due > now) svcSleepThread(static_cast<s64>((due - now) * 1000000 / kClock * 1000));
 }
+
+// The bottom screen. The game thread reads the touch screen with the buttons and acts on what the main thread decided.
+std::atomic<std::uint32_t> g_touch{0};          // 0x80000000 | x << 16 | y while the screen is touched
+std::atomic<std::uint32_t> g_touch_buttons{0};  // PS2 pad bits held on the bottom screen
+std::atomic<int> g_save_slot{0};                // 1 to 3: save a state there at the next vblank
+std::atomic<std::uint32_t> g_saves_done{0};
+std::uint64_t g_save_at = 0;
 
 void on_vblank() {
     if (g_hold_speed) hold_speed();
@@ -336,17 +356,38 @@ void on_vblank() {
         return;
     }
     hidScanInput();
+    static bool saving = false;
+    if (saving) {   // the save asked for at the last vblank is done by now
+        saving = false;
+        g_saves_done.fetch_add(1);
+    }
+    if (hidKeysHeld() & KEY_TOUCH) {
+        touchPosition touch{};
+        hidTouchRead(&touch);
+        g_touch.store(0x80000000u | (static_cast<std::uint32_t>(touch.px) << 16) | touch.py);
+    } else {
+        g_touch.store(0);
+    }
+    if (g_save_at && ps2::frame_count() == g_save_at) g_save_slot.store(1);
+    if (const int slot = g_save_slot.exchange(0)) {
+        ps2::g_options.save_state_path = "sdmc:/p3fes/slot" + std::to_string(slot) + ".state";
+        saving = true;
+        ps2::request_state_save();
+    }
     circlePosition pad{}, cstick{};
     hidCircleRead(&pad);
     hidCstickRead(&cstick);
-    if (ps2::g_options.presses.empty()) {   // scripted test runs keep their own inputs
-        ps2::set_pad_buttons(read_buttons(hidKeysHeld()) | remote::buttons(ps2::frame_count()));
+    const std::uint64_t frame = ps2::frame_count();
+    const bool scripted = std::any_of(ps2::g_options.presses.begin(), ps2::g_options.presses.end(), [frame](const ps2::Press &press) {
+        return frame >= press.frame && frame - press.frame < press.frames;
+    });
+    if (!scripted) {
+        ps2::set_pad_buttons(read_buttons(hidKeysHeld()) | remote::buttons(frame) | static_cast<std::uint16_t>(g_touch_buttons.load()));
         ps2::set_pad_axis(0, stick_axis(cstick.dx));
         ps2::set_pad_axis(1, stick_axis(-cstick.dy));
         ps2::set_pad_axis(2, stick_axis(pad.dx));
         ps2::set_pad_axis(3, stick_axis(-pad.dy));
     }
-    const std::uint64_t frame = ps2::frame_count();
     if (g_software && g_show_every && frame % g_show_every == 0) show_frame();
     if (!g_perf) return;
     u64 now = 0;
@@ -421,8 +462,10 @@ void mvd_probe() {
     std::fprintf(stderr, "[mvd] linear free %lu KB after\n", static_cast<unsigned long>(linearSpaceFree() >> 10));
 }
 
-void read_settings() {
-    std::FILE *f = std::fopen("sdmc:/p3fes/args.txt", "r");
+bool g_movies = true;
+
+void read_settings(const char *path) {
+    std::FILE *f = std::fopen(path, "r");
     if (!f) return;
     char line[128];
     while (std::fgets(line, sizeof line, f)) {
@@ -461,6 +504,10 @@ void read_settings() {
         else if (!std::strcmp(key, "uncapped")) g_hold_speed = std::strtoul(value, nullptr, 10) == 0;
         else if (!std::strcmp(key, "mvdprobe")) g_mvd_probe = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "lossy")) gen::g_lossy = std::strtoul(value, nullptr, 10) != 0;
+        else if (!std::strcmp(key, "vulag")) ps2::gs::g_max_vu_lag = std::strtoul(value, nullptr, 10);
+        else if (!std::strcmp(key, "stereo")) ps2::gs::pica::set_stereo(std::strtoul(value, nullptr, 10));
+        else if (!std::strcmp(key, "movies")) g_movies = std::strtoul(value, nullptr, 10) != 0;
+        else if (!std::strcmp(key, "saveat")) g_save_at = std::strtoull(value, nullptr, 10);
         else if (!std::strcmp(key, "draw")) g_draw_every = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         else if (!std::strcmp(key, "shots")) {
             mkdir("sdmc:/p3fes/shots", 0777);
@@ -574,7 +621,7 @@ void emulate_on_game_stack() {
 #ifdef PS2_PROF_ALL
     ps2::prof::g_game_thread = getThreadLocalStorage();
 #endif
-    g_split_gs = g_split_gs && g_vu_thread && !g_software && g_draw_every == 1;
+    g_split_gs = g_split_gs && g_vu_thread && !g_software;
     if (g_software) {
         ps2::g_options.frames_dir = g_shots_every ? "sdmc:/p3fes/shots" : "";
         ps2::g_options.frame_every = g_shots_every;
@@ -643,6 +690,130 @@ void emulate_on_game_stack() {
 
 void emulate(void *) { call_on_stack(emulate_on_game_stack, kGameStackTop); }
 
+// ---- The bottom screen: saved states and a few controls the console has no button for.
+// It is the text console, 40 columns by 30 rows of 8x8 cells, so a button is a block of coloured cells.
+struct Button {
+    int col, row, cols, rows;
+    const char *label;
+    int id;
+};
+enum { kSave = 1, kLoad, kSlot1, kSlot2, kSlot3, kL3, kR3, kFast, kFlatter, kDeeper };
+constexpr Button kButtons[] = {
+    {2, 4, 17, 5, "SAVE STATE", kSave},  {21, 4, 17, 5, "LOAD STATE", kLoad},
+    {10, 11, 8, 3, "1", kSlot1},         {20, 11, 8, 3, "2", kSlot2},         {30, 11, 8, 3, "3", kSlot3},
+    {2, 17, 11, 3, "L3", kL3},           {14, 17, 11, 3, "R3", kR3},          {27, 17, 11, 3, "FAST", kFast},
+    {20, 22, 8, 3, "-", kFlatter},       {30, 22, 8, 3, "+", kDeeper},
+};
+int g_slot = 1;
+char g_panel_status[40] = "";
+bool g_panel_was_saving = false;
+std::uint32_t g_panel_saves = 0;
+std::uint64_t g_panel_frames = 0;
+u64 g_panel_ticks = 0;
+
+void panel_button(const Button &b, bool lit) {
+    const int text_row = b.row + b.rows / 2, length = static_cast<int>(std::strlen(b.label));
+    for (int r = 0; r < b.rows; ++r) {
+        std::printf("\x1b[%d;%dH\x1b[%sm", b.row + r + 1, b.col + 1, lit ? "47;30" : "44;37");
+        for (int c = 0; c < b.cols; ++c) {
+            const int at = c - (b.cols - length) / 2;
+            std::putchar(r + b.row == text_row && at >= 0 && at < length ? b.label[at] : ' ');
+        }
+    }
+    std::printf("\x1b[0m");
+}
+
+bool slot_exists(int slot) {
+    struct stat info;
+    return stat(("sdmc:/p3fes/slot" + std::to_string(slot) + ".state").c_str(), &info) == 0;
+}
+
+void panel_draw() {
+    std::printf("\x1b[2J\x1b[1;1H\x1b[0m Persona 3 FES");
+    for (const Button &b : kButtons)
+        panel_button(b, (b.id >= kSlot1 && b.id <= kSlot3 && b.id - kSlot1 + 1 == g_slot) || (b.id == kFast && !g_hold_speed));
+    std::printf("\x1b[13;3HSLOT\x1b[15;11H%-28s", slot_exists(g_slot) ? "holds a saved state" : "empty");
+    std::printf("\x1b[24;3H3D DEPTH %-2lu", static_cast<unsigned long>(ps2::gs::pica::stereo()));
+    std::printf("\x1b[28;2H%-38s", g_panel_status);
+    std::fflush(stdout);
+}
+
+void panel_say(const char *text) {
+    std::snprintf(g_panel_status, sizeof g_panel_status, "%s", text);
+    panel_draw();
+}
+
+// Once per vblank on the main thread.
+void panel_step() {
+    static int held = 0;
+    static std::uint32_t beats = 0;
+    const std::uint32_t touch = g_touch.load();
+    int over = 0;
+    if (touch) {
+        const int col = static_cast<int>((touch >> 16) & 0x7FFFu) / 8, row = static_cast<int>(touch & 0xFFFFu) / 8;
+        for (const Button &b : kButtons)
+            if (col >= b.col && col < b.col + b.cols && row >= b.row && row < b.row + b.rows) over = b.id;
+    }
+    g_touch_buttons.store(over == kL3 ? 1u << 1 : (over == kR3 ? 1u << 2 : 0u));
+    if (over != held) {
+        held = over;
+        switch (over) {
+        case kSave:
+            if (g_panel_was_saving) break;
+            g_panel_was_saving = true;
+            g_panel_saves = g_saves_done.load();
+            g_save_slot.store(g_slot);
+            panel_say("Saving...");
+            break;
+        case kLoad:
+            if (!slot_exists(g_slot)) {
+                panel_say("This slot is empty");
+                break;
+            }
+            if (std::FILE *f = std::fopen("sdmc:/p3fes/next.txt", "w")) {
+                std::fprintf(f, "load slot%d.state\n", g_slot);
+                std::fclose(f);
+                panel_say("Loading: the game starts again...");
+                remote::restart();
+            }
+            break;
+        case kSlot1: case kSlot2: case kSlot3:
+            g_slot = over - kSlot1 + 1;
+            panel_say("");
+            break;
+        case kFast:
+            g_hold_speed = !g_hold_speed;
+            panel_say(g_hold_speed ? "Normal speed" : "As fast as it can");
+            break;
+        case kFlatter: case kDeeper: {
+            const std::uint32_t now = ps2::gs::pica::stereo();
+            ps2::gs::pica::set_stereo(over == kDeeper ? now + 1 : (now ? now - 1 : 0));
+            panel_say("");
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    if (g_panel_was_saving && g_saves_done.load() != g_panel_saves) {
+        g_panel_was_saving = false;
+        char text[40];
+        std::snprintf(text, sizeof text, slot_exists(g_slot) ? "Saved to slot %d" : "Could not save to slot %d", g_slot);
+        panel_say(text);
+    }
+    if (++beats % 60 == 0) {   // game frames a second over the last second: 60 is full speed
+        const u64 now = svcGetSystemTick();
+        const std::uint64_t frames = ps2::frame_count();
+        if (g_panel_ticks) {
+            const double seconds = static_cast<double>(now - g_panel_ticks) / static_cast<double>(SYSCLOCK_ARM11);
+            std::printf("\x1b[1;26H%5.1f a second", static_cast<double>(frames - g_panel_frames) / seconds);
+            std::fflush(stdout);
+        }
+        g_panel_ticks = now;
+        g_panel_frames = frames;
+    }
+}
+
 }
 
 int main() {
@@ -660,13 +831,16 @@ int main() {
         svcBreak(USERBREAK_PANIC);
     });
     gfxInit(GSP_BGR8_OES, GSP_BGR8_OES, false);
+    gfxSet3D(true);   // the right eye's buffer is shown only while the 3D slider is up
     gfxSetDoubleBuffering(GFX_TOP, true);
     consoleInit(GFX_BOTTOM, nullptr);
     osSetSpeedupEnable(true);
 
     mkdir("sdmc:/p3fes", 0777);
     std::freopen("sdmc:/p3fes/log.txt", "w", stderr);
-    std::setvbuf(stderr, nullptr, _IOLBF, 512);
+    // A picture can log several lines. Batch them so SD writes do not stall the drawing core per line.
+    static char log_buffer[16 * 1024];
+    std::setvbuf(stderr, log_buffer, _IOFBF, sizeof log_buffer);
     g_perf = std::fopen("sdmc:/p3fes/perf.txt", "w");
 
     log_memory();
@@ -682,7 +856,9 @@ int main() {
         while (aptMainLoop()) gspWaitForVBlank();
     } else {
         std::memset(ps2::g_ram, 0, ps2::kRamSize);
-        read_settings();
+        read_settings("sdmc:/p3fes/args.txt");
+        read_settings("sdmc:/p3fes/next.txt");
+        std::remove("sdmc:/p3fes/next.txt");
         if (g_link) remote::start();
         ps2::g_options.on_vblank = on_vblank;
         ps2::g_options.memcard_path = "sdmc:/p3fes/card.ps2";
@@ -690,10 +866,12 @@ int main() {
         register_generated_vu();
 
         svcGetThreadPriority(&g_priority, CUR_THREAD_HANDLE);
+        // The movie decoder shares core 2 with the vector programs and drawing, below them: a movie leaves that core idle.
+        if (g_movies && !g_software && movie::start(g_priority + 2, 2)) ps2::ipu::g_csc_watch = movie::watch;
         Thread thread = threadCreate(emulate, nullptr, kEmulationStack, g_priority + 1, -2, false);
         if (!thread) std::puts("Could not start the game thread.");
-        std::puts("Persona 3 FES New 3DS test build\nProgress goes to sdmc:/p3fes/log.txt");
         std::uint32_t beats = 0;
+        panel_draw();
         while (thread && !g_finished) {
             if (!aptMainLoop() || remote::wants_exit()) {
                 g_quit = true;
@@ -701,7 +879,9 @@ int main() {
             }
             gspWaitForVBlank();
             remote::poll(ps2::frame_count());
-            if (++beats % 600 == 0)
+            panel_step();
+            if (++beats % 60 == 0) std::fflush(stderr);
+            if (beats % 600 == 0)
                 std::fprintf(stderr, "[3ds] heartbeat %lu, %llu ms, frame %llu\n", static_cast<unsigned long>(beats),
                              static_cast<unsigned long long>(svcGetSystemTick() / static_cast<u64>(CPU_TICKS_PER_MSEC)),
                              static_cast<unsigned long long>(ps2::frame_count()));
@@ -712,7 +892,9 @@ int main() {
         }
     }
 
+    movie::stop();
     remote::stop();
+    std::fflush(stderr);
     remote::chain_restart();
     if (g_perf) std::fclose(g_perf);
     std::fflush(stderr);

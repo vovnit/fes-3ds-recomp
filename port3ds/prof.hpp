@@ -4,6 +4,7 @@
 // pica.cpp prints the counters with "stats 1". Spu is part of Iop and Gif is part of Vu; drawing is inside Gif. Whatever is left
 // over is the translated game code.
 
+#include <atomic>
 #include <cstdint>
 
 extern "C" std::uint64_t svcGetSystemTick(void);
@@ -12,7 +13,8 @@ namespace ps2::prof {
 
 // Wait is the VU thread finding nothing to do, Full is the EE thread finding the queue to it full.
 enum Counter { Vu, Gif, Upload, Draw, Iop, Spu, Ipu, Vif, Dma, Events, Kernel, Present, Wait, Full, Count };
-extern std::uint64_t g_ticks[Count];
+// Cumulative counters. Each reader takes its own unsigned delta across wraparound.
+extern std::atomic<std::uint32_t> g_ticks[Count];
 
 #ifdef PS2_PROF_ALL
 // With "pmu A B", the two hardware events on the game thread by activity, each nested activity apart from the one around it.
@@ -65,7 +67,8 @@ struct Scope {
 #endif
     }
     ~Scope() {
-        if constexpr (kTimed) g_ticks[C] += svcGetSystemTick() - start;
+        if constexpr (kTimed)
+            g_ticks[C].fetch_add(static_cast<std::uint32_t>(svcGetSystemTick() - start), std::memory_order_relaxed);
 #ifdef PS2_PROF_ALL
         if (outer >= 0) switch_events(outer);
 #endif

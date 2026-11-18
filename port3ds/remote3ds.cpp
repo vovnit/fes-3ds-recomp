@@ -198,9 +198,18 @@ bool may_put_state(const char *path) {
            !std::strchr(path + kFolder, '/') && !std::strstr(path, "..");
 }
 
+// The 400x240 movie copies and the cheap movie data go into the movies folder (see tools/p3fes_3ds_movies.py).
+bool may_put_movie(const char *path) {
+    constexpr std::size_t kFolder = 14, kEnding = 4;   // "/p3fes/movies/" and ".p3v" or ".cut"
+    const std::size_t length = std::strlen(path);
+    if (length <= kFolder + kEnding || std::strncmp(path, "/p3fes/movies/", kFolder) || std::strchr(path + kFolder, '/') || std::strstr(path, "..")) return false;
+    return !std::strcmp(path + length - kEnding, ".p3v") || !std::strcmp(path + kFolder, "movies.cut");
+}
+
 void start_put(const char *path, std::uint64_t size, std::uint32_t crc, bool packed = false, std::uint64_t unpacked = 0) {
     g_is_program = !std::strcmp(path, kProgram);
-    if (!g_is_program && std::strcmp(path, kSettings) && !may_put_state(path)) return say("ERR not allowed\n");
+    if (!g_is_program && std::strcmp(path, kSettings) && !may_put_state(path) && !may_put_movie(path)) return say("ERR not allowed\n");
+    if (may_put_movie(path)) mkdir("sdmc:/p3fes/movies", 0777);
     if (size > kMostBytes || (g_is_program && size < 4)) return say("ERR wrong size\n");
     if (packed && (unpacked > kMostBytes || (g_is_program && unpacked < 4))) return say("ERR wrong size\n");
     if (packed) {
@@ -270,6 +279,7 @@ void run_command(char *line, std::uint64_t frame) {
         if (may_list(rest)) list_folder(rest);
         else say("ERR not allowed\n");
     } else if (!std::strcmp(line, "GET") && rest) {
+        if (!std::strcmp(rest, "/p3fes/log.txt")) std::fflush(stderr);
         if (may_read(rest)) start_get(rest);
         else say("ERR not allowed\n");
     } else if ((!std::strcmp(line, "PUT") || !std::strcmp(line, "PUTZ")) && rest) {
@@ -505,6 +515,11 @@ void stop() {
 }
 
 bool wants_exit() { return g_exit; }
+
+void restart() {
+    g_restart = true;
+    g_exit = true;
+}
 
 void chain_restart() {
     if (!g_restart) return;

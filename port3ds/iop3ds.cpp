@@ -8,7 +8,8 @@
 // The picture rate does not change, because that depends on the core running the vector programs. What changes is how fast the
 // game runs when enough pictures are skipped.
 //
-// The I/O processor can be behind the game, and by how much depends on real time. So a run is no longer exactly repeatable, and
+// The I/O processor can be behind the game, or up to the next vblank ahead of it (see iop_horizon), and by how much depends on
+// real time. So a run is no longer exactly repeatable, and
 // "iopthread 0" in args.txt brings back the old lockstep for picture comparisons.
 #include "iop/iop.hpp"
 #include "ps2/system.hpp"
@@ -42,6 +43,8 @@ Handle g_go = 0;
 // These count EE cycles and wrap: only their differences mean anything.
 std::atomic<std::uint32_t> g_target{0}, g_done{0};
 std::atomic<std::uint32_t> g_edge_in{0}, g_edge_out{0};
+// Where the I/O processor may run to with no edge waiting: the next vblank, set at the end of each vblank. See iop_horizon.
+std::atomic<std::uint32_t> g_horizon{0};
 std::atomic<bool> g_asleep{false};
 Edge g_edges[kEdges];
 // With "pmu" in args.txt: system ticks the game thread spent waiting for this thread, and this thread spent working.
@@ -68,13 +71,27 @@ void worker_take() {
     take();
 }
 
+// Where the worker may run to: the next edge, or else the game's clock or the horizon past it.
+std::uint32_t stop_at(bool edge, std::uint32_t out) {
+    if (edge) return g_edges[out % kEdges].at;
+    const std::uint32_t target = g_target.load(std::memory_order_acquire);
+    const std::uint32_t horizon = g_horizon.load(std::memory_order_acquire);
+    const std::uint32_t past = horizon - target;
+    return past != 0 && past <= kMaxLag ? horizon : target;
+}
+
+// Cycles left to run before stop, or 0 when the worker is there or past it.
+std::uint32_t left_to(std::uint32_t stop, std::uint32_t done) {
+    const std::uint32_t left = stop - done;
+    return left < 0x80000000u ? left : 0;
+}
+
 void worker(void *) {
     for (;;) {
         const std::uint32_t done = g_done.load(std::memory_order_relaxed);
         const std::uint32_t out = g_edge_out.load(std::memory_order_relaxed);
         const bool edge = out != g_edge_in.load(std::memory_order_acquire);
-        const std::uint32_t stop = edge ? g_edges[out % kEdges].at : g_target.load(std::memory_order_acquire);
-        if (const std::uint32_t left = stop - done; left != 0 && left < 0x80000000u) {
+        if (const std::uint32_t left = left_to(stop_at(edge, out), done); left != 0) {
             const std::uint32_t chunk = left < kChunk ? left : kChunk;
             worker_take();
             const u64 from = g_timing ? svcGetSystemTick() : 0;
@@ -92,8 +109,7 @@ void worker(void *) {
         } else {
             g_asleep.store(true);
             // Anything posted before this store is seen by the second look, and anything after it signals.
-            const std::uint32_t target = g_target.load(), in = g_edge_in.load();
-            if (target == done && in == out) {
+            if (g_edge_in.load() == out && left_to(stop_at(false, out), done) == 0) {
                 if (g_stop) return;
                 svcWaitSynchronization(g_go, U64_MAX);
             }
@@ -101,6 +117,9 @@ void worker(void *) {
         }
     }
 }
+
+// How far the I/O processor is behind a target: negative when it ran ahead.
+std::int32_t behind(std::uint32_t target) { return static_cast<std::int32_t>(target - g_done.load(std::memory_order_acquire)); }
 
 void wake() {
     if (g_asleep.exchange(false)) svcSignalEvent(g_go);
@@ -148,9 +167,19 @@ void iop_advance(std::uint64_t ee_cycles) {
     const std::uint32_t target = g_target.load(std::memory_order_relaxed) + static_cast<std::uint32_t>(ee_cycles);
     g_target.store(target, std::memory_order_release);
     wake();
-    if (target - g_done.load(std::memory_order_acquire) <= kMaxLag) return;
+    if (behind(target) <= static_cast<std::int32_t>(kMaxLag)) return;
     const WaitTimer timer;
-    while (target - g_done.load(std::memory_order_acquire) > kMaxLag) svcSleepThread(50000);
+    while (behind(target) > static_cast<std::int32_t>(kMaxLag)) svcSleepThread(50000);
+}
+
+// The game thread posts this at the end of each vblank: with nothing to do from the game, the I/O processor carries on up to the
+// next vblank instead of waiting for the game's clock. The game does a frame's work early in the frame and then idles to the
+// vblank, and its clock jumps there at once; without this the I/O processor only starts on that stretch then, and the game's next
+// request, which it waits for, queues behind it. A request that comes in while the I/O processor is ahead is taken at the I/O
+// processor's own time, a little later than on a PS2, and its reply reaches the game early.
+void iop_horizon(std::uint32_t ee_cycles) {
+    g_horizon.store(g_target.load(std::memory_order_relaxed) + ee_cycles, std::memory_order_release);
+    wake();
 }
 
 void iop_edge(bool start) {
@@ -166,7 +195,7 @@ void iop_wait() {
     if (!g_running) return;
     wake();
     const WaitTimer timer;
-    while (g_done.load(std::memory_order_acquire) != g_target.load(std::memory_order_relaxed) ||
+    while (behind(g_target.load(std::memory_order_relaxed)) > 0 ||
            g_edge_out.load(std::memory_order_acquire) != g_edge_in.load(std::memory_order_relaxed))
         svcSleepThread(20000);
 }

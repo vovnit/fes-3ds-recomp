@@ -5536,6 +5536,363 @@ bool run_unchanging(int unit, Unit &u, const std::uint8_t *data, std::uint32_t q
 }
 
 
+# The I/O processor thread may run ahead of the game's clock up to the next vblank (port3ds/iop3ds.cpp, iop_horizon).
+IOPAHEAD_EDITS = {
+    'runtime/include/ps2/system.hpp': [
+        (r"""void iop_edge(bool start);
+void iop_wait();""", r"""void iop_edge(bool start);
+void iop_horizon(std::uint32_t ee_cycles);   // ps2run_3ds_patch.py: the I/O processor may run this far past the last edge
+void iop_wait();"""),
+    ],
+    'runtime/src/system.cpp': [
+        (r"""        iop_edge(start);
+        return;
+""", r"""        iop_edge(start);
+        if (!start) iop_horizon(static_cast<std::uint32_t>(frame_cycles() - hblank_cycles() * 22u));   // up to the next vblank
+        return;
+"""),
+    ],
+}
+
+
+# Unchanging data sent as an address is read by the VU thread when it gets to it. Its queue then held twenty pictures and more, and on
+# entering an area the game had put the new area's models where the old ones were, so the VU thread drew garbage, asked for a 10 MB
+# copy buffer and stopped. The game now waits at a vblank while the VU thread is more than ten behind (counted as a full queue, which
+# the picture skipping goes by); between full checks a few words of each block are still compared; kept VIF records go with the
+# bytes' hash; and a GS copy of more than a million pixels is left out.
+STALE_EDITS = {
+    'runtime/src/gs/queue.hpp': [
+        (r"""void rewritten(const std::uint8_t *data, std::uint32_t bytes);
+extern bool g_quiet;         // ps2run_3ds_patch.py: nothing is drawn while this is set
+""", r"""void rewritten(const std::uint8_t *data, std::uint32_t bytes);
+extern std::uint32_t g_unchanging_hash;   // ps2run_3ds_patch.py: the bytes' hash when unchanging() last said yes
+extern bool g_quiet;         // ps2run_3ds_patch.py: nothing is drawn while this is set
+"""),
+    ],
+    'runtime/src/gs/queue.cpp': [
+        (r"""// than a picture behind, that one picture is drawn from the newer bytes. Build with -DPS2_VIF_COPY to copy everything as before.
+namespace {
+""", r"""// than a picture behind, that one picture is drawn from the newer bytes. Build with -DPS2_VIF_COPY to copy everything as before.
+//
+// Between checks a few words of the block are still compared every time (sample()): on entering an area the game puts the new area's
+// models where the last one's were, and without that the VU thread read the new bytes as the old commands until the next check, drew
+// garbage and once asked for a 10 MB copy buffer.
+namespace {
+"""),
+        (r"""    std::uint32_t bytes, hash;
+""", r"""    std::uint32_t bytes, hash, sample;
+"""),
+        (r"""Unchanging g_unchanging[16384];
+}
+""", r"""Unchanging g_unchanging[16384];
+}
+std::uint32_t g_unchanging_hash = 0;
+namespace {
+
+// Four words: the first, the last, and two between (blocks are whole quadwords, at least 16 bytes).
+std::uint32_t sample(const std::uint8_t *data, std::uint32_t bytes) {
+    const std::uint32_t q = (bytes >> 2) & ~3u;
+    std::uint32_t a, b, c, d;
+    std::memcpy(&a, data, 4);
+    std::memcpy(&b, data + q, 4);
+    std::memcpy(&c, data + q * 2 + 4, 4);
+    std::memcpy(&d, data + bytes - 4, 4);
+    return a ^ (b * 3u) ^ (c * 5u) ^ (d * 7u);
+}
+}
+"""),
+        (r"""    if (known && e.rest) {
+""", r"""    if (known && e.rest && sample(data, bytes) == e.sample) {
+"""),
+        (r"""        --e.rest;
+        return true;
+""", r"""        --e.rest;
+        g_unchanging_hash = e.hash;
+        return true;
+"""),
+        (r"""        if (e.same >= 3) e.rest = static_cast<std::uint8_t>(24u + (h >> 28));
+""", r"""        if (e.same >= 3) {
+            e.rest = static_cast<std::uint8_t>(24u + (h >> 28));
+            e.sample = sample(data, bytes);
+        }
+"""),
+        (r"""        e = Unchanging{data, bytes, h, 0, 0};
+""", r"""        e = Unchanging{data, bytes, h, 0, 0, 0};
+"""),
+    ],
+    'runtime/src/vif.cpp': [
+        (r"""    std::uint32_t records, words, epoch;   // what to send the VU thread: g_records[records], words long, if epoch is still g_epoch
+    bool dbf;
+""", r"""    std::uint32_t records, words, epoch;   // what to send the VU thread: g_records[records], words long, if epoch is still g_epoch
+    std::uint32_t hash;   // of the bytes then: the same place can hold other unchanging data later (a new area's models)
+    bool dbf;
+"""),
+        (r"""    if (slot.data == data && slot.qwc == qwc && slot.before == before && slot.epoch == g_epoch) {
+""", r"""    if (slot.data == data && slot.qwc == qwc && slot.before == before && slot.epoch == g_epoch && slot.hash == gs::queue::g_unchanging_hash) {
+"""),
+        (r"""        slot.epoch = g_epoch;
+        g_records_used += g_capture_words;
+""", r"""        slot.epoch = g_epoch;
+        slot.hash = gs::queue::g_unchanging_hash;
+        g_records_used += g_capture_words;
+"""),
+    ],
+    'runtime/src/gs/gs.hpp': [
+        (r"""void vblank(bool start);
+bool interlaced_odd_field();
+""", r"""void vblank(bool start);
+extern std::uint32_t g_max_vu_lag;   // ps2run_3ds_patch.py: vblanks the drawing side may be behind; 0 for no limit
+bool interlaced_odd_field();
+"""),
+    ],
+    'runtime/src/gs/gs.cpp': [
+        (r"""    const std::uint32_t rrw = static_cast<std::uint32_t>(reg) & 0xFFFu, rrh = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
+    std::vector<std::uint32_t> pixels(static_cast<std::size_t>(rrw) * rrh);
+""", r"""    const std::uint32_t rrw = static_cast<std::uint32_t>(reg) & 0xFFFu, rrh = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
+    if (static_cast<std::size_t>(rrw) * rrh > (1u << 20)) {   // ps2run_3ds_patch.py: only garbage asks this much; it took 10 MB of a 3DS heap
+        static bool warned = false;
+        if (!warned) std::fprintf(stderr, "[gs] local copy of %ux%u left out\n", rrw, rrh);
+        warned = true;
+        return;
+    }
+    std::vector<std::uint32_t> pixels(static_cast<std::size_t>(rrw) * rrh);
+"""),
+        (r"""
+void vblank(bool start) {
+""", r"""
+std::atomic<std::uint32_t> g_vblanks_served{0};
+std::uint32_t g_vblanks_posted = 0;
+// ps2run_3ds_patch.py: the drawing side reads unchanging data from PS2 memory when it gets to it (see unchanging() in queue.cpp), and
+// with that data sent as addresses its queue held twenty pictures and more, by which time the game had put a new area's models
+// there. So the game waits at a vblank while the drawing side is more than this many behind. In the lobby it is normally 6 to 10
+// behind: a limit of 3 cost 7.6 ms a frame on the console, 6 cost 4, and 10 cost 0.8, and walking into the hallway in Azahar
+// with draw 3 fails with no limit and passes with 10 or 14.
+std::uint32_t g_max_vu_lag = 10;
+
+void vblank(bool start) {
+"""),
+        (r"""            queue::post(queue::kVblank, static_cast<std::uint32_t>(ps2::frame_count()), 0, &message, sizeof message);
+        }
+""", r"""            queue::post(queue::kVblank, static_cast<std::uint32_t>(ps2::frame_count()), 0, &message, sizeof message);
+            ++g_vblanks_posted;
+            if (g_max_vu_lag && g_vblanks_posted - g_vblanks_served.load() > g_max_vu_lag) {
+                PS2_PROF(ps2::prof::Full);   // counts as a full queue: the picture skipping goes by that
+                for (std::uint32_t done = g_vblanks_served.load(); g_vblanks_posted - done > g_max_vu_lag; done = g_vblanks_served.load())
+                    queue::wait(g_vblanks_served, done);
+            }
+        }
+"""),
+        (r"""        if (pica::active()) pica::vblank(arg0, message.regs, message.picture);
+        break;
+""", r"""        if (pica::active()) pica::vblank(arg0, message.regs, message.picture);
+        g_vblanks_served.fetch_add(1);
+        queue::notify(g_vblanks_served);
+        break;
+"""),
+    ],
+}
+
+
+# Movies and saved states for the console itself (2026-11-13).
+# - The IPU asks a watcher about each macroblock a CSC command converts. The 3DS build's movie player (port3ds/movie3ds.cpp)
+#   reads its picture markers there and has the conversion left out while one of its own movies is on.
+# - On the 3DS a state is written to the card packed, as it is made, and read back the same way: the whole of one does not
+#   fit the heap. zlib reads a plain state from the computer too. The caller of request_state_save() names the file there.
+MOVIE_EDITS = {
+    'runtime/src/ipu/ipu.hpp': [
+        (r"""void stats();
+
+""", r"""void stats();
+// ps2run_3ds_patch.py: asked for each macroblock a CSC command is about to convert, with its number in the command and how many
+// the command converts. True leaves the conversion out, and the pixels come out black. The 3DS build reads its movie markers
+// here (port3ds/movie3ds.cpp).
+extern bool (*g_csc_watch)(const std::uint8_t *raw, unsigned index, unsigned count);
+
+"""),
+    ],
+    'runtime/src/ipu/ipu.cpp': [
+        (r"""                convert_fast(g_in.data() + (g_bit >> 3));
+""", r"""                if (g_csc_watch && g_csc_watch(g_in.data() + (g_bit >> 3), (cmd & 0x7FFu) - g_count, cmd & 0x7FFu)) g_out.insert(g_out.end(), 1024, 0);
+                else convert_fast(g_in.data() + (g_bit >> 3));
+"""),
+        (r"""                convert(raw, (cmd >> 27) & 1u);
+""", r"""                if (g_csc_watch && g_csc_watch(raw, (cmd & 0x7FFu) - g_count, cmd & 0x7FFu)) g_out.insert(g_out.end(), (cmd >> 27) & 1u ? 512 : 1024, 0);
+                else convert(raw, (cmd >> 27) & 1u);
+"""),
+        (r"""
+}
+
+void reset() {
+""", r"""
+}
+
+bool (*g_csc_watch)(const std::uint8_t *raw, unsigned index, unsigned count) = nullptr;   // ps2run_3ds_patch.py
+
+void reset() {
+"""),
+    ],
+    'runtime/src/system.cpp': [
+        (r"""#include <stdexcept>
+
+""", r"""#include <stdexcept>
+#ifdef __3DS__
+#include <zlib.h>   // ps2run_3ds_patch.py: states are written and read packed, piece by piece
+#endif
+
+"""),
+        (r"""    if (g_live_state_request.exchange(false)) {
+        std::string name;
+""", r"""    if (g_live_state_request.exchange(false)) {
+#ifndef __3DS__   // ps2run_3ds_patch.py: there the caller names the file in g_options.save_state_path
+        std::string name;
+"""),
+        (r"""        g_options.save_state_path = name;
+        g_state_request = true;
+""", r"""        g_options.save_state_path = name;
+#endif
+        g_state_request = true;
+"""),
+        (r"""
+bool save_state(const std::string &path) {
+    try {
+""", r"""
+#ifdef __3DS__
+namespace {
+// ps2run_3ds_patch.py: a state is about 44 MB and the console has 7 MB of heap to spare, so it goes to the card as it is made.
+// zlib's fastest setting makes it about a quarter of that, which the card writes sooner than the whole.
+class PackedWriter : public state::Stream {
+public:
+    explicit PackedWriter(gzFile file) : Stream(true), file_(file) {}
+    void bytes(void *data, std::size_t size) override {
+        if (size && gzwrite(file_, data, static_cast<unsigned>(size)) != static_cast<int>(size)) throw std::runtime_error("cannot write the state file");
+    }
+
+private:
+    gzFile file_;
+};
+}
+#endif
+
+bool save_state(const std::string &path) {
+#ifdef __3DS__
+    {
+        const std::string part = path + ".part";
+        gzFile file = gzopen(part.c_str(), "wb1");
+        if (!file) {
+            std::fprintf(stderr, "[state] cannot write %s\n", part.c_str());
+            return false;
+        }
+        gzbuffer(file, 128u << 10);
+        bool saved = false;
+        try {
+            PackedWriter w(file);
+            machine_state(w);
+            saved = true;
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "[state] cannot save: %s\n", e.what());
+        }
+        if (gzclose(file) != Z_OK) saved = false;
+        // The old file goes only once the new one is whole.
+        if (saved) {
+            std::remove(path.c_str());
+            saved = std::rename(part.c_str(), path.c_str()) == 0;
+        }
+        if (saved) std::fprintf(stderr, "[state] saved frame %llu to %s\n", static_cast<unsigned long long>(g_frames), path.c_str());
+        else std::remove(part.c_str());
+        return saved;
+    }
+#endif
+    try {
+"""),
+        (r"""class FileReader : public state::Stream {   // ps2run_3ds_patch.py
+""", r"""class FileReader : public state::Stream {   // ps2run_3ds_patch.py: zlib reads a packed state and a plain one alike
+"""),
+        (r"""    explicit FileReader(std::FILE *file) : Stream(false), file_(file) {}
+""", r"""    explicit FileReader(gzFile file) : Stream(false), file_(file) {}
+"""),
+        (r"""        if (std::fread(data, 1, size, file_) != size) throw std::runtime_error("state file is truncated");
+    }
+
+private:
+    std::FILE *file_;
+};
+}
+#endif
+
+""", r"""        if (size && gzread(file_, data, static_cast<unsigned>(size)) != static_cast<int>(size)) throw std::runtime_error("state file is truncated");
+    }
+
+private:
+    gzFile file_;
+};
+}
+#endif
+
+"""),
+        (r"""    std::FILE *file = std::fopen(path.c_str(), "rb");
+""", r"""    gzFile file = gzopen(path.c_str(), "rb");
+"""),
+        (r"""    }
+    bool loaded = false;
+""", r"""    }
+    gzbuffer(file, 128u << 10);
+    bool loaded = false;
+"""),
+        (r"""    }
+    std::fclose(file);
+    return loaded;
+""", r"""    }
+    gzclose(file);
+    return loaded;
+"""),
+    ],
+}
+
+
+SPLIT_SKIP_EDITS = {
+    'runtime/src/gs/gs.cpp': [
+        ('''void start_thread() { queue::render().start(queue::g_split_pica ? 512u << 10 : 4096u); }''',
+         '''void start_thread() {
+    // Keep enough GIF data queued for the VU to continue while the GS worker waits for the GPU.
+    queue::render().start(queue::g_split_pica ? 1536u << 10 : 4096u);
+}'''),
+        ('''            queue::post(queue::kVblank, static_cast<std::uint32_t>(ps2::frame_count()), 0, &message, sizeof message);''',
+         '''            queue::post(queue::kVblank, static_cast<std::uint32_t>(ps2::frame_count()), message.picture, &message, sizeof message);'''),
+    ],
+    'runtime/src/gs/queue.hpp': [
+        ('extern bool g_split_pica;', 'extern bool g_split_pica;\nextern bool g_vu_skip_picture;'),
+    ],
+    'runtime/src/gs/queue.cpp': [
+        ('bool g_split_pica = false;', 'bool g_split_pica = false;\nbool g_vu_skip_picture = false;'),
+    ],
+    'runtime/src/vif.cpp': [
+        ('''        if (gs::queue::g_skip_picture && (resume || vu::seen(address))) return;
+        if (gs::queue::g_skip_picture) {''', '''        const bool skip = gs::queue::g_split_pica ? gs::queue::g_vu_skip_picture : gs::queue::g_skip_picture;
+        if (skip && (resume || vu::seen(address))) return;
+        if (skip) {'''),
+        ('''    if (unit == 1 && gs::queue::g_skip_picture && ((cmd >> 15) & 1u)) dry = true;''',
+         '''    if (unit == 1 && ((cmd >> 15) & 1u) && (gs::queue::g_split_pica ? gs::queue::g_vu_skip_picture : gs::queue::g_skip_picture)) dry = true;'''),
+    ],
+    'runtime/src/system.cpp': [
+        ('''#include "gs/queue.hpp"
+''', '''#include "gs/queue.hpp"
+#ifdef PS2_PICA
+#include "pica.hpp"
+#endif
+'''),
+        ('''#ifdef PS2_PICA
+            case gs::queue::kVuStop:''', '''#ifdef PS2_PICA
+            case gs::queue::kVblank:
+                if (gs::queue::g_split_pica) {
+                    gs::pica::advance_vu_picture(h.arg1);
+                    gs::queue::render().post(gs::queue::kVblank, h.arg0, h.arg1, payload, h.bytes);
+                } else gs::serve(h.type, h.arg0, payload);
+                break;
+            case gs::queue::kVuStop:'''),
+    ],
+}
+
+
 def fail(msg):
     print("PATCH NOT APPLIED:", msg)
     raise SystemExit(1)
@@ -5545,7 +5902,8 @@ def fail(msg):
 originals = {}
 texts = {}
 pending = 0
-for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items()):
+
+for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items(), *IOPAHEAD_EDITS.items(), *STALE_EDITS.items(), *MOVIE_EDITS.items(), *SPLIT_SKIP_EDITS.items()):
     rel = key.split('#')[0]   # the part after # only keeps two lists for one file apart
     if rel in texts:
         t = texts[rel]
@@ -5556,7 +5914,7 @@ for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(),
         except OSError:
             fail("cannot read " + rel)
         # Unwind the later stages in memory so their inputs can be verified.
-        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()))):
+        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()), *IOPAHEAD_EDITS.get(rel, ()), *STALE_EDITS.get(rel, ()), *MOVIE_EDITS.get(rel, ()), *SPLIT_SKIP_EDITS.get(rel, ()))):
             if t.count(new) == 1:
                 t = t.replace(new, old)
                 pending -= 1

@@ -7,6 +7,7 @@ Writes:
     <output>/3ds/p3fes-probe.3dsx    a small test that reports the console's memory and speed
     <output>/p3fes/SLUS_216.21       the boot program
     <output>/p3fes/disc.00, .01 ...  the disc in 1 GB parts, because FAT32 cannot hold a file of 4 GB or more
+    <output>/p3fes/movies/           with --movies FOLDER: the movie files made by p3fes_3ds_movies.py
 
 Your disc image is never changed, and nothing is written outside the output folder. A part that already has the right size is
 kept, so a stopped copy can be started again. Everything written here comes from your own disc: keep it private.
@@ -86,6 +87,7 @@ def main():
     parser.add_argument("recomp", help="the ps2-web-recomp folder holding build/3ds")
     parser.add_argument("-o", "--output", required=True, help="the SD card or folder to write to")
     parser.add_argument("--no-disc", action="store_true", help="copy only the programs, for when the disc is already on the card")
+    parser.add_argument("--movies", help="a folder made by p3fes_3ds_movies.py: its movies.cut and .p3v files are copied too")
     parser.add_argument("--part-size", type=int, default=PART_SIZE, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -118,6 +120,17 @@ def main():
     with open(os.path.join(data, "SLUS_216.21"), "wb") as out:
         out.write(program)
     print("Programs copied.")
+    if args.movies:
+        names = [n for n in sorted(os.listdir(args.movies)) if n.endswith(".p3v") or n == "movies.cut"]
+        if "movies.cut" not in names:
+            print("No movies.cut in %s. Make it with p3fes_3ds_movies.py." % args.movies)
+            return 1
+        os.makedirs(os.path.join(data, "movies"), exist_ok=True)
+        for name in names:
+            source, target = os.path.join(args.movies, name), os.path.join(data, "movies", name)
+            if not (os.path.isfile(target) and os.path.getsize(target) == os.path.getsize(source)):
+                shutil.copyfile(source, target)
+        print("%d movie files copied." % len(names))
     if args.no_disc:
         return 0
     print("Copying the disc in parts (this takes a while):")

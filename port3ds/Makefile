@@ -10,7 +10,7 @@ OUT       := /w/build/3ds
 ARCH      := -march=armv6k -mtune=arm1136jf-s -mfloat-abi=hard -mtp=soft
 OPT       ?= -O2
 CXXFLAGS  := $(ARCH) $(OPT) -std=gnu++20 -D__3DS__ -fno-math-errno -ffunction-sections -Wno-psabi -MMD -MP \
-             -DPS2_PICA -I$(CTRU)/include -I/w/runtime/include -I/w/runtime/src -I/p/port3ds -I$(OUT)/shader
+             -DPS2_PICA -I$(CTRU)/include -I$(PORTLIBS)/include -I/w/runtime/include -I/w/runtime/src -I/p/port3ds -I$(OUT)/shader
 
 # PROF=1 times every part of the program for "stats 1", which itself costs time.
 PROF      ?= 0
@@ -37,8 +37,11 @@ GAME      += $(IOP)
 CXXFLAGS  += -DPS2_IOP_BLOCKS
 endif
 endif
-HOST      := /p/port3ds/main3ds.cpp /p/port3ds/pica.cpp /p/port3ds/native3ds.cpp /p/port3ds/memcpy3ds.cpp /p/port3ds/remote3ds.cpp /p/port3ds/iop3ds.cpp
+HOST      := /p/port3ds/main3ds.cpp /p/port3ds/pica.cpp /p/port3ds/native3ds.cpp /p/port3ds/memcpy3ds.cpp /p/port3ds/remote3ds.cpp /p/port3ds/iop3ds.cpp \
+             /p/port3ds/movie3ds.cpp /p/port3ds/mpeg1.cpp /p/port3ds/gpuoverlap.cpp
 OBJS      := $(patsubst /%.cpp,$(OUT)/obj/%.o,$(RUNTIME) $(GAME) $(HOST)) $(OUT)/shader/gs_v_shbin.o
+comma     := ,
+GPU_WRAP  := $(addprefix -Wl$(comma)--wrap=,GPUCMD_Add GPUCMD_AddRawCommands GPUCMD_Split gxCmdQueueWait gxCmdQueueStop gxCmdQueueClear gxCmdQueueRun)
 CONFIG    := $(OUT)/build-config
 CONFIG_FLAGS = $(CXXFLAGS) VUOPT=$(VUOPT) GAMEOPT=$(GAMEOPT)
 
@@ -57,7 +60,7 @@ $(OUT)/p3fes.3dsx: $(OUT)/p3fes.elf
 	$(TOOLS)/3dsxtool $< $@
 
 $(OUT)/p3fes.elf: $(OBJS) $(CONFIG)
-	$(PREFIX)g++ -specs=3dsx.specs $(ARCH) -Wl,--gc-sections -Wl,-Map,$(OUT)/p3fes.map $(OBJS) -L$(CTRU)/lib -L$(PORTLIBS)/lib -lcitro3d -lctru -lz -lm -o $@
+	$(PREFIX)g++ -specs=3dsx.specs $(ARCH) -Wl,--gc-sections $(GPU_WRAP) -Wl,-Map,$(OUT)/p3fes.map $(OBJS) -L$(CTRU)/lib -L$(PORTLIBS)/lib -lcitro3d -lctru -lz -lm -o $@
 	$(PREFIX)size $@
 
 # The wireless link unpacks uploads with zlib from the portlibs.
