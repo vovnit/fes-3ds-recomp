@@ -329,6 +329,60 @@ void switch_events(int to) {
 }
 #endif
 
+#ifdef PS2_HOT_SAMPLE
+// SAMPLE=1: every 250 microseconds a thread on another core notes which copy from tools/p3fes_eehot.py the game thread is in (the
+// innermost one; code without a copy counts for the copy that called it) and, with PROF=1, which activity. Every 10 seconds it
+// appends what it counted to sdmc:/p3fes/samples.txt: "period N", then "copy activity count" lines (copy 0 is outside every copy,
+// activity 14 is the game code itself and 15 to 24 are PS2_PROF_EXTRA 0 to 9,
+// see prof.hpp), and starts again.
+namespace gen {
+volatile std::uint16_t g_hot_now;
+}
+#ifndef PS2_PROF_ALL
+namespace ps2::prof {
+volatile std::uint8_t g_where = Count;
+void *g_game_thread = nullptr;
+}
+#endif
+namespace {
+constexpr int kSampleCopies = 1024, kSampleActs = 32;
+std::uint32_t g_samples[kSampleCopies][kSampleActs];
+
+void sampler(void *) {
+    std::FILE *f = std::fopen("sdmc:/p3fes/samples.txt", "w");
+    if (!f) return;
+    const u64 period = SYSCLOCK_ARM11 * 10ull;
+    u64 next = svcGetSystemTick() + period;
+    for (int n = 0; !g_finished && !g_quit; ) {
+        svcSleepThread(250000);
+        const int k = gen::g_hot_now & (kSampleCopies - 1);
+#ifdef PS2_PROF_ALL
+        const int act = ps2::prof::g_events_at & (kSampleActs - 1);
+#else
+        const int act = ps2::prof::g_where & (kSampleActs - 1);
+#endif
+        ++g_samples[k][act];
+        if (svcGetSystemTick() < next) continue;
+        next += period;
+        std::fprintf(f, "period %d\n", n++);
+        for (int i = 0; i < kSampleCopies; ++i)
+            for (int j = 0; j < kSampleActs; ++j)
+                if (g_samples[i][j]) std::fprintf(f, "%d %d %lu\n", i, j, static_cast<unsigned long>(g_samples[i][j]));
+        std::fflush(f);
+        std::memset(g_samples, 0, sizeof g_samples);
+    }
+    std::fclose(f);
+}
+
+void start_sampler(s32 priority) {
+    Thread t = nullptr;
+    if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(80))) t = threadCreate(sampler, nullptr, 16 * 1024, priority, 1, true);
+    if (!t) t = threadCreate(sampler, nullptr, 16 * 1024, priority, 2, true);
+    std::fprintf(stderr, "[3ds] sampler %s\n", t ? "started" : "could not start");
+}
+}
+#endif
+
 namespace {
 
 // The game counts vblanks, so without this a scene lighter than one vblank of work plays fast. Four frames of credit even out slow
@@ -618,7 +672,7 @@ Thread start_vu_thread() {
 
 void emulate_on_game_stack() {
     Thread vu_thread = nullptr;
-#ifdef PS2_PROF_ALL
+#if defined(PS2_PROF_ALL) || defined(PS2_HOT_SAMPLE)
     ps2::prof::g_game_thread = getThreadLocalStorage();
 #endif
     g_split_gs = g_split_gs && g_vu_thread && !g_software;
@@ -868,6 +922,9 @@ int main() {
         svcGetThreadPriority(&g_priority, CUR_THREAD_HANDLE);
         // The movie decoder shares core 2 with the vector programs and drawing, below them: a movie leaves that core idle.
         if (g_movies && !g_software && movie::start(g_priority + 2, 2)) ps2::ipu::g_csc_watch = movie::watch;
+#ifdef PS2_HOT_SAMPLE
+        start_sampler(g_priority - 1);
+#endif
         Thread thread = threadCreate(emulate, nullptr, kEmulationStack, g_priority + 1, -2, false);
         if (!thread) std::puts("Could not start the game thread.");
         std::uint32_t beats = 0;

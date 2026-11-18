@@ -17,6 +17,11 @@ PROF      ?= 0
 ifeq ($(PROF),1)
 CXXFLAGS  += -DPS2_PROF_ALL
 endif
+# SAMPLE=1 notes which game function is running 4000 times a second, in sdmc:/p3fes/samples.txt (tools/p3fes_samples.py reads it).
+SAMPLE    ?= 0
+ifeq ($(SAMPLE),1)
+CXXFLAGS  += -DPS2_HOT_SAMPLE
+endif
 
 RUNTIME   := $(wildcard /w/runtime/src/*.cpp /w/runtime/src/gs/*.cpp /w/runtime/src/iop/*.cpp /w/runtime/src/ipu/*.cpp)
 # VU=1 adds the vector unit programs from "vurecomp <recorded> generated/p3fes-vu3ds --scalar". Without them they run in the interpreter.

@@ -898,6 +898,15 @@ namespace gen {
 #ifdef PS2_HOT_BISECT
 extern int g_hot_lo, g_hot_hi;
 #define PS2_HOT_GATE(k) if ((k) < g_hot_lo || (k) >= g_hot_hi) return false;
+#elif defined(PS2_HOT_SAMPLE)
+// SAMPLE=1 on the 3DS: the number of the copy running now, plus one, for the sampler in port3ds/main3ds.cpp ("sample 1")
+extern volatile std::uint16_t g_hot_now;
+struct HotNow {
+    std::uint16_t outer;
+    explicit HotNow(int k) : outer(g_hot_now) { g_hot_now = static_cast<std::uint16_t>(k + 1); }
+    ~HotNow() { g_hot_now = outer; }
+};
+#define PS2_HOT_GATE(k) HotNow ps2_hot_now(k);
 #else
 #define PS2_HOT_GATE(k)
 #endif

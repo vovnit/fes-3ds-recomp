@@ -42,6 +42,29 @@ struct Extra {
         if (outer >= 0) switch_events(outer);
     }
 };
+#elif defined(PS2_HOT_SAMPLE)
+// SAMPLE=1 without PROF=1: the activity now on the game thread (Count is the game code itself, Count + 1 + k is PS2_PROF_EXTRA(k)),
+// read by the sampler in main3ds.cpp. Only a store, so these cost almost nothing.
+inline constexpr int kExtra = 10;
+extern volatile std::uint8_t g_where;
+extern void *g_game_thread;
+inline bool on_game_thread() {
+    void *tls;
+    asm("mrc p15, 0, %0, c13, c0, 3" : "=r"(tls));
+    return tls == g_game_thread;
+}
+struct Where {
+    int outer = -1;
+    explicit Where(int k) {
+        if (on_game_thread()) {
+            outer = g_where;
+            g_where = static_cast<std::uint8_t>(k);
+        }
+    }
+    ~Where() {
+        if (outer >= 0) g_where = static_cast<std::uint8_t>(outer);
+    }
+};
 #endif
 
 // Reading the clock is a system call, and thousands of these run per game frame. So a normal build times only the two waits, which
@@ -56,6 +79,8 @@ struct Scope {
     std::uint64_t start;
 #ifdef PS2_PROF_ALL
     int outer = -1;
+#elif defined(PS2_HOT_SAMPLE)
+    Where where{C};
 #endif
     Scope() {
         if constexpr (kTimed) start = svcGetSystemTick();
@@ -80,6 +105,8 @@ struct Scope {
 #define PS2_PROF(counter) ps2::prof::Scope<counter> ps2_prof_scope
 #ifdef PS2_PROF_ALL
 #define PS2_PROF_EXTRA(k) ps2::prof::Extra ps2_prof_extra(k)
+#elif defined(PS2_HOT_SAMPLE)
+#define PS2_PROF_EXTRA(k) ps2::prof::Where ps2_prof_extra(ps2::prof::Count + 1 + (k))
 #else
 #define PS2_PROF_EXTRA(k)
 #endif
