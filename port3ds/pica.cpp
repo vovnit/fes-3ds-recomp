@@ -11,6 +11,7 @@
 // target has a separate texture for each eye. Every batch is drawn twice, shifted sideways by its
 // depth (see the "eye" uniform in gs.v.pica).
 #include "pica.hpp"
+#include "g3model.hpp"
 #include "movie3ds.hpp"
 #include "prof.hpp"
 
@@ -45,6 +46,7 @@ extern "C" bool FesOverlapBegin(bool, bool);
 extern "C" void FesOverlapCommandStats(u32*, unsigned*);
 extern "C" void FesOverlapWait();
 extern "C" u64 FesOverlapWaitTicks();
+extern "C" u32 FesOverlapWordsLeft();
 extern "C" void FesOverlapEnd(u8);
 
 namespace movie { bool overlap_needs_wait(); }
@@ -99,6 +101,14 @@ shaderProgram_s g_program;
 C3D_AttrInfo g_attr;
 C3D_BufInfo g_buf;
 int g_uniform_scale = -1, g_uniform_offset = -1, g_uniform_eye = -1;
+// The g3 half of the shader: proj to lcol are 15 registers in a row, then bones; isg3 picks the half.
+int g_uniform_proj = -1, g_uniform_bones = -1, g_bool_g3 = -1, g_bool_skin = -1;
+C3D_AttrInfo g_g3_attr;
+// What is set for g3 batches: their vertex layout and shader half (until flush_batch puts the GS ones back), the buffer they
+// are bound at, the skin half, and the culling (the GS path draws with none).
+bool g_g3_bound = false, g_g3_skin = false;
+const void *g_g3_buffer = nullptr;
+GPU_CULLMODE g_g3_cull = GPU_CULL_NONE;
 
 DrawVertex *g_ring = nullptr;
 std::uint16_t *g_indices = nullptr;
@@ -177,6 +187,9 @@ bool g_skip_batch = false;
 
 // Counters for tuning.
 std::uint32_t g_stat_reused = 0, g_stat_missing = 0;
+std::uint32_t g_stat_g3 = 0, g_stat_g3_declined = 0, g_stat_unif = 0;
+std::uint32_t g_words_setup = 0, g_words_flush = 0, g_words_bind = 0, g_words_draw = 0;   // command words by part (test aid)
+inline std::uint32_t cmd_words() { return gpuCmdBufOffset; }   // g3 batches drawn, and handed back for want of command list room
 std::uint32_t g_stat_draws = 0, g_stat_shapes = 0, g_stat_state = 0, g_stat_decoded = 0, g_stat_decode_texels = 0, g_stat_splits = 0;
 std::uint32_t g_shapes_since_present = 0;
 std::uint32_t g_setup_seen = 0;
@@ -288,10 +301,22 @@ int uniform_alpha_pass(const std::uint16_t *indices, std::uint32_t count) {
     }
 }
 
+void flush_g3();
+
 void flush_batch() {
     PS2_PROF_EXTRA(1);
+    flush_g3();
     const std::uint32_t count = g_index_used - g_index_first;
     if (!count) return;
+    if (g_g3_bound) {
+        C3D_SetAttrInfo(&g_attr);
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_g3, false);
+        if (g_g3_cull != GPU_CULL_NONE) C3D_CullFace(GPU_CULL_NONE);
+        g_g3_cull = GPU_CULL_NONE;
+        g_g3_bound = false;
+        g_g3_buffer = nullptr;
+        g_bound_base = UINT32_MAX;
+    }
     if (g_bound_base != g_index_base) {
         BufInfo_Init(&g_buf);
         BufInfo_Add(&g_buf, g_ring + g_index_base, sizeof(DrawVertex), 4, 0x3210);
@@ -1116,6 +1141,7 @@ inline void write_vertex(DrawVertex *o, float x, float y, const Vertex &z_from, 
 }
 
 void use_geometry_slice(unsigned slice, std::uint32_t capacity) {
+    flush_g3();   // nothing should wait here (callers flush first), but its vertices are in the slice being left
     g_slice = slice;
     g_slice_capacity = capacity;
     g_ring = g_vertex_storage + slice * kSliceVertices;
@@ -1228,6 +1254,7 @@ void add_quad(float x0, float y0, float x1, float y1, const Vertex &a, const Ver
 
 // One picture onto one of the top screen's two buffers: u0 to u1 across, the top row at v = 1 and the bottom at v1.
 void show_texture(C3D_RenderTarget *screen, C3D_Tex *tex, float u0, float u1, float v1, GPU_TEXTURE_FILTER_PARAM filter) {
+    flush_g3();
     C3D_FrameDrawOn(screen);
     g_current = nullptr;
     g_split.on = false;
@@ -1380,6 +1407,33 @@ bool init() {
     g_uniform_scale = shaderInstanceGetUniformLocation(g_program.vertexShader, "scale");
     g_uniform_offset = shaderInstanceGetUniformLocation(g_program.vertexShader, "offset");
     g_uniform_eye = shaderInstanceGetUniformLocation(g_program.vertexShader, "eye");
+    g_uniform_proj = shaderInstanceGetUniformLocation(g_program.vertexShader, "proj");
+    g_uniform_bones = shaderInstanceGetUniformLocation(g_program.vertexShader, "bones");
+    {
+        // A bool uniform's location counts from the float ones' base (b0 is 0x68), which C3D_BoolUnifSet takes off itself.
+        const int lcol = shaderInstanceGetUniformLocation(g_program.vertexShader, "lcol");
+        const int b = shaderInstanceGetUniformLocation(g_program.vertexShader, "isg3");
+        const int skin = shaderInstanceGetUniformLocation(g_program.vertexShader, "isskin");
+        if (g_uniform_proj >= 0 && lcol == g_uniform_proj + 12 && g_uniform_bones == g_uniform_proj + 15 && b >= 0x68 && b < 0x78 &&
+            skin >= 0x68 && skin < 0x78) {
+            g_bool_g3 = b;
+            g_bool_skin = skin;
+        }
+        std::fprintf(stderr, "[pica] g3 shader: proj %d lcol %d bones %d isg3 %d%s\n", g_uniform_proj, lcol, g_uniform_bones, b,
+                     g_bool_g3 >= 0 ? "" : " (not usable)");
+    }
+    if (g_bool_g3 >= 0) {
+        // Every bone slot starts at zero: a weight of zero may point at a slot no batch has filled yet.
+        C3D_FVec *b = C3D_FVUnifWritePtr(GPU_VERTEX_SHADER, g_uniform_bones, 3 * static_cast<int>(::g3::kGpuBones));
+        std::memset(b, 0, 3 * ::g3::kGpuBones * sizeof *b);
+    }
+    AttrInfo_Init(&g_g3_attr);
+    AttrInfo_AddLoader(&g_g3_attr, 0, GPU_FLOAT, 3);           // position
+    AttrInfo_AddLoader(&g_g3_attr, 1, GPU_FLOAT, 2);           // uv
+    AttrInfo_AddLoader(&g_g3_attr, 2, GPU_UNSIGNED_BYTE, 4);   // prelit colour
+    AttrInfo_AddLoader(&g_g3_attr, 3, GPU_BYTE, 4);            // normal
+    AttrInfo_AddLoader(&g_g3_attr, 4, GPU_FLOAT, 4);           // bone weights
+    AttrInfo_AddLoader(&g_g3_attr, 5, GPU_UNSIGNED_BYTE, 4);   // bones' first rows
 
     AttrInfo_Init(&g_attr);
     AttrInfo_AddLoader(&g_attr, 0, GPU_FLOAT, 4);
@@ -1443,11 +1497,10 @@ void shutdown() {
     C3D_Fini();
 }
 
-void draw(const State &st, std::uint32_t serial, std::uint64_t clamp) {
-    PS2_PROF_EXTRA(0);   // for SAMPLE=1: shapes in, x1 to x3 below are apart
-    if (g_draw_nothing || (!queue::g_split_pica && queue::g_quiet)) return;
-    if (!g_frame_open) begin_frame();
-    // Every register that can change the batch moves g_setup_generation, so a run of shapes checks just this one number.
+namespace {
+
+// Every register that can change the batch moves g_setup_generation, so a run of shapes checks just this one number.
+void setup_batch(const State &st, std::uint64_t clamp) {
     if (!g_key_valid || g_setup_seen != g_setup_generation) {
         g_setup_seen = g_setup_generation;
         std::uint64_t attr = st.prim;
@@ -1462,7 +1515,196 @@ void draw(const State &st, std::uint32_t serial, std::uint64_t clamp) {
             ensure_state(st, c, attr);
         }
     }
+}
+
+// A g3 strip drawn as flush_batch draws its triangles, with an alpha test split into its two passes when g_split asks for it.
+void draw_strip(int first, int count) {
+    if (g_split.on) {
+        C3D_AlphaTest(true, g_split.pass, g_split.reference);
+        C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.pass_writes));
+        C3D_DrawArrays(GPU_TRIANGLE_STRIP, first, count);
+        C3D_AlphaTest(true, g_split.fail, g_split.reference);
+        C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.fail_writes));
+    }
+    C3D_DrawArrays(GPU_TRIANGLE_STRIP, first, count);
+}
+
+// A uniform written only when it changes: citro3d keeps a copy of every uniform and uploads only the dirty ones, and batches
+// of one model mostly share their projection, lights and bones. Each one written costs the command list 5 words.
+inline void put_unif(int id, const float *v) {
+    C3D_FVec &u = C3D_FVUnif[GPU_VERTEX_SHADER][id];
+    if (u.x == v[0] && u.y == v[1] && u.z == v[2] && u.w == v[3]) return;
+    u.x = v[0], u.y = v[1], u.z = v[2], u.w = v[3];
+    C3D_FVUnifDirty[GPU_VERTEX_SHADER][id] = true;
+    ++g_stat_unif;
+}
+
+// Command words a g3 batch may need at most (all uniforms, the attribute and buffer setup, both eyes' draws), and what must
+// stay free after it for the rest of the frame's shapes: the frame's command list has one fixed buffer.
+constexpr u32 kG3Words = 1024, kFrameReserveWords = 24 * 1024;
+
+}
+
+bool g3_ready() { return g_bool_g3 >= 0; }
+
+namespace {
+
+// g3 batches waiting to be drawn as one strip: consecutive batches with the same state, uniforms and culling are joined
+// with degenerate triangles, since every draw call costs the command list about 150 words and the GPU a framebuffer flush.
+// Their vertices lie in the ring from vertex `first` (48-byte units from g_ring). A GS shape, a state change, or a later batch
+// that needs different uniforms or a bone slot these vertices use draws them first.
+struct G3Pending {
+    bool on = false;
+    std::uint32_t first = 0, count = 0, slots = 0;
+} g_g3_pending;
+
+void flush_g3() {
+    if (!g_g3_pending.on) return;
+    g_g3_pending.on = false;
+    const int first = static_cast<int>(g_g3_pending.first), count = static_cast<int>(g_g3_pending.count);
+    const std::uint32_t w0 = cmd_words();
+    draw_strip(first, count);
+    if (g_current && g_current->right_rt) {
+        set_eye(true);
+        draw_strip(first, count);
+        set_eye(false);
+    }
+    const std::uint32_t w1 = cmd_words();
+    if (w1 >= w0) g_words_draw += w1 - w0;
+    ++g_stat_draws;
+    if (C3D_GetCmdBufUsage() > 0.75f) {
+        flush_ring();
+        C3D_FrameSplit(GX_CMDLIST_FLUSH);
+        ++g_stat_splits;
+    }
+}
+
+inline bool same_unif(int id, const float *v) {
+    const C3D_FVec &u = C3D_FVUnif[GPU_VERTEX_SHADER][id];
+    return u.x == v[0] && u.y == v[1] && u.z == v[2] && u.w == v[3];
+}
+
+}
+
+bool draw_g3(const State &st, std::uint64_t clamp, const ::g3::Gpu &g) {
+    PS2_PROF_EXTRA(0);
+    if (g_draw_nothing || (!queue::g_split_pica && queue::g_quiet) || g.n < 3) return true;
+    if (!g_frame_open) begin_frame();
+    if (FesOverlapWordsLeft() < kG3Words + kFrameReserveWords) {
+        ++g_stat_g3_declined;
+        return false;   // the GS path's shapes need far less of the command list
+    }
+    std::uint32_t w0 = cmd_words();
+    setup_batch(st, clamp);   // a state change draws what waits first (apply_state calls flush_batch)
+    std::uint32_t w1 = cmd_words();
+    if (w1 >= w0) g_words_setup += w1 - w0;
+    if (g_skip_batch) return true;
+    ++g_stat_shapes;
+    ++g_stat_g3;
+    if (g_index_used > g_index_first) flush_batch();   // the GS path's triangles (no g3 batch waits while they do)
+
+    // The uniforms: proj, post, texs, fogp, mat, amb, ldir[3], lcol[3].
+    float unif[15][4];
+    for (int i = 0; i < 4; ++i) std::memcpy(unif[i], g.proj[i], sizeof unif[i]);
+    const float post[4] = {g.offset[0] - static_cast<float>(g_ofx) * (1.0f / 16.0f), g.offset[1] - static_cast<float>(g_ofy) * (1.0f / 16.0f), g.offset[2],
+                           -g_z_scale * (g.fog ? 1.0f : 16.0f)};
+    std::memcpy(unif[4], post, sizeof post);
+    const float texs[4] = {g_s_scale, -g_t_scale, g_v_offset, 0.0f};
+    std::memcpy(unif[5], texs, sizeof texs);
+    const float fogp[4] = {g.fog ? g.fog_scale * (1.0f / 255.0f) : 0.0f,
+                           g.fog ? -g.fog_near * g.fog_scale * (1.0f / 255.0f) : static_cast<float>((st.fog >> 56) & 0xFFu) * (1.0f / 255.0f), 0.0f, 0.0f};
+    std::memcpy(unif[6], fogp, sizeof fogp);
+    for (int i = 0; i < 4; ++i) unif[7][i] = g.material[i] * (1.0f / 255.0f);
+    std::memcpy(unif[8], g.ambient, sizeof unif[8]);
+    for (int i = 0; i < 3; ++i) std::memcpy(unif[9 + i], g.light_dir[i], sizeof unif[9 + i]);
+    for (int i = 0; i < 3; ++i) std::memcpy(unif[12 + i], g.light_colour[i], sizeof unif[12 + i]);
+    const GPU_CULLMODE cull = g.keep_negative && g.keep_positive ? GPU_CULL_NONE : g.keep_negative ? GPU_CULL_FRONT_CCW : GPU_CULL_BACK_CCW;
+
+    // Can it join the batches waiting? Same culling, shader half and uniforms, and no bone slot they use about to change.
+    if (g_g3_pending.on) {
+        bool join = g.skin == g_g3_skin && cull == g_g3_cull;
+        for (int i = 0; i < 15 && join; ++i) join = same_unif(g_uniform_proj + i, unif[i]);
+        if (join && g.skin)
+            for (unsigned s = 0; s < ::g3::kGpuBones && join; ++s)
+                if (g_g3_pending.slots & (1u << s))
+                    for (unsigned r = 0; r < 3 && join; ++r) join = same_unif(g_uniform_bones + static_cast<int>(3 * s + r), g.bone[3 * s + r]);
+        if (!join) flush_g3();
+    }
+
+    // Room: the vertices, up to three joining ones, and the rounding to whole 96-byte steps, in the ring's 32-byte slots.
+    // The GS path counts on the ring never being ahead of the indices (its room check looks at indices only).
+    const std::uint32_t worst = (g_ring_used + 2u) / 3u * 3u + (g.n + 4u) / 2u * 3u;
+    if (!reserve_geometry(worst > g_index_used ? worst - g_index_used : 1u)) {   // a move to the other slice draws what waits
+        if (!g_ring_warned) std::fprintf(stderr, "[pica] vertex ring full, dropping shapes\n");
+        g_ring_warned = true;
+        return true;
+    }
+    auto *ring = reinterpret_cast<::g3::GpuVertex *>(g_ring);
+    std::uint32_t at;   // where this batch's own vertices go, in 48-byte units
+    if (g_g3_pending.on) {
+        // The strip goes on: the last vertex again and this batch's first, so the triangles between have no area, and once
+        // more if needed so that this batch's strip starts at an even place, where the GPU's alternating winding starts.
+        std::uint32_t end = g_g3_pending.first + g_g3_pending.count;
+        ring[end] = ring[end - 1u];
+        ring[end + 1u] = g.v[0];
+        end += 2u;
+        if ((end - g_g3_pending.first) & 1u) ring[end++] = g.v[0];
+        at = end;
+        g_g3_pending.count = at + g.n - g_g3_pending.first;
+        g_g3_pending.slots |= g.slots;
+    } else {
+        // A new strip at a multiple of 96 bytes (3 slots, 2 vertices) from the ring's start, so that one buffer bound at the
+        // start with a 48-byte stride serves every g3 batch of the slice.
+        at = (g_ring_used + 2u) / 3u * 2u;
+        g_g3_pending = G3Pending{true, at, g.n, g.slots};
+    }
+    std::memcpy(ring + at, g.v, g.n * sizeof(::g3::GpuVertex));
+    g_ring_used = ((at + g.n) * 3u + 1u) / 2u;
+    g_index_used = std::max(g_index_used, g_ring_used);
+    g_index_first = g_index_used;
+    g_last_triangle_end = 0;
+
+    w0 = cmd_words();
+    // The g3 vertex layout, buffer and shader half stay set across g3 batches; flush_batch puts the GS ones back.
+    if (!g_g3_bound) {
+        C3D_SetAttrInfo(&g_g3_attr);
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_g3, true);
+        g_g3_bound = true;
+        g_bound_base = UINT32_MAX;
+    }
+    if (g_g3_buffer != g_ring) {
+        BufInfo_Init(&g_buf);
+        BufInfo_Add(&g_buf, g_ring, sizeof(::g3::GpuVertex), 6, 0x543210);
+        C3D_SetBufInfo(&g_buf);
+        g_g3_buffer = g_ring;
+    }
+    if (g.skin != g_g3_skin) {
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_skin, g.skin);
+        g_g3_skin = g.skin;
+    }
+    // The GS leaves out the triangles whose ADC bit the program set: here the GPU's culling does it. With every other
+    // triangle turned round as (k-1, k-2, k), the program's negative facing is an area above zero with y down; the y axis
+    // flips on the way to clip space, so it is clockwise there.
+    if (cull != g_g3_cull) {
+        C3D_CullFace(cull);
+        g_g3_cull = cull;
+    }
+    // Only what changed is sent.
+    for (int i = 0; i < 15; ++i) put_unif(g_uniform_proj + i, unif[i]);
+    if (g.skin)
+        for (unsigned i = 0; i < 3u * ::g3::kGpuBones; ++i) put_unif(g_uniform_bones + static_cast<int>(i), g.bone[i]);
+    w1 = cmd_words();
+    if (w1 >= w0) g_words_bind += w1 - w0;
+    return true;
+}
+
+void draw(const State &st, std::uint32_t serial, std::uint64_t clamp) {
+    PS2_PROF_EXTRA(0);   // for SAMPLE=1: shapes in, x1 to x3 below are apart
+    if (g_draw_nothing || (!queue::g_split_pica && queue::g_quiet)) return;
+    if (!g_frame_open) begin_frame();
+    setup_batch(st, clamp);
     if (g_skip_batch) return;
+    flush_g3();   // g3 batches waiting are older than this shape
     ++g_stat_shapes;
     ++g_stat_prim[st.prim & 7u];
     ++g_shapes_since_present;
@@ -1685,9 +1927,18 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r) {
                      ms(ticks[Spu]), ms(ticks[Ipu]), static_cast<unsigned long>(g_stat_shapes), static_cast<unsigned long>(g_stat_draws), static_cast<unsigned long>(g_stat_state),
                      static_cast<unsigned long>(g_stat_splits), static_cast<unsigned long>(g_stat_decoded), static_cast<unsigned long>(g_stat_decode_texels), static_cast<unsigned long>(g_stat_reused), static_cast<unsigned long>(g_stat_missing),
                      static_cast<unsigned long>(g_ring_used), static_cast<unsigned long>(linearSpaceFree() >> 10));
+        if (g_stat_g3 || g_stat_g3_declined)
+            std::fprintf(stderr, "[pica] g3 on the GPU %lu, handed back %lu, uniform vectors sent %lu; command words left %lu\n",
+                         static_cast<unsigned long>(g_stat_g3), static_cast<unsigned long>(g_stat_g3_declined), static_cast<unsigned long>(g_stat_unif),
+                         static_cast<unsigned long>(FesOverlapWordsLeft()));
+        if (g_stat_g3)
+            std::fprintf(stderr, "[pica] g3 command words: setup %lu, GS flush %lu, binding %lu, draw %lu\n", static_cast<unsigned long>(g_words_setup),
+                         static_cast<unsigned long>(g_words_flush), static_cast<unsigned long>(g_words_bind), static_cast<unsigned long>(g_words_draw));
         last_interpreted = interpreted;
         last = svcGetSystemTick();
     }
+    g_stat_g3 = g_stat_g3_declined = g_stat_unif = 0;
+    g_words_setup = g_words_flush = g_words_bind = g_words_draw = 0;
     g_batch_number = 0;
     g_stat_reused = g_stat_missing = 0;
     g_stat_shapes = g_stat_draws = g_stat_state = g_stat_splits = g_stat_decoded = g_stat_decode_texels = 0;

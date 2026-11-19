@@ -16,7 +16,9 @@
 //                               "pmu 0 8" (hardware counters of the game's core in perf.txt, by event number, see below),
 //                               "link 0" (no wireless test link), "stereo N" (depth of the 3D picture, 0 to 10),
 //                               "movies 0" (the game's own movies, not the 400x240 copies in sdmc:/p3fes/movies),
-//                               "saveat N" (test aid: save a state to slot 1 at game frame N, as the bottom screen's Save does)
+//                               "saveat N" (test aid: save a state to slot 1 at game frame N, as the bottom screen's Save does),
+//                               "g3 N" (the model programs g3_generic and g3_skin: 1 native, 2 compared with the programs, 3 also
+//                               captured, "g3cap N" batches, one in "g3every K"; 4 on the GPU's vertex shader; see g3native.cpp)
 //   sdmc:/p3fes/slot1.state     states saved from the bottom screen (slot1 to slot3), packed
 //   sdmc:/p3fes/next.txt        settings for the next start only: the bottom screen's Load writes "load slotN.state" here
 //   sdmc:/p3fes/log.txt         everything the runtime prints
@@ -49,6 +51,11 @@ extern std::uint32_t g_max_vu_lag;   // runtime/src/gs/gs.cpp
 }
 
 namespace gen { extern bool g_lossy; }   // native3ds.cpp
+namespace g3native {   // g3native.cpp
+extern int g_mode;
+extern std::uint32_t g_capture_left, g_capture_every, g_gpu_mask;
+void start();
+}
 
 extern "C" {
 // Program + these + the PS2 RAM must fit the 124 MB a New 3DS application gets.
@@ -591,6 +598,10 @@ void read_settings(const char *path) {
         else if (!std::strcmp(key, "iopthread")) g_iop_thread = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "uncapped")) g_hold_speed = std::strtoul(value, nullptr, 10) == 0;
         else if (!std::strcmp(key, "mvdprobe")) g_mvd_probe = std::strtoul(value, nullptr, 10) != 0;
+        else if (!std::strcmp(key, "g3")) g3native::g_mode = std::atoi(value);
+        else if (!std::strcmp(key, "g3gpu")) g3native::g_gpu_mask = static_cast<std::uint32_t>(std::atoi(value));
+        else if (!std::strcmp(key, "g3cap")) g3native::g_capture_left = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+        else if (!std::strcmp(key, "g3every")) g3native::g_capture_every = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)));
         else if (!std::strcmp(key, "lossy")) gen::g_lossy = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "vulag")) ps2::gs::g_max_vu_lag = std::strtoul(value, nullptr, 10);
         else if (!std::strcmp(key, "stereo")) ps2::gs::pica::set_stereo(std::strtoul(value, nullptr, 10));
@@ -955,6 +966,7 @@ int main() {
         ps2::g_options.memcard_path = "sdmc:/p3fes/card.ps2";
         register_generated_code();
         register_generated_vu();
+        g3native::start();
 
         svcGetThreadPriority(&g_priority, CUR_THREAD_HANDLE);
         // The movie decoder shares core 2 with the vector programs and drawing, below them: a movie leaves that core idle.

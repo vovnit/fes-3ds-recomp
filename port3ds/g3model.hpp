@@ -1,0 +1,81 @@
+// The g3 batch model: what one MSCNT batch of the game's g3_generic (042) or g3_skin (064) VU1 program computes, from
+// VU1 data memory and the registers the program's init left. Plain C++ with no 3DS parts, so tools/g3check can run it
+// on a computer against batches captured from the game (port3ds/g3native.cpp, "g3 3").
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
+namespace ps2 { struct Vu0Regs; }
+
+namespace g3 {
+
+struct Input {
+    int program;                 // 42 or 64
+    const std::uint8_t *mem;     // VU1 data memory, 16 KB, as the batch finds it
+    std::uint32_t top, itop;     // the VIF's TOP and ITOP for this batch
+    std::uint32_t vf[32][4];     // VU1 float registers (bit patterns) at the batch start
+    std::uint16_t vi[16];        // VU1 integer registers at the batch start
+};
+
+// How the batch ended, for leave_state.
+struct End {
+    bool swap = true;        // the output buffers vi13/vi14 changed places (not when the clipper culled the whole batch)
+    bool clipper = false;    // the full clipper ran: it leaves vf28-30.z at w - w
+};
+
+// Writes the GIF packets the program would XGKICK to out from its start (out grows when too small and is never shrunk, so
+// keep it between calls); ends gets each packet's end offset, the last being the bytes used (none when nothing is drawn).
+// False: not modelled, run the program instead.
+bool run(const Input &in, std::vector<std::uint8_t> &out, std::vector<std::uint32_t> &ends, End &end);
+
+// The registers a later batch of the program reads, set as the program would have left them.
+void leave_state(int program, const End &end, ps2::Vu0Regs &r);
+
+// The GPU path (pica::draw_g3 and the g3 half of port3ds/gs.v.pica): the batch's own vertices, and what the vertex shader
+// needs to do the program's work on them. Close to the program's pictures, not exact: the GPU's floats have 24 bits.
+struct GpuVertex {
+    float x, y, z, u, v;
+    std::uint8_t colour[4];      // prelit, 0-255
+    std::int8_t normal[4];       // in 1/128 units
+    float weight[4];
+    std::uint8_t bone[4];        // each weight's bone: its first vector in Gpu::bone
+};
+static_assert(sizeof(GpuVertex) == 48);
+
+constexpr unsigned kGpuBones = 24;   // the shader's bone uniforms (3 vectors each)
+
+struct Gpu {
+    std::uint64_t prim;              // what the GIF tag sets PRIM to
+    bool skin;                       // g3_skin: the shader blends bones (g3_generic's bone is the identity, for g3check)
+    bool fog;                        // the XYZF2 strip: the fog value from w, and z without the 16 of FTOI4
+    bool keep_negative, keep_positive;   // which triangles the program leaves without ADC, by facing (see facing_negative)
+    float proj[4][4];                // vf28-vf31 as the strip uses them (the z of vf28 and vf29 is not used: zero)
+    float offset[4];                 // vf02, added to the screen position
+    float fog_scale, fog_near;       // 0x3F6 z and w: the fog value is fog_scale * (w - fog_near), clamped to 0-255
+    float material[4];               // 0x3FB
+    float ambient[4];                // the ambient lights' sum (x, y, z)
+    float light_dir[3][4];           // up to three directional lights, unused ones zero: N.L is dot(normal, light_dir)
+    float light_colour[3][4];
+    // The bone palette, kept between batches (so keep g too): each bone's matrix as 3 vectors, x, y and z each a dot product
+    // with (position, 1). A bone keeps its slot while batches go on using it, so the shader's copy rarely needs sending.
+    float bone[kGpuBones * 3][4];
+    std::uint32_t slots;             // the palette slots this batch's vertices use (bit per slot)
+    unsigned n;
+    GpuVertex v[256];
+};
+
+// Why gpu_batch did not give a batch to draw.
+enum GpuDecline : int {
+    kGpuNotModelled = 1,   // what run() declines too
+    kGpuBoneCount,         // more bones than the shader holds
+    kGpuLights,            // more than three directional lights
+    kGpuRange,             // a colour beyond 0-255 or a normal beyond a signed byte
+    kGpuPrim,              // not a Gouraud triangle strip with ST coordinates
+    kGpuDeclines
+};
+
+// 0: g filled, draw it. -1: the program draws nothing (end says how it ended, as run()'s). Otherwise a GpuDecline.
+int gpu_batch(const Input &in, Gpu &g, End &end);
+
+}

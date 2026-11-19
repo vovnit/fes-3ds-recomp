@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace g3 { struct Gpu; }
+
 namespace ps2::gs {
 
 struct State;
@@ -27,6 +29,11 @@ void set_stereo(std::uint32_t strength);         // how deep the picture looks w
 std::uint32_t stereo();
 
 void draw(const State &s, std::uint32_t serial, std::uint64_t clamp);
+// A batch of the game's model programs, transformed and lit by the vertex shader (port3ds/g3native.cpp, "g3 4"). PRIM must
+// already hold the batch's own. False: the frame's command list is nearly full, send the batch the GS way instead.
+// g3_ready: init found the shader's g3 uniforms where draw_g3 expects them.
+bool g3_ready();
+bool draw_g3(const State &s, std::uint64_t clamp, const ::g3::Gpu &g);
 extern bool g_after_hidden;      // set by next_picture(): the picture after the one it chose will be skipped
 extern bool g_render_left_out;   // set by lossy_return (native3ds.cpp): next_picture() must not show the picture being built
 std::uint32_t next_picture();   // on the game thread at each PS2 vblank: what the next picture is, passed on to vblank()

@@ -5973,6 +5973,153 @@ SAMPLE_EDITS = {
     ],
 }
 
+# A native stand-in for VU1 programs (port3ds/g3native.cpp): the VIF's program start asks a hook first, and XGKICK packets can be
+# copied out, so a stand-in can be checked against the program itself.
+G3_EDITS = {
+    'runtime/src/vu_micro.hpp': [
+        ('''#include <cstdint>
+''', '''#include <cstdint>
+#include <vector>
+'''),
+        ('''Vu0Regs &regs(int unit);
+''', '''Vu0Regs &regs(int unit);
+// ps2run_3ds_patch.py: a native stand-in for VU1 programs. The hook gets each VU1 start address first; true means it did the work.
+using NativeHook = bool (*)(std::uint32_t address);
+extern NativeHook g_native_hook;
+std::uintptr_t program_at(std::uint32_t address);   // the compiled program that starts here, or 0
+void run_program(std::uint32_t address);            // run the VU1 program itself (for a hook that declines or checks)
+extern std::vector<std::uint8_t> *g_kick_capture;   // when set, each VU1 XGKICK packet is also appended here
+std::uint32_t data_top();
+std::uint32_t data_itop();
+'''),
+    ],
+    'runtime/src/vu_micro.cpp': [
+        ('''void kick(int unit, std::uint32_t address) {
+    if (g_kick_log && unit == 1) g_kick_log->push_back(address);
+    Unit u = unit_of(unit);
+    xgkick(u, address);
+}
+''', '''NativeHook g_native_hook = nullptr;   // ps2run_3ds_patch.py
+std::vector<std::uint8_t> *g_kick_capture = nullptr;
+
+void capture_packet(Unit &u, std::uint32_t address) {
+    std::uint32_t q = address & (u.data_qwords - 1), count = 0;
+    bool done = false;
+    while (!done && count < u.data_qwords) {
+        std::uint64_t tag;
+        std::memcpy(&tag, qword(u, q), 8);
+        const std::uint32_t nloop = static_cast<std::uint32_t>(tag) & 0x7FFFu, flg = static_cast<std::uint32_t>(tag >> 58) & 3u;
+        std::uint32_t nreg = static_cast<std::uint32_t>(tag >> 60) & 0xFu;
+        if (!nreg) nreg = 16;
+        const std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+        for (std::uint32_t i = 0; i <= body && count < u.data_qwords; ++i, ++count) {
+            const std::uint8_t *p = qword(u, q);
+            g_kick_capture->insert(g_kick_capture->end(), p, p + 16);
+            q = (q + 1) & (u.data_qwords - 1);
+        }
+        done = (tag >> 15) & 1u;
+    }
+}
+
+void kick(int unit, std::uint32_t address) {
+    if (g_kick_log && unit == 1) g_kick_log->push_back(address);
+    Unit u = unit_of(unit);
+    if (g_kick_capture && unit == 1) capture_packet(u, address);
+    xgkick(u, address);
+}
+
+std::uint32_t data_top() { return g_top; }
+std::uint32_t data_itop() { return g_itop; }
+'''),
+        ('''    if (n == 1 && !exact) {
+        interpret(n, address);
+        return;
+    }
+''', '''    if (n == 1 && !exact) {
+        if (g_native_hook && g_native_hook(address)) return;   // ps2run_3ds_patch.py
+        interpret(n, address);
+        return;
+    }
+'''),
+        ('''ProgramFn lookup(std::uint32_t address) {
+''', '''std::uintptr_t program_at(std::uint32_t address);
+void run_program(std::uint32_t address) { interpret(1, address); }   // ps2run_3ds_patch.py
+
+ProgramFn lookup(std::uint32_t address) {
+'''),
+        ('''void run(int n, std::uint32_t address) {
+''', '''std::uintptr_t program_at(std::uint32_t address) { return reinterpret_cast<std::uintptr_t>(lookup(address)); }   // ps2run_3ds_patch.py
+
+void run(int n, std::uint32_t address) {
+'''),
+    ],
+    # The GPU path ("g3 4"): a model batch goes to the PICA renderer as the batch's own vertices, with PRIM as its tag sets it.
+    'runtime/src/gs/gs.hpp': [
+        ('''namespace ps2::gs {
+''', '''namespace g3 { struct Gpu; }   // ps2run_3ds_patch.py
+
+namespace ps2::gs {
+''', ),
+        ('''void write(std::uint32_t reg, std::uint64_t value);
+''', '''void write(std::uint32_t reg, std::uint64_t value);
+bool draw_g3(std::uint64_t prim, const ::g3::Gpu &g);   // ps2run_3ds_patch.py: false when the PICA renderer cannot take it
+'''),
+    ],
+    'runtime/src/gs/gs.cpp': [
+        ('''void draw_gpu(const State &s) {
+    if (queue::g_skip_picture) return;
+    static bool known = false;
+    static std::uint32_t seen = 0;
+    static std::uint64_t clamp = 0;
+    if (!known || seen != g_setup_generation) {
+        known = true;
+        seen = g_setup_generation;
+        const Context &uc = s.ctx[static_cast<unsigned>(s.prim >> 9) & 1u];
+        g_upload_ext.erase((static_cast<std::uint32_t>(uc.frame) & 0x1FFu) * 32u);
+        clamp = upload_clamped(s, uc);
+    }
+    pica::draw(s, g_vertex_serial, clamp);
+    ++g_primitives;
+}
+#endif
+''', '''std::uint64_t gpu_clamp(const State &s) {
+    static bool known = false;
+    static std::uint32_t seen = 0;
+    static std::uint64_t clamp = 0;
+    if (!known || seen != g_setup_generation) {
+        known = true;
+        seen = g_setup_generation;
+        const Context &uc = s.ctx[static_cast<unsigned>(s.prim >> 9) & 1u];
+        g_upload_ext.erase((static_cast<std::uint32_t>(uc.frame) & 0x1FFu) * 32u);
+        clamp = upload_clamped(s, uc);
+    }
+    return clamp;
+}
+
+void draw_gpu(const State &s) {
+    if (queue::g_skip_picture) return;
+    pica::draw(s, g_vertex_serial, gpu_clamp(s));
+    ++g_primitives;
+}
+#endif
+
+bool draw_g3(std::uint64_t prim, const ::g3::Gpu &g) {   // ps2run_3ds_patch.py
+#ifdef PS2_PICA
+    if (!pica::active() || !pica::g3_ready()) return false;
+    write(0x00, prim);
+    if (!queue::g_skip_picture && !pica::draw_g3(g_state, gpu_clamp(g_state), g)) return false;
+    ++g_primitives;
+    return true;
+#else
+    (void)prim, (void)g;
+    return false;
+#endif
+}
+'''),
+    ],
+}
+
+
 
 def fail(msg):
     print("PATCH NOT APPLIED:", msg)
@@ -5984,7 +6131,7 @@ originals = {}
 texts = {}
 pending = 0
 
-for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items(), *IOPAHEAD_EDITS.items(), *STALE_EDITS.items(), *MOVIE_EDITS.items(), *SPLIT_SKIP_EDITS.items(), *SAMPLE_EDITS.items()):
+for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items(), *IOPAHEAD_EDITS.items(), *STALE_EDITS.items(), *MOVIE_EDITS.items(), *SPLIT_SKIP_EDITS.items(), *SAMPLE_EDITS.items(), *G3_EDITS.items()):
     rel = key.split('#')[0]   # the part after # only keeps two lists for one file apart
     if rel in texts:
         t = texts[rel]
@@ -5995,7 +6142,7 @@ for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(),
         except OSError:
             fail("cannot read " + rel)
         # Unwind the later stages in memory so their inputs can be verified.
-        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()), *IOPAHEAD_EDITS.get(rel, ()), *STALE_EDITS.get(rel, ()), *MOVIE_EDITS.get(rel, ()), *SPLIT_SKIP_EDITS.get(rel, ()), *SAMPLE_EDITS.get(rel, ()))):
+        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()), *IOPAHEAD_EDITS.get(rel, ()), *STALE_EDITS.get(rel, ()), *MOVIE_EDITS.get(rel, ()), *SPLIT_SKIP_EDITS.get(rel, ()), *SAMPLE_EDITS.get(rel, ()), *G3_EDITS.get(rel, ()))):
             if t.count(new) == 1:
                 t = t.replace(new, old)
                 pending -= 1

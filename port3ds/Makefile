@@ -43,7 +43,7 @@ CXXFLAGS  += -DPS2_IOP_BLOCKS
 endif
 endif
 HOST      := /p/port3ds/main3ds.cpp /p/port3ds/pica.cpp /p/port3ds/native3ds.cpp /p/port3ds/memcpy3ds.cpp /p/port3ds/remote3ds.cpp /p/port3ds/iop3ds.cpp \
-             /p/port3ds/movie3ds.cpp /p/port3ds/mpeg1.cpp /p/port3ds/gpuoverlap.cpp
+             /p/port3ds/movie3ds.cpp /p/port3ds/mpeg1.cpp /p/port3ds/gpuoverlap.cpp /p/port3ds/g3native.cpp /p/port3ds/g3model.cpp
 OBJS      := $(patsubst /%.cpp,$(OUT)/obj/%.o,$(RUNTIME) $(GAME) $(HOST)) $(OUT)/shader/gs_v_shbin.o
 comma     := ,
 GPU_WRAP  := $(addprefix -Wl$(comma)--wrap=,GPUCMD_Add GPUCMD_AddRawCommands GPUCMD_Split gxCmdQueueWait gxCmdQueueStop gxCmdQueueClear gxCmdQueueRun)
@@ -67,6 +67,9 @@ $(OUT)/p3fes.3dsx: $(OUT)/p3fes.elf
 $(OUT)/p3fes.elf: $(OBJS) $(CONFIG)
 	$(PREFIX)g++ -specs=3dsx.specs $(ARCH) -Wl,--gc-sections $(GPU_WRAP) -Wl,-Map,$(OUT)/p3fes.map $(OBJS) -L$(CTRU)/lib -L$(PORTLIBS)/lib -lcitro3d -lctru -lz -lm -o $@
 	$(PREFIX)size $@
+
+# The g3 model must round as the VU programs do: every multiply and add on its own (tools/g3check builds it the same way).
+$(OUT)/obj/p/port3ds/g3model.o: CXXFLAGS += -ffp-contract=off
 
 # The wireless link unpacks uploads with zlib from the portlibs.
 $(OUT)/obj/p/port3ds/remote3ds.o: CXXFLAGS += -I$(PORTLIBS)/include

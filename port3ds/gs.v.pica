@@ -1,18 +1,41 @@
-; Vertex shader for the PS2 GS path. Vertices arrive in GS pixels:
+; Vertex shader for the PS2 GS path, with a second path for the game's RenderWare models (g3: see port3ds/g3gpu.cpp).
+;
+; GS path (isg3 false). Vertices arrive in GS pixels:
 ;   v0 = x, y, z (GS screen position) and w (1/Q, used for perspective)
 ;   v1 = colour, v2 = texture coordinates, v3 = GS fog value as a coordinate into the fog ramp
 ; scale and offset turn x, y, z into clip space for the current render target. x, y and z are then multiplied by w, so the
 ; GPU's perspective divide gives back the same screen position while interpolating the colour and coordinates with perspective.
 ; eye moves a shape sideways by its depth, for the picture each eye gets with the 3D slider up: x times the depth, plus y.
 ; Depth runs from 0 (far) to -1 (near), and anything nearer than eye.z counts as eye.z, so it does not move at all.
+;
+; g3 path (isg3 true): what the VU1 programs g3_generic and g3_skin work out on the CPU, done here from their own vertex data:
+;   v0 = position, v1 = uv, v2 = prelit colour (0-255), v3 = normal in 1/128 units, v4 = four bone weights, v5 = the four bones'
+;   first uniform in bones (3 each: the bone's matrix turned so that x, y and z are each a dot product with (position, 1));
+;   with isskin false (g3_generic) v4 and v5 are not used
+; The weighted bone rows move the position and the normal; proj (VU vf28-vf31) and post (vf2 less the GS offset) give the GS
+; screen position, which then goes on as in the GS path. Colour: prelit plus the ambient lights (amb), plus each directional
+; light's colour times N.L clamped at 0, clamped to 255, times the material. Fog comes from w.
 
 .fvec scale
 .fvec offset
 .fvec eye
+.fvec proj[4]
+.fvec post
+.fvec texs
+.fvec fogp
+.fvec mat
+.fvec amb
+.fvec ldir[3]
+.fvec lcol[3]
+.fvec bones[72]
+.bool isg3
+.bool isskin
 
 .constf ones(1.0, 1.0, 1.0, 1.0)
 ; Byte attributes arrive as 0 to 255, not 0 to 1.
 .constf bytes_to_unit(0.00392156862745098, 0.00392156862745098, 0.00392156862745098, 0.00392156862745098)
+; x: normal unit, y: the colour clamp, z: zero, w: one
+.constf g3c(0.0078125, 255.0, 0.0, 1.0)
 
 .out outpos position
 .out outclr color
@@ -23,20 +46,94 @@
 .alias inclr v1
 .alias intc0 v2
 .alias infog v3
+.alias g3pos v0
+.alias g3uv v1
+.alias g3clr v2
+.alias g3nrm v3
+.alias g3w v4
+.alias g3idx v5
 
 .proc main
-    mul r0.xyz, scale.xyz, inpos.xyz
+    ifu isg3
+        ; independent work first, so a0 is never read right after mova writes it
+        mova a0.xy, g3idx.xy
+        mul r8, g3c.xxxx, g3nrm
+        ifu isskin
+            ; the weighted bone matrices: r4, r5, r6 give x, y and z, each a dot product with (position, 1)
+            mul r4, bones[a0.x], g3w.xxxx
+            mul r5, bones[a0.x+1], g3w.xxxx
+            mul r6, bones[a0.x+2], g3w.xxxx
+            mad r4, g3w.yyyy, bones[a0.y], r4
+            mad r5, g3w.yyyy, bones[a0.y+1], r5
+            mad r6, g3w.yyyy, bones[a0.y+2], r6
+            mova a0.xy, g3idx.zw
+            add r10, amb, g3clr
+            mad r4, g3w.zzzz, bones[a0.x], r4
+            mad r5, g3w.zzzz, bones[a0.x+1], r5
+            mad r6, g3w.zzzz, bones[a0.x+2], r6
+            mad r4, g3w.wwww, bones[a0.y], r4
+            mad r5, g3w.wwww, bones[a0.y+1], r5
+            mad r6, g3w.wwww, bones[a0.y+2], r6
+            ; position (w is 1) and normal through them
+            dp4 r0.x, r4, g3pos
+            dp4 r0.y, r5, g3pos
+            dp4 r0.z, r6, g3pos
+            dp3 r9.x, r4, r8
+            dp3 r9.y, r5, r8
+            dp3 r9.z, r6, r8
+        .else
+            ; g3_generic: no bones
+            mov r0, g3pos
+            mov r9, r8
+            add r10, amb, g3clr
+        .end
+        ; clip space through vf28-vf31
+        mov r1, proj[3]
+        mad r1, r0.xxxx, proj[0], r1
+        mad r1, r0.yyyy, proj[1], r1
+        mad r1, r0.zzzz, proj[2], r1
+        ; GS screen position: x and y in pixels from the offset, z as the GS path's depth
+        rcp r2, r1.wwww
+        mul r3.xyz, r1.xyz, r2.xyz
+        add r3.xyz, post.xyz, r3.xyz
+        mul r3.z, post.wwww, r3.zzzz
+        mov r3.w, r1.wwww
+        ; colour
+        dp3 r11.x, ldir[0], r9
+        dp3 r11.y, ldir[1], r9
+        dp3 r11.z, ldir[2], r9
+        max r11, g3c.zzzz, r11
+        mad r10, r11.xxxx, lcol[0], r10
+        mad r10, r11.yyyy, lcol[1], r10
+        mad r10, r11.zzzz, lcol[2], r10
+        min r10, g3c.yyyy, r10
+        mul outclr, mat, r10
+        ; texture coordinates and fog
+        mul r13, texs, g3uv
+        add r13.y, texs.zzzz, r13.yyyy
+        mov outtc0, r13
+        mul r12, fogp.xxxx, r1.wwww
+        add r12, fogp.yyyy, r12
+        max r12, g3c.zzzz, r12
+        min r12, g3c.wwww, r12
+        mul outtc1, g3c.wzzz, r12
+    .else
+        mov r3, inpos
+        mul outclr, bytes_to_unit, inclr
+        mov outtc0, intc0
+        mul outtc1, bytes_to_unit, infog
+    .end
+    ; depth no nearer than the top of the buffer
+    max r3.z, -ones.zzzz, r3.zzzz
+    mul r0.xyz, scale.xyz, r3.xyz
     add r0.xyz, offset.xyz, r0.xyz
     max r2, eye.zzzz, r0.zzzz
     mul r2, eye.xxxx, r2
     add r2, eye.yyyy, r2
     add r0.x, r0.xxxx, r2.xxxx
-    mov r0.w, inpos.w
-    mul r1, ones, inpos.wwww
+    mov r0.w, r3.w
+    mul r1, ones, r3.wwww
     mul outpos.xyz, r1.xyz, r0.xyz
     mov outpos.w, r0.w
-    mul outclr, bytes_to_unit, inclr
-    mov outtc0, intc0
-    mul outtc1, bytes_to_unit, infog
     end
 .end

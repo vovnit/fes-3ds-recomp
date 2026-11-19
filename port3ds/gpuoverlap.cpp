@@ -185,6 +185,13 @@ extern "C" void FesOverlapEnd(u8 flags) {
     C3D_FrameEnd(flags);
 }
 
+// Command words still free this frame, counting the growth expand_recording can still give the recording.
+extern "C" u32 FesOverlapWordsLeft() {
+    u32 left = gpuCmdBufSize - gpuCmdBufOffset;
+    if (recording_begin && recording_words != original_words) left += original_words - recording_words;
+    return left;
+}
+
 extern "C" void FesOverlapCommandStats(u32 *peak, unsigned *expanded) {
     *peak = peak_words;
     *expanded = expansions;
