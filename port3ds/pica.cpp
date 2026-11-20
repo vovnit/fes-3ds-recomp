@@ -1607,7 +1607,7 @@ bool draw_g3(const State &st, std::uint64_t clamp, const ::g3::Gpu &g) {
     float unif[15][4];
     for (int i = 0; i < 4; ++i) std::memcpy(unif[i], g.proj[i], sizeof unif[i]);
     const float post[4] = {g.offset[0] - static_cast<float>(g_ofx) * (1.0f / 16.0f), g.offset[1] - static_cast<float>(g_ofy) * (1.0f / 16.0f), g.offset[2],
-                           -g_z_scale * (g.fog ? 1.0f : 16.0f)};
+                           -g_z_scale * (g.xyzf ? 1.0f : 16.0f)};
     std::memcpy(unif[4], post, sizeof post);
     const float texs[4] = {g_s_scale, -g_t_scale, g_v_offset, 0.0f};
     std::memcpy(unif[5], texs, sizeof texs);

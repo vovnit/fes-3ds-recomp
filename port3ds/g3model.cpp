@@ -351,6 +351,23 @@ bool clipper_culls_all(const Input &in, u32 top, u32 n) {
     return all != 0;
 }
 
+// For the GPU path: no vertex beyond the clipper's depth planes (M[0x3FD].z + M[0x3FE].z * w within +-w, which puts them near
+// w = 150 and far w = 10000) or behind the eye. The clipper then only cuts triangles at the guard band, which is the picture
+// plus a few pixels, and the GPU's own edges cut the same pixels. Each output vertex the clipper keeps is the plain strip's,
+// with the same colour, depth and ADC (port3ds/README.md).
+bool clipper_depth_inside(const Input &in, u32 top, u32 n) {
+    const Batch b{in, top, n};
+    const Vec v28 = b.vf(28), v29 = b.vf(29), v30 = b.vf(30), v31 = b.vf(31);
+    const Vec m26 = load(in.mem, 0x3FD), m27 = load(in.mem, 0x3FE);
+    const float bw = v31.w + 0.0f, az = 0.0f + m26.z, sz = 0.0f + m27.z;
+    for (u32 k = 0; k < n; ++k) {
+        const Vec p = load(in.mem, top + 4u * k);
+        const float cw = ((bw * 1.0f + v28.w * p.x) + v29.w * p.y) + v30.w * p.z;
+        if (!(cw > 0.0f) || (clip_codes(0.0f, 0.0f, az + sz * cw, cw) & 0x30u)) return false;
+    }
+    return true;
+}
+
 }
 
 bool run(const Input &in, std::vector<std::uint8_t> &out, std::vector<std::uint32_t> &ends, End &end) {
@@ -410,6 +427,19 @@ inline bool colour_normal(const std::uint8_t *mem, u32 at, bool lights, GpuVerte
 
 }
 
+// A list of n / 3 triangles as one strip: each triangle after the first is joined by its predecessor's last vertex and its
+// own first three times, so it starts at an even place (where the GPU does not turn the triangle round) and every triangle
+// between has no area. a0 b0 c0, then c0 a1 a1 a1 b1 c1, and so on: 2n - 3 vertices.
+static void list_to_strip(Gpu &g) {
+    const unsigned triangles = g.n / 3u;
+    for (unsigned t = triangles - 1u; t >= 1u; --t) {
+        const GpuVertex join = g.v[3u * t - 1u], a = g.v[3u * t], b = g.v[3u * t + 1u], c = g.v[3u * t + 2u];
+        GpuVertex *o = g.v + 6u * t - 3u;
+        o[0] = join, o[1] = a, o[2] = a, o[3] = a, o[4] = b, o[5] = c;
+    }
+    g.n = triangles ? 6u * triangles - 3u : 0u;
+}
+
 int gpu_batch(const Input &in, Gpu &g, End &end) {
     end = End{};
     const std::uint8_t *mem = in.mem;
@@ -417,13 +447,20 @@ int gpu_batch(const Input &in, Gpu &g, End &end) {
     const u32 top = in.top & 1023u, n = in.itop & 1023u;
     const bool skin = in.program == 64;
     if (n == 0 || n > 256u || top + (skin ? 5u : 4u) * n > 0x3D0u) return kGpuNotModelled;
+    // Triangle lists: only g3_generic's plain ones (flags 0xC) are known. Their vertices are the strip's, each triangle with
+    // the strip's facing test as if it began at an even place (042 0x1520 on; tools/g3check -liststrip).
+    const bool list = flags & 4u;
+    if (list && (skin || (flags & 3u) || n % 3u)) return kGpuNotModelled;
     if (flags & 2u) {
-        if (skin || !(flags & 8u) || !clipper_culls_all(in, top, n)) return kGpuNotModelled;
-        end.swap = false;
+        if (skin || !(flags & 8u)) return kGpuNotModelled;
         end.clipper = true;
-        return -1;
+        if (clipper_culls_all(in, top, n)) {
+            end.swap = false;
+            return -1;
+        }
+        if (!clipper_depth_inside(in, top, n)) return kGpuClipDepth;
+        // otherwise the whole strip, as below
     }
-    if (flags & 4u) return kGpuNotModelled;
     static Lighting L;
     if (!prepare_lighting(mem, L)) return kGpuNotModelled;
 
@@ -432,7 +469,7 @@ int gpu_batch(const Input &in, Gpu &g, End &end) {
     const u32 tag_hi = bits(tag.y);
     if (!(tag_hi & (1u << 14))) return kGpuPrim;   // no PRE: PRIM would stay as it was
     g.prim = (tag_hi >> 15) & 0x7FFu;
-    if ((g.prim & 7u) != 4u || !(g.prim & 8u) || (g.prim & 0x100u)) return kGpuPrim;
+    if ((g.prim & 7u) != (list ? 3u : 4u) || !(g.prim & 8u) || (g.prim & 0x100u)) return kGpuPrim;
 
     // Lights: ambient ones summed; directional ones each get N.L clamped at 0. Without lights, the colour times the material.
     for (auto &d : g.light_dir) set4(d, 0, 0, 0, 0);
@@ -462,6 +499,7 @@ int gpu_batch(const Input &in, Gpu &g, End &end) {
     set4(g.proj[3], v31.x, v31.y, v31.z, v31.w);
     set4(g.offset, v2.x, v2.y, v2.z, 0);
     g.fog = flags & 1u;
+    g.xyzf = g.fog || list;   // lists send XYZF2 even without fog: the GS takes their z word shifted down by 4 bits
     const Vec fog = load(mem, 0x3F6);
     g.fog_scale = fog.z;
     g.fog_near = fog.w;
@@ -494,6 +532,7 @@ int gpu_batch(const Input &in, Gpu &g, End &end) {
             o.weight[0] = 1.0f, o.weight[1] = o.weight[2] = o.weight[3] = 0.0f;
             o.bone[0] = o.bone[1] = o.bone[2] = o.bone[3] = 0;
         }
+        if (list) list_to_strip(g);
         return 0;
     }
 

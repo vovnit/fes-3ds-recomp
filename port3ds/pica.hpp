@@ -30,7 +30,7 @@ std::uint32_t stereo();
 
 void draw(const State &s, std::uint32_t serial, std::uint64_t clamp);
 // A batch of the game's model programs, transformed and lit by the vertex shader (port3ds/g3native.cpp, "g3 4"). PRIM must
-// already hold the batch's own. False: the frame's command list is nearly full, send the batch the GS way instead.
+// already hold the batch's own (its GIF tag has gone through the GIF). False: the frame's command list is nearly full, send the batch the GS way instead.
 // g3_ready: init found the shader's g3 uniforms where draw_g3 expects them.
 bool g3_ready();
 bool draw_g3(const State &s, std::uint64_t clamp, const ::g3::Gpu &g);

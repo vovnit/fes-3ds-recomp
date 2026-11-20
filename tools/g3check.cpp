@@ -152,7 +152,7 @@ void check_gpu(const g3::Input &in, const std::vector<std::uint8_t> &model, bool
         return;
     }
     ++c.drawn;
-    float sx[256], sy[256];
+    float sx[512], sy[512];
     for (unsigned k = 0; k < g.n; ++k) {
         const g3::GpuVertex &v = g.v[k];
         float p[4] = {v.x, v.y, v.z, 1.0f}, clip[4], nrm[4] = {v.normal[0] / 128.0f, v.normal[1] / 128.0f, v.normal[2] / 128.0f, 0.0f};
@@ -171,7 +171,7 @@ void check_gpu(const g3::Input &in, const std::vector<std::uint8_t> &model, bool
         const float q = 1.0f / clip[3];
         sx[k] = clip[0] * q + g.offset[0];
         sy[k] = clip[1] * q + g.offset[1];
-        const float sz = (clip[2] * q + g.offset[2]) * (g.fog ? 1.0f : 16.0f);
+        const float sz = (clip[2] * q + g.offset[2]) * (g.xyzf ? 1.0f : 16.0f);
         float colour[4];
         float d[3];
         for (int l = 0; l < 3; ++l) d[l] = std::max(0.0f, nrm[0] * g.light_dir[l][0] + nrm[1] * g.light_dir[l][1] + nrm[2] * g.light_dir[l][2]);
@@ -182,8 +182,10 @@ void check_gpu(const g3::Input &in, const std::vector<std::uint8_t> &model, bool
         }
         const std::size_t at = 16u + 48u * k;
         const std::uint32_t X = word(model, at + 32) & 0xFFFFu, Y = word(model, at + 36) & 0xFFFFu, Z = word(model, at + 40);
-        const double dx = std::fabs(sx[k] * 16.0 - X), dy = std::fabs(sy[k] * 16.0 - Y);
-        const double z = g.fog ? (Z >> 4) & 0xFFFFFFu : Z;
+        // XYZF2 keeps 16 bits of x and y: a vertex far off the picture (a clipper batch's, which the clipper cuts) wraps.
+        auto wrapped = [](double d) { d = std::fmod(std::fabs(d), 65536.0); return std::min(d, 65536.0 - d); };
+        const double dx = wrapped(sx[k] * 16.0 - X), dy = wrapped(sy[k] * 16.0 - Y);
+        const double z = g.xyzf ? (Z >> 4) & 0xFFFFFFu : Z;
         const double dz = std::fabs(sz - z) / std::max(1.0, z);
         c.worst_xy = std::max({c.worst_xy, dx, dy});
         c.worst_z = std::max(c.worst_z, dz);
@@ -213,16 +215,122 @@ void check_gpu(const g3::Input &in, const std::vector<std::uint8_t> &model, bool
 
 }
 
+// Test aid (-clipstrip): the clipper's vertices that keep their triangle (the same three vertices as in the batch) against
+// what the plain strip would send for them: tells whether the clipper culls and lights as the strip does.
+struct ClipStrip { unsigned table[3][2][2][2] = {}; unsigned shown = 0, batches = 0, identical = 0, compared = 0, adc_differs = 0, other_differs = 0; };
+void clip_vs_strip(const Record &r, ClipStrip &cs) {
+    std::vector<std::uint8_t> mem = r.mem;
+    mem[0x3FF0] &= ~2u;
+    g3::Input in{};
+    in.program = 42;
+    in.mem = mem.data();
+    in.top = r.top;
+    in.itop = r.itop;
+    std::memcpy(in.vf, r.regs.data(), 512);
+    std::memcpy(in.vi, r.regs.data() + 528, 32);
+    std::vector<std::uint8_t> out;
+    std::vector<std::uint32_t> ends;
+    g3::End end;
+    if (!g3::run(in, out, ends, end) || r.packets.empty()) return;
+    out.resize(ends.back());
+    ++cs.batches;
+    if (out == r.packets) ++cs.identical;
+    // model vertices: 3 qwords each after the 16-byte tag; XYZF2 is the third
+    const std::size_t mn = (out.size() - 16) / 48;
+    auto xyz = [](const std::vector<std::uint8_t> &v, std::size_t at) { std::uint64_t a; std::uint32_t b; std::memcpy(&a, v.data() + at + 32, 8); std::memcpy(&b, v.data() + at + 40, 4); return std::pair{a, b}; };
+    std::size_t at = 0;
+    while (at + 16 <= r.packets.size()) {
+        const unsigned nl = word(r.packets, at) & 0x7FFFu;
+        const std::size_t first = at + 16;
+        for (unsigned j = 2; j < nl; ++j) {
+            const std::size_t pv = first + 48u * j;
+            for (std::size_t k = 2; k < mn; ++k) {
+                const std::size_t mv = 16 + 48u * k;
+                if (xyz(r.packets, pv) != xyz(out, mv) || xyz(r.packets, pv - 48) != xyz(out, mv - 48) || xyz(r.packets, pv - 96) != xyz(out, mv - 96)) continue;
+                ++cs.compared;
+                if (((word(r.packets, pv + 44) ^ word(out, mv + 44)) >> 15) & 1u) ++cs.adc_differs;
+                const bool stq = std::memcmp(r.packets.data() + pv, out.data() + mv, 12) != 0, rgba = std::memcmp(r.packets.data() + pv + 16, out.data() + mv + 16, 16) != 0;
+                if (stq || rgba) ++cs.other_differs;
+                const bool adc = ((word(r.packets, pv + 44) ^ word(out, mv + 44)) >> 15) & 1u;
+                {
+                    auto sxy = [&](std::size_t v, float &x, float &y) { x = (word(out, v + 32) & 0xFFFFu) / 16.0f; y = (word(out, v + 36) & 0xFFFFu) / 16.0f; };
+                    float x0, y0, x1, y1, x2, y2;
+                    const std::size_t va = (k & 1u) ? mv - 48 : mv - 96, vb = (k & 1u) ? mv - 96 : mv - 48;
+                    sxy(va, x0, y0), sxy(vb, x1, y1), sxy(mv, x2, y2);
+                    const float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+                    const int sign = std::fabs(area) < 0.5f ? 0 : area > 0 ? 1 : 2;
+                    ++cs.table[sign][(word(r.packets, pv + 44) >> 15) & 1u][(word(out, mv + 44) >> 15) & 1u][k & 1u];
+                }
+                if ((adc || stq || rgba) && cs.shown < 12) {
+                    ++cs.shown;
+                    std::printf("  strip vertex %zu (out %u): adc program %u model %u; stq %s rgba %s; program", k, j, (word(r.packets, pv + 44) >> 15) & 1u, (word(out, mv + 44) >> 15) & 1u, stq ? "differs" : "same", rgba ? "differs" : "same");
+                    for (int q = 0; q < 8; ++q) std::printf(" %08X", word(r.packets, pv + 4 * q));
+                    std::printf(" model");
+                    for (int q = 0; q < 8; ++q) std::printf(" %08X", word(out, mv + 4 * q));
+                    std::printf("\n");
+                }
+                break;
+            }
+        }
+        at = first + 48u * nl;
+    }
+}
+
+// Test aid (-liststrip): a triangle-list batch's vertices against the strip model's for the same vertices (flag 4 cleared).
+struct ListStrip { unsigned stq_ulp = 0, batches = 0, vertices = 0, stq = 0, rgba = 0, xyz = 0, word3[4] = {}; };
+void list_vs_strip(const Record &r, ListStrip &ls) {
+    std::vector<std::uint8_t> mem = r.mem;
+    mem[0x3FF0] &= ~4u;
+    g3::Input in{};
+    in.program = static_cast<int>(r.program);
+    in.mem = mem.data();
+    in.top = r.top;
+    in.itop = r.itop;
+    std::memcpy(in.vf, r.regs.data(), 512);
+    std::memcpy(in.vi, r.regs.data() + 528, 32);
+    std::vector<std::uint8_t> out;
+    std::vector<std::uint32_t> ends;
+    g3::End end;
+    if (!g3::run(in, out, ends, end) || r.packets.size() != ends.back()) return;
+    ++ls.batches;
+    const std::size_t n = (r.packets.size() - 16) / 48;
+    for (std::size_t k = 0; k < n; ++k) {
+        const std::size_t at = 16 + 48 * k;
+        ++ls.vertices;
+        if (std::memcmp(r.packets.data() + at, out.data() + at, 12)) ++ls.stq;
+        for (int q = 0; q < 3; ++q) {
+            const std::int64_t d = std::llabs(static_cast<std::int64_t>(static_cast<std::int32_t>(word(r.packets, at + 4 * q))) - static_cast<std::int32_t>(word(out, at + 4 * q)));
+            if (d > 4 && ls.stq_ulp <= 4) std::printf("  STQ word %d: program %08X model %08X\n", q, word(r.packets, at + 4 * q), word(out, at + 4 * q));
+            if (d > ls.stq_ulp) ls.stq_ulp = static_cast<unsigned>(std::min<std::int64_t>(d, 0x7FFFFFFF));
+        }
+        if (std::memcmp(r.packets.data() + at + 16, out.data() + at + 16, 16)) ++ls.rgba;
+        if (std::memcmp(r.packets.data() + at + 32, out.data() + at + 32, 12)) ++ls.xyz;
+        const std::uint32_t w = word(r.packets, at + 44);
+        ++ls.word3[k % 3 == 2 ? (w & 0x8000u ? 3 : w ? 2 : 1) : (w ? 2 : 0)];
+        if (ls.vertices <= 6) {
+            std::printf("  list vertex %zu: program", k);
+            for (int q = 0; q < 12; ++q) std::printf(" %08X", word(r.packets, at + 4 * q));
+            std::printf("\n                 model  ");
+            for (int q = 0; q < 12; ++q) std::printf(" %08X", word(out, at + 4 * q));
+            std::printf("\n");
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: g3check g3cap.bin [-v N]\n");
         return 2;
     }
     int verbose = 0;
-    bool gpu = false;
+    bool gpu = false, clipstrip = false, liststrip = false;
+    ClipStrip cs;
+    ListStrip ls;
     for (int i = 2; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-v") && i + 1 < argc) verbose = std::atoi(argv[i + 1]);
         if (!std::strcmp(argv[i], "-gpu")) gpu = true;
+        if (!std::strcmp(argv[i], "-clipstrip")) clipstrip = true;
+        if (!std::strcmp(argv[i], "-liststrip")) liststrip = true;
     }
     GpuCheck gc;
     std::FILE *f = std::fopen(argv[1], "rb");
@@ -252,7 +360,32 @@ int main(int argc, char **argv) {
         std::snprintf(key, sizeof key, "%u flags %X cull %X", r.program, word(r.mem, 0x3FF0) & 0xFFu, word(r.mem, 0x3FF8));
         Count &c = counts[key];
         ++c.total;
-        if (gpu) check_gpu(in, out, modelled, gc);
+        if (gpu && r.program == 42 && (r.mem[0x3FF0] & 2u)) {
+            // A clipper batch: its kept vertices are the plain strip's (-clipstrip), so the GPU path is checked against that.
+            std::vector<std::uint8_t> mem = r.mem, strip;
+            mem[0x3FF0] &= ~2u;
+            g3::Input sin = in;
+            sin.mem = mem.data();
+            std::vector<std::uint32_t> sends;
+            g3::End send;
+            const bool smodelled = g3::run(sin, strip, sends, send);
+            strip.resize(sends.empty() ? 0 : sends.back());
+            check_gpu(in, strip, smodelled, gc);
+        } else if (gpu && (r.mem[0x3FF0] & 4u)) {
+            // A list: the program's own vertices in the order gpu_batch turns them into a strip (g3::list_to_strip).
+            std::vector<std::uint8_t> strip(r.packets.begin(), r.packets.begin() + std::min<std::size_t>(16, r.packets.size()));
+            const std::size_t nv = r.packets.size() >= 16 ? (r.packets.size() - 16) / 48 : 0;
+            auto put = [&](std::size_t k) { strip.insert(strip.end(), r.packets.begin() + 16 + 48 * k, r.packets.begin() + 64 + 48 * k); };
+            for (std::size_t t = 0; t < nv / 3; ++t) {
+                if (t) put(3 * t - 1), put(3 * t), put(3 * t);
+                put(3 * t), put(3 * t + 1), put(3 * t + 2);
+            }
+            check_gpu(in, strip, !r.packets.empty(), gc);
+        } else if (gpu) {
+            check_gpu(in, out, modelled, gc);
+        }
+        if (liststrip && (r.mem[0x3FF0] & 4u)) list_vs_strip(r, ls);
+        if (clipstrip && r.program == 42 && (r.mem[0x3FF0] & 2u)) clip_vs_strip(r, cs);
         if (!modelled) continue;
         ++c.modelled;
         if (same_for_gs(r.packets, out, c.differ)) {
@@ -270,10 +403,23 @@ int main(int argc, char **argv) {
     for (const auto &[k, c] : counts)
         std::printf("  %-28s %6u batches, %6u modelled, %6u identical; qwords differing: tag %u, RGBA %u, STQ %u, XYZF2 %u, XYZ2 %u\n", k.c_str(), c.total,
                     c.modelled, c.same, c.differ[0], c.differ[1], c.differ[2], c.differ[4], c.differ[5]);
+    if (liststrip)
+        std::printf("list batches against the strip model: %u batches, %u vertices; differ: STQ %u (at most %u units in the last place), RGBA %u, XYZ %u; last word: 0 on first two %u, "
+                    "set on first two %u, third: 0 %u, set without ADC %u, ADC %u\n", ls.batches, ls.vertices, ls.stq, ls.stq_ulp, ls.rgba, ls.xyz, ls.word3[0],
+                    ls.word3[2], ls.word3[1], ls.word3[2], ls.word3[3]);
+    if (clipstrip)
+        for (int a = 0; a < 3; ++a)
+            for (int p = 0; p < 2; ++p)
+                for (int m = 0; m < 2; ++m)
+                    for (int o = 0; o < 2; ++o)
+                        if (cs.table[a][p][m][o]) std::printf("  area %s, ADC program %d model %d, %s vertex: %u\n", a == 0 ? "zero" : a == 1 ? "above 0" : "below 0", p, m, o ? "odd" : "even", cs.table[a][p][m][o]);
+    if (clipstrip)
+        std::printf("clipper batches against the strip model: %u batches, %u identical; vertices with the same triangle: %u, ADC differs %u, "
+                    "colour/STQ differ %u\n", cs.batches, cs.identical, cs.compared, cs.adc_differs, cs.other_differs);
     if (gpu) {
-        std::printf("GPU path: %u batches, %u drawn, %u draw nothing; declined: %u not modelled, %u bones, %u lights, %u range, %u prim, %u other\n",
+        std::printf("GPU path: %u batches, %u drawn, %u draw nothing; declined: %u not modelled, %u bones, %u lights, %u range, %u prim, %u clipper depth, %u other\n",
                     gc.batches, gc.drawn, gc.nothing, gc.declined[g3::kGpuNotModelled], gc.declined[g3::kGpuBoneCount], gc.declined[g3::kGpuLights],
-                    gc.declined[g3::kGpuRange], gc.declined[g3::kGpuPrim], gc.declined[0]);
+                    gc.declined[g3::kGpuRange], gc.declined[g3::kGpuPrim], gc.declined[g3::kGpuClipDepth], gc.declined[0]);
         std::printf("  %u vertices: worst x/y %.2f (1/16 px), %u over a pixel; worst z %.2g (relative); worst colour %.2f, %u over 2; worst fog %.2f, %u over 2\n",
                     gc.vertices, gc.worst_xy, gc.xy_over, gc.worst_z, gc.worst_colour, gc.colour_over, gc.worst_fog, gc.fog_over);
         std::printf("  %u triangles, %u drawn differently\n", gc.triangles, gc.facing_wrong);

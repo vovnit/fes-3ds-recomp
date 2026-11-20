@@ -49,6 +49,7 @@ struct Gpu {
     std::uint64_t prim;              // what the GIF tag sets PRIM to
     bool skin;                       // g3_skin: the shader blends bones (g3_generic's bone is the identity, for g3check)
     bool fog;                        // the XYZF2 strip: the fog value from w, and z without the 16 of FTOI4
+    bool xyzf;                       // z as XYZF2 takes it (24 bits, without the 16 of XYZ2): the fog strip and lists
     bool keep_negative, keep_positive;   // which triangles the program leaves without ADC, by facing (see facing_negative)
     float proj[4][4];                // vf28-vf31 as the strip uses them (the z of vf28 and vf29 is not used: zero)
     float offset[4];                 // vf02, added to the screen position
@@ -62,7 +63,7 @@ struct Gpu {
     float bone[kGpuBones * 3][4];
     std::uint32_t slots;             // the palette slots this batch's vertices use (bit per slot)
     unsigned n;
-    GpuVertex v[256];
+    GpuVertex v[512];                // a list batch is turned into a strip, up to 2n - 3 vertices (see gpu_batch)
 };
 
 // Why gpu_batch did not give a batch to draw.
@@ -72,6 +73,7 @@ enum GpuDecline : int {
     kGpuLights,            // more than three directional lights
     kGpuRange,             // a colour beyond 0-255 or a normal beyond a signed byte
     kGpuPrim,              // not a Gouraud triangle strip with ST coordinates
+    kGpuClipDepth,         // the clipper batch has a vertex beyond its near or far plane
     kGpuDeclines
 };
 

@@ -6053,7 +6053,8 @@ ProgramFn lookup(std::uint32_t address) {
 void run(int n, std::uint32_t address) {
 '''),
     ],
-    # The GPU path ("g3 4"): a model batch goes to the PICA renderer as the batch's own vertices, with PRIM as its tag sets it.
+    # The GPU path ("g3 4"): a model batch goes to the PICA renderer as the batch's own vertices (its GIF tag, which sets
+    # PRIM, has gone through the GIF first).
     'runtime/src/gs/gs.hpp': [
         ('''namespace ps2::gs {
 ''', '''namespace g3 { struct Gpu; }   // ps2run_3ds_patch.py
@@ -6062,7 +6063,7 @@ namespace ps2::gs {
 ''', ),
         ('''void write(std::uint32_t reg, std::uint64_t value);
 ''', '''void write(std::uint32_t reg, std::uint64_t value);
-bool draw_g3(std::uint64_t prim, const ::g3::Gpu &g);   // ps2run_3ds_patch.py: false when the PICA renderer cannot take it
+bool draw_g3(const ::g3::Gpu &g);   // ps2run_3ds_patch.py: false when the PICA renderer cannot take it (PRIM already set)
 '''),
     ],
     'runtime/src/gs/gs.cpp': [
@@ -6103,15 +6104,14 @@ void draw_gpu(const State &s) {
 }
 #endif
 
-bool draw_g3(std::uint64_t prim, const ::g3::Gpu &g) {   // ps2run_3ds_patch.py
+bool draw_g3(const ::g3::Gpu &g) {   // ps2run_3ds_patch.py
 #ifdef PS2_PICA
     if (!pica::active() || !pica::g3_ready()) return false;
-    write(0x00, prim);
     if (!queue::g_skip_picture && !pica::draw_g3(g_state, gpu_clamp(g_state), g)) return false;
     ++g_primitives;
     return true;
 #else
-    (void)prim, (void)g;
+    (void)g;
     return false;
 #endif
 }
