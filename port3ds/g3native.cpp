@@ -15,13 +15,16 @@
 //      and lighting (g3::gpu_batch, pica::draw_g3, port3ds/gs.v.pica). Close to the program's pictures, not exact. Batches
 //      it cannot take go to the model as in 1 (and from there to the program).
 #include "g3model.hpp"
+#include "prof.hpp"
 
 #include "gs/gif.hpp"
 #include "gs/gs.hpp"
 #include "gs/queue.hpp"
 #include "hw.hpp"
+#include "vif.hpp"
 #include "vu_micro.hpp"
 #include "ps2/cpu.hpp"
+#include "ps2/vu_ops.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -31,11 +34,19 @@
 namespace gen {
 void vu1_CBE8B2DF5F7B4F30(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic (042): the MSCNT resume at 0x3968
 void vu1_82FF17C192C71968(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin (064): the MSCNT resume at 0x3C38
+void vu1_83B534FABA285679(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic (042): MSCAL 0 init + first batch
+void vu1_85768FB5F27F6386(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin (064): MSCAL 0 init + first batch
+void vu1_B81B4869B7719058(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin_ortho (065): MSCAL 0 init + first batch
+void vu1_E57D01C0AE2CD050(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin_ortho (065): MSCNT resume at 0x3138
+void vu1_2AC0382C206276EB(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX (043): MSCAL 0 init + first batch
+void vu1_3E7831392666D4FB(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX + UV1 xform (044): MSCAL 0 init + first batch
+void vu1_E2E9810EA328371C(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX (043/044): MSCNT resume at 0x3798
+void vu1_5CE717CC054A434F(ps2::Vu0Regs &r, std::uint8_t *mem);   // RwIm2D 2D triangle list (MSCAL 0)
 }
 
 namespace g3native {
 
-int g_mode = 0;
+int g_mode = -1;   // automatic until the renderer has started
 std::uint32_t g_gpu_mask = 7;   // test aid "g3gpu N": what the GPU path may take: 1 generic, 2 skin, 4 lit batches; 8 draws both facings,
                                 // 16 no directional light colours, 32 no normals, 64 no light directions, 128 leave out
 std::uint32_t g_capture_left = 0, g_capture_every = 7;
@@ -46,6 +57,7 @@ struct Stats {
     std::uint64_t batches[2], native[2], declined[2], compared[2], mismatched[2], state_differs[2], gpu[2];
     std::uint64_t gpu_declined[g3::kGpuDeclines];
     std::uint64_t not_modelled[2][4];   // by flags: strip, clipper, guard band clipper, list
+    std::uint64_t direct_hit, direct_miss, ortho_gpu, dual_gpu, im2d_batches;
 };
 Stats g_stats{};
 std::vector<std::uint8_t> g_model_out, g_real_out;
@@ -81,11 +93,75 @@ bool same_for_gs(const std::uint8_t *model, std::size_t model_bytes, const std::
     return at == a.size();
 }
 
-int program_of(std::uint32_t address) {
-    const std::uintptr_t fn = ps2::vu::program_at(address);
+int program_of(std::uintptr_t fn, bool &mscal0) {
+    mscal0 = false;
     if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_CBE8B2DF5F7B4F30)) return 42;
     if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_82FF17C192C71968)) return 64;
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_83B534FABA285679)) { mscal0 = true; return 42; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_85768FB5F27F6386)) { mscal0 = true; return 64; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_B81B4869B7719058)) { mscal0 = true; return 65; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_E57D01C0AE2CD050)) return 65;
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_2AC0382C206276EB)) { mscal0 = true; return 43; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_3E7831392666D4FB)) { mscal0 = true; return 44; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_E2E9810EA328371C)) {
+        const std::uintptr_t p0 = ps2::vu::program_at(0);
+        if (p0 == reinterpret_cast<std::uintptr_t>(&gen::vu1_2AC0382C206276EB)) return 43;
+        if (p0 == reinterpret_cast<std::uintptr_t>(&gen::vu1_3E7831392666D4FB)) return 44;
+    }
     return 0;
+}
+
+bool try_im2d_tris() {
+    if (g_mode != 4 || ps2::gs::queue::g_split_pica) return false;
+    ps2::vif::flush_deferred_unpacks();
+    const std::uint32_t top = ps2::vu::data_top() & 1023u;
+    const std::uint32_t count = ps2::vu::data_itop() & 1023u;
+    std::uint8_t *mem = ps2::g_vu1_mem;
+    ps2::Vu0Regs &r = ps2::vu::regs(1);
+    const std::uint16_t i11_start = static_cast<std::uint16_t>((top + 192u) & 0xFFFFu);
+    if (count == 0) {
+        const std::uint32_t v = i11_start;
+        std::memcpy(mem + 1023u * 16u + 12u, &v, 4);
+        r.vi[14] = 4080u;
+        r.vi[10] = static_cast<std::uint16_t>(top);
+        r.vi[12] = 0u;
+        r.vi[11] = i11_start;
+        r.tpc = 360u;
+        return true;
+    }
+    if (count > 64u || !(ps2::gs::g_state.prmodecont & 1u)) return false;
+    std::uint32_t tag[4];
+    std::memcpy(tag, mem + 1018u * 16u, 16);
+    if (!(tag[1] & (1u << 14)) || ((tag[1] >> 26) & 3u) != 0u || ((tag[1] >> 28) & 15u) != 3u) return false;
+    const std::uint32_t regs = tag[2] & 0xFFFu;
+    if (regs != 0x412u && regs != 0x512u) return false;
+    const std::uint64_t prim = (tag[1] >> 15) & 0x7FFu;
+    const std::uint32_t ptype = static_cast<std::uint32_t>(prim & 7u);
+    if ((ptype < 3u || ptype > 5u) || (prim & 0x100u)) return false;
+    ps2::gif::release_if_pending();
+    const std::uint64_t saved_prim = ps2::gs::g_state.prim;
+    if ((saved_prim & ~7ull) != (prim & ~7ull)) ++ps2::gs::g_setup_generation;
+    ps2::gs::g_state.prim = prim;
+    ps2::gs::g_state.count = 0;
+    if (!ps2::gs::draw_im2d_tris(mem, top, count, regs == 0x412u)) {
+        ps2::gs::g_state.prim = saved_prim;
+        ++ps2::gs::g_setup_generation;
+        return false;
+    }
+    float last_q;
+    std::memcpy(&last_q, mem + ((top + 12u * (count - 1u) + 9u) & 1023u) * 16u + 8u, 4);
+    ps2::gs::g_state.q = last_q;
+    const std::uint32_t v = i11_start;
+    std::memcpy(mem + 1023u * 16u + 12u, &v, 4);
+    r.vi[1] = 32768u;
+    r.vi[10] = static_cast<std::uint16_t>((top + 12u * count) & 0xFFFFu);
+    r.vi[11] = static_cast<std::uint16_t>((i11_start + 10u * count) & 0xFFFFu);
+    r.vi[12] = 0u;
+    r.vi[13] = i11_start;
+    r.vi[14] = 4080u;
+    r.tpc = 360u;
+    ++g_stats.im2d_batches;
+    return true;
 }
 
 g3::Input input_of(int program, const ps2::Vu0Regs &r, const std::uint8_t *mem) {
@@ -94,8 +170,8 @@ g3::Input input_of(int program, const ps2::Vu0Regs &r, const std::uint8_t *mem) 
     in.mem = mem;
     in.top = ps2::vu::data_top();
     in.itop = ps2::vu::data_itop();
-    for (int i = 0; i < 32; ++i) std::memcpy(in.vf[i], &r.vf[i], 16);
-    std::memcpy(in.vi, r.vi, sizeof in.vi);
+    static_assert(sizeof r.vf == 32 * 16);
+    in.vf = reinterpret_cast<const std::uint8_t *>(&r.vf);
     return in;
 }
 
@@ -130,8 +206,11 @@ void report() {
                  static_cast<unsigned long long>(g_stats.compared[1]), static_cast<unsigned long long>(g_stats.mismatched[1]),
                  static_cast<unsigned long long>(g_stats.state_differs[1]));
     if (g_mode == 4)
-        std::fprintf(stderr, "[g3] GPU: generic %llu, skin %llu; declined: %llu not modelled, %llu bones, %llu lights, %llu range, %llu prim, %llu clipper depth\n",
-                     static_cast<unsigned long long>(g_stats.gpu[0]), static_cast<unsigned long long>(g_stats.gpu[1]),
+        std::fprintf(stderr, "[g3] GPU: generic %llu (dual %llu), skin %llu (ortho %llu, im2d %llu, direct %llu, miss %llu); declined: %llu not modelled, %llu bones, %llu lights, %llu range, %llu prim, %llu clipper depth\n",
+                     static_cast<unsigned long long>(g_stats.gpu[0]), static_cast<unsigned long long>(g_stats.dual_gpu),
+                     static_cast<unsigned long long>(g_stats.gpu[1]),
+                     static_cast<unsigned long long>(g_stats.ortho_gpu), static_cast<unsigned long long>(g_stats.im2d_batches),
+                     static_cast<unsigned long long>(g_stats.direct_hit), static_cast<unsigned long long>(g_stats.direct_miss),
                      static_cast<unsigned long long>(g_stats.gpu_declined[g3::kGpuNotModelled]),
                      static_cast<unsigned long long>(g_stats.gpu_declined[g3::kGpuBoneCount]),
                      static_cast<unsigned long long>(g_stats.gpu_declined[g3::kGpuLights]),
@@ -151,7 +230,7 @@ std::uint64_t g_probe_class[2][4], g_probe_logged = 0;
 void probe_declined(int program, const ps2::Vu0Regs &before, const ps2::Vu0Regs &after) {
     std::uint32_t flags[4];
     std::memcpy(flags, g_mem_before + 0x3FF * 16, 16);
-    const int k = program == 64;
+    const int k = (program == 64 || program == 65) ? 1 : 0;
     const int c = (flags[0] & 2u) ? ((flags[0] & 8u) ? 1 : 2) : (flags[0] & 4u) ? 3 : 0;
     ++g_probe_class[k][c];
     if (c == 3) {
@@ -209,50 +288,162 @@ void probe_declined(int program, const ps2::Vu0Regs &before, const ps2::Vu0Regs 
 }
 
 bool hook(std::uint32_t address) {
-    const int program = program_of(address);
+    const std::uintptr_t fn = ps2::vu::program_at(address);
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_5CE717CC054A434F)) return try_im2d_tris();
+    bool mscal0 = false;
+    const int program = program_of(fn, mscal0);
     if (!program) return false;
-    const int k = program == 64;
+    const int k = (program == 64 || program == 65) ? 1 : 0;
     ps2::Vu0Regs &r = ps2::vu::regs(1);
     if (++g_stats.batches[k] % 20000 == 0) report();
     g_model_ends.clear();
+    // For MSCAL 0, save only the fields init_state modifies (~94 B instead of copying all 600 B of Vu0Regs twice).
+    struct SavedInit {
+        ps2::Reg128 vf28[4], vf2;
+        std::uint32_t i_reg, mem_i12;
+        std::uint16_t vi12, vi13, vi14;
+    };
+    SavedInit saved_init;
+    const bool do_init = mscal0 && (g_mode == 1 || g_mode == 4);
+    if (do_init) {
+        std::memcpy(saved_init.vf28, &r.vf[28], sizeof saved_init.vf28);
+        saved_init.vf2 = r.vf[2];
+        saved_init.i_reg = r.i;
+        saved_init.vi12 = r.vi[12];
+        saved_init.vi13 = r.vi[13];
+        saved_init.vi14 = r.vi[14];
+        std::memcpy(&saved_init.mem_i12, ps2::g_vu1_mem + 0x3FF * 16 + 4, 4);
+        g3::init_state(program, ps2::g_vu1_mem, r);
+    }
+    ps2::Vu0Regs &r_use = r;
+    auto restore_init = [&]() {
+        if (!do_init) return;
+        std::memcpy(&r.vf[28], saved_init.vf28, sizeof saved_init.vf28);
+        r.vf[2] = saved_init.vf2;
+        r.i = saved_init.i_reg;
+        r.vi[12] = saved_init.vi12;
+        r.vi[13] = saved_init.vi13;
+        r.vi[14] = saved_init.vi14;
+        std::memcpy(ps2::g_vu1_mem + 0x3FF * 16 + 4, &saved_init.mem_i12, 4);
+    };
     // The GPU path draws on this thread, so not while the renderer runs on its own (split GS).
     if (g_mode == 4 && !ps2::gs::queue::g_split_pica) {
         g3::End end;
-        int got = g3::gpu_batch(input_of(program, r, ps2::g_vu1_mem), g_gpu, end);
-        if (got == 0) {
+        int got;
+        g3::Input in = input_of(program, r_use, ps2::g_vu1_mem);
+        ps2::vif::DirectStreams vds;
+        g3::DirectStreams ds;
+        bool tried_direct = false;
+        if (ps2::vif::get_g3_streams(in.top, k ? 5u : 4u, vds)) {
+            ds.top = vds.top;
+            ds.stride = vds.stride;
+            ds.mask = vds.mask;
+            for (int i = 0; i < 5; ++i)
+                ds.s[i] = g3::DirectStream{vds.s[i].src, vds.s[i].num, vds.s[i].vn, vds.s[i].vl, vds.s[i].usn};
+            in.streams = &ds;
+            tried_direct = true;
+        } else {
+            ps2::vif::flush_deferred_unpacks();
+        }
+        g3::BatchPlan plan{};
+        {
+            PS2_PROF_EXTRA(8);   // for SAMPLE=1: reading the batch for the GPU, apart from the VIF work around it (x4)
+            got = g3::gpu_batch_setup(in, g_gpu, end, plan);
+            if (got == -2) {
+                ++g_stats.direct_miss;
+                ps2::vif::flush_deferred_unpacks();
+                in.streams = nullptr;
+                got = g3::gpu_batch_setup(in, g_gpu, end, plan);
+            } else if (tried_direct) {
+                ++g_stats.direct_hit;
+            }
+        }
+        if (got == 0 && g_gpu_mask != 7u) {
             const bool lit = g_gpu.ambient[0] != 0.0f || g_gpu.ambient[1] != 0.0f || g_gpu.ambient[2] != 0.0f || g_gpu.light_colour[0][0] != 0.0f ||
                              g_gpu.light_colour[0][1] != 0.0f || g_gpu.light_colour[0][2] != 0.0f;
             if (!(g_gpu_mask & (k ? 2u : 1u)) || (lit && !(g_gpu_mask & 4u))) got = g3::kGpuNotModelled;
             if (g_gpu_mask & 8u) g_gpu.keep_negative = g_gpu.keep_positive = true;
             if (g_gpu_mask & 16u) std::memset(g_gpu.light_colour, 0, sizeof g_gpu.light_colour);
-            if (g_gpu_mask & 32u)
-                for (unsigned i = 0; i < g_gpu.n; ++i) g_gpu.v[i].normal[0] = g_gpu.v[i].normal[1] = g_gpu.v[i].normal[2] = 0;
             if (g_gpu_mask & 64u) std::memset(g_gpu.light_dir, 0, sizeof g_gpu.light_dir);
+            if (got == 0 && (g_gpu_mask & 128u)) got = -1;   // test aid: leave the batch out
         }
-        if (got == 0 && (g_gpu_mask & 128u)) got = -1;   // test aid: leave the batch out
+        bool drew = got < 0;
         if (got == 0) {
-            // The batch's GIF tag alone (NLOOP 0) goes through the GIF as the program's packet would start: it sets PRIM,
-            // and the GIF also does what it does at every tag (Q back to 1, PATH3 data held back while masked let through).
-            alignas(16) std::uint8_t tag[16];
-            std::memcpy(tag, ps2::g_vu1_mem + 0x3FA * 16, 16);
-            const std::uint32_t eop = 0x8000u;
-            std::memcpy(tag, &eop, 4);
-            ps2::gif::transfer(1, tag, 1);
+            if (!plan.dual && !plan.list && !(g_gpu_mask & 32u)) {
+                ps2::gif::release_if_pending();
+                const std::uint64_t saved_prim = ps2::gs::g_state.prim;
+                ps2::gs::g_state.q = 1.0f;
+                ps2::gs::g_state.count = 0;
+                if ((saved_prim & ~7ull) != (g_gpu.prim & ~7ull)) ++ps2::gs::g_setup_generation;
+                ps2::gs::g_state.prim = g_gpu.prim;
+                const int rc = ps2::gs::draw_g3_direct(in, g_gpu, plan);
+                if (rc == 0) {
+                    drew = true;
+                } else {
+                    if (rc > 0) got = rc;
+                    ps2::gs::g_state.prim = saved_prim;
+                    ++ps2::gs::g_setup_generation;
+                }
+            } else {
+                {
+                    PS2_PROF_EXTRA(8);
+                    got = g3::gpu_batch_fill(in, g_gpu, plan, g_gpu.v);
+                }
+                if (got == 0 && (g_gpu_mask & 32u))
+                    for (unsigned i = 0; i < g_gpu.n; ++i) g_gpu.v[i].normal[0] = g_gpu.v[i].normal[1] = g_gpu.v[i].normal[2] = 0;
+                if (got == 0) {
+                    if (plan.dual) {
+                        ps2::vu::kick(1, 957u);
+                        ps2::gif::release_if_pending();
+                        ps2::gs::g_state.q = 1.0f;
+                        ps2::gs::g_state.count = 0;
+                        if ((ps2::gs::g_state.prim & ~7ull) != (g_gpu.prim & ~7ull)) ++ps2::gs::g_setup_generation;
+                        ps2::gs::g_state.prim = g_gpu.prim;
+                        if (ps2::gs::draw_g3(g_gpu)) {
+                            ps2::vu::kick(1, 960u);
+                            ps2::gif::release_if_pending();
+                            ps2::gs::g_state.q = 1.0f;
+                            ps2::gs::g_state.count = 0;
+                            if ((ps2::gs::g_state.prim & ~7ull) != (g_gpu.prim2 & ~7ull)) ++ps2::gs::g_setup_generation;
+                            ps2::gs::g_state.prim = g_gpu.prim2;
+                            g_gpu.prim = g_gpu.prim2;
+                            for (std::uint32_t i = 0; i < g_gpu.n; ++i) {
+                                g_gpu.v[i].u = g_gpu.uv2[i][0];
+                                g_gpu.v[i].v = g_gpu.uv2[i][1];
+                            }
+                            drew = ps2::gs::draw_g3(g_gpu);
+                        }
+                    } else {
+                        ps2::gif::release_if_pending();
+                        ps2::gs::g_state.q = 1.0f;
+                        ps2::gs::g_state.count = 0;
+                        if ((ps2::gs::g_state.prim & ~7ull) != (g_gpu.prim & ~7ull)) ++ps2::gs::g_setup_generation;
+                        ps2::gs::g_state.prim = g_gpu.prim;
+                        drew = ps2::gs::draw_g3(g_gpu);
+                    }
+                }
+            }
         }
-        if (got <= 0 && (got < 0 || ps2::gs::draw_g3(g_gpu))) {
+        if (got <= 0 && drew) {
+            ps2::vif::discard_deferred_unpacks();
             g3::leave_state(program, end, r);
             ++g_stats.gpu[k];
+            if (program == 65) ++g_stats.ortho_gpu;
+            if (program == 43 || program == 44) ++g_stats.dual_gpu;
             return true;
         }
+        ps2::vif::flush_deferred_unpacks();
         ++g_stats.gpu_declined[got > 0 ? got : 0];
         if (got == g3::kGpuNotModelled) {
             const std::uint32_t flags = ps2::g_vu1_mem[0x3FF * 16];
             ++g_stats.not_modelled[k][(flags & 2u) ? ((flags & 8u) ? 1 : 2) : (flags & 4u) ? 3 : 0];
         }
     }
+    ps2::vif::flush_deferred_unpacks();
     if (g_mode == 1 || g_mode == 4) {
         g3::End end;
-        if (!g3::run(input_of(program, r, ps2::g_vu1_mem), g_model_out, g_model_ends, end)) {
+        if (!g3::run(input_of(program, r_use, ps2::g_vu1_mem), g_model_out, g_model_ends, end)) {
+            restore_init();
             ++g_stats.declined[k];
             return false;
         }
@@ -266,6 +457,7 @@ bool hook(std::uint32_t address) {
         return true;
     }
     // Compare (and capture): the model on the memory as the program finds it, then the program itself.
+    if (mscal0) return false;
     const ps2::Vu0Regs before = r;
     std::memcpy(g_mem_before, ps2::g_vu1_mem, sizeof g_mem_before);
     g3::End end;
@@ -314,7 +506,8 @@ bool hook(std::uint32_t address) {
 
 }
 
-void start() {
+void start(bool gpu_available) {
+    if (g_mode == -1) g_mode = gpu_available ? 4 : 0;
     if (g_mode) ps2::vu::g_native_hook = hook;
 }
 

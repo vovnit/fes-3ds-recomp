@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace g3 { struct Gpu; }
+namespace g3 { struct Gpu; struct Input; struct BatchPlan; }
 
 namespace ps2::gs {
 
@@ -34,13 +34,15 @@ void draw(const State &s, std::uint32_t serial, std::uint64_t clamp);
 // g3_ready: init found the shader's g3 uniforms where draw_g3 expects them.
 bool g3_ready();
 bool draw_g3(const State &s, std::uint64_t clamp, const ::g3::Gpu &g);
+int draw_g3_direct(const State &s, std::uint64_t clamp, const ::g3::Input &in, ::g3::Gpu &g, const ::g3::BatchPlan &plan);
+bool draw_im2d_tris(const State &s, std::uint64_t clamp, const std::uint8_t *vu_mem, std::uint32_t top, std::uint32_t count, bool xyzf);
 extern bool g_after_hidden;      // set by next_picture(): the picture after the one it chose will be skipped
 extern bool g_render_left_out;   // set by lossy_return (native3ds.cpp): next_picture() must not show the picture being built
 std::uint32_t next_picture();   // on the game thread at each PS2 vblank: what the next picture is, passed on to vblank()
 void advance_vu_picture(std::uint32_t picture);
 void vblank(std::uint32_t frame, const DisplayRegs &regs, std::uint32_t picture);   // a PS2 vblank, with what was on show then
 void note_transfer(const State &s, std::uint64_t dir);   // a transfer into GS memory starts
-void note_data(const std::uint8_t *data, std::size_t bytes);   // bytes of that transfer
+void note_data(const std::uint8_t *data, std::size_t bytes, std::uint32_t known_hash = 0);   // bytes of that transfer
 void note_clut();                                        // the palette in g_state.clut was reloaded
 void shutdown();
 

@@ -63,6 +63,7 @@ def main():
             assert now[:12] == old[:12]
             if old[12:16] != b"\0\0\1\xe0":
                 assert now == old
+        assert M.picture_size(M.scan(new)[1])[:2] == (640, 16)
         raw = subprocess.run(["ffmpeg", "-v", "error", "-f", "mpegvideo", "-i", "-", "-vf", "crop=640:16:0:0", "-pix_fmt", "gray", "-f", "rawvideo", "-"],
                              input=M.scan(new)[1], stdout=subprocess.PIPE, check=True).stdout
         assert len(raw) == pictures * 640 * 16, "the cheap movie has another number of pictures"

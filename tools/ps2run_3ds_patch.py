@@ -6121,6 +6121,3185 @@ bool draw_g3(const ::g3::Gpu &g) {   // ps2run_3ds_patch.py
 
 
 
+# Core 0 dispatch/fast-target, Core 2 deferred GS uploads & direct CLUTs, VIF/DMAC/queue optimizations.
+RT_OPT_EDITS = {
+    'runtime/include/ps2/generated.hpp': [
+        ('''void register_units(const UnitInfo *units, std::uint32_t count);
+void register_modules(const ModuleInfo *modules, std::uint32_t count);
+
+void dispatch(Cpu &c, std::uint32_t entry);
+''',
+         '''void register_units(const UnitInfo *units, std::uint32_t count);
+void register_modules(const ModuleInfo *modules, std::uint32_t count);
+using FastFn = bool (*)(Cpu &);
+struct FastTarget {
+    std::uint32_t pc;
+    FastFn fn;
+    bool is_native;
+};
+void register_fast_targets(const FastTarget *targets, std::uint32_t count);
+
+void dispatch(Cpu &c, std::uint32_t entry);
+'''),
+    ],
+    'runtime/include/ps2/system.hpp': [
+        ('''#define PS2_PROF(counter)
+#define PS2_PROF_EXTRA(k)
+#define PS2_SAMPLE_VU(fn)
+#endif
+''',
+         '''#define PS2_PROF(counter)
+#define PS2_PROF_EXTRA(k)
+#define PS2_SAMPLE_VU(fn)
+#endif
+#ifdef PS2_PICA
+#include "prof.hpp"
+#else
+#define PS2_PROF(counter)
+#define PS2_SAMPLE_VU(fn)
+#endif
+'''),
+        ('''#endif
+void stop_vu_thread();
+void run_vu_thread();
+double vu_thread_idle_ms();
+''',
+         '''#endif
+void stop_vu_thread();
+void abort_vu_thread();
+bool vu_aborting();
+void run_vu_thread();
+double vu_thread_idle_ms();
+'''),
+    ],
+    'runtime/src/dispatch.cpp': [
+        ('''std::uint32_t g_origin = 0;
+std::uint32_t g_unit_size = 1;
+std::set<std::uint32_t> g_misses;
+std::set<std::string> g_module_misses;
+''',
+         '''std::uint32_t g_origin = 0;
+std::uint32_t g_unit_size = 1;
+std::uint32_t g_unit_shift = 0;
+struct FastEntry {
+    std::uint32_t pc_tag;
+    FastFn fn;
+};
+constexpr std::uint32_t kFastMask = 1023u;
+FastEntry g_fast[kFastMask + 1u]{};
+bool g_has_fast = false;
+std::set<std::uint32_t> g_misses;
+std::set<std::string> g_module_misses;
+'''),
+        ('''}
+
+const UnitInfo *unit_for(std::uint32_t pc) {
+    const std::uint32_t slot = (pc - g_origin) / g_unit_size;
+    if (pc < g_origin || slot >= g_index.size()) return nullptr;
+    return g_index[slot];
+}
+
+''',
+         '''}
+
+inline const UnitInfo *unit_for(std::uint32_t pc) {
+    if (pc < g_origin) return nullptr;
+    const std::uint32_t slot = g_unit_shift ? ((pc - g_origin) >> g_unit_shift) : ((pc - g_origin) / g_unit_size);
+    if (slot >= g_index.size()) return nullptr;
+    return g_index[slot];
+}
+
+[[gnu::always_inline]] inline bool try_fast(Cpu &c, std::uint32_t pc) {
+    if (!g_has_fast || (pc & 3u)) return false;
+    std::uint32_t slot = ((pc >> 2) * 2654435761u) >> 22;
+    for (;;) {
+        const FastEntry &e = g_fast[slot];
+        const std::uint32_t tag = e.pc_tag;
+        if (!tag) return false;
+        if ((tag & ~1u) == pc) {
+            if (e.fn(c)) {
+                if (tag & 1u) c.pc = c.r[31].w[0];
+                return true;
+            }
+            return false;
+        }
+        slot = (slot + 1u) & kFastMask;
+    }
+}
+
+'''),
+        ('''    g_origin = g_units.front().base;
+    g_unit_size = g_units.front().size;
+    g_index.assign((g_units.back().base - g_origin) / g_unit_size + 1, nullptr);
+    for (const UnitInfo &u : g_units) g_index[(u.base - g_origin) / g_unit_size] = &u;
+}
+
+''',
+         '''    g_origin = g_units.front().base;
+    g_unit_size = g_units.front().size;
+    g_unit_shift = (g_unit_size && (g_unit_size & (g_unit_size - 1u)) == 0) ? static_cast<std::uint32_t>(__builtin_ctz(g_unit_size)) : 0u;
+    g_index.assign((g_units.back().base - g_origin) / g_unit_size + 1, nullptr);
+    for (const UnitInfo &u : g_units) g_index[(u.base - g_origin) / g_unit_size] = &u;
+}
+
+void register_fast_targets(const FastTarget *targets, std::uint32_t count) {
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t pc = targets[i].pc;
+        if (!pc || (pc & 3u) || !targets[i].fn) continue;
+        std::uint32_t slot = ((pc >> 2) * 2654435761u) >> 22;
+        for (std::uint32_t p = 0; p <= kFastMask; ++p) {
+            FastEntry &e = g_fast[slot];
+            if (!e.pc_tag || (e.pc_tag & ~1u) == pc) {
+                e = FastEntry{pc | (targets[i].is_native ? 1u : 0u), targets[i].fn};
+                g_has_fast = true;
+                break;
+            }
+            slot = (slot + 1u) & kFastMask;
+        }
+    }
+}
+
+'''),
+        ('''    const std::uint32_t pc = c.pc;
+    if (pc & kUnwind) return;
+    if (g_comm.enabled != 0) comm_trace(c, pc);
+    if (pc == kHandlerReturn || pc == kIdle) return;
+    const UnitInfo *u = unit_for(pc);
+    const std::uint16_t id = u ? u->entries[(pc - u->base) >> 2] : 0;
+''',
+         '''    const std::uint32_t pc = c.pc;
+    if (pc & kUnwind) return;
+#ifndef __3DS__
+    if (g_comm.enabled != 0) comm_trace(c, pc);
+#endif
+    if (pc == kHandlerReturn || pc == kIdle) return;
+#ifdef __3DS__
+    if (try_fast(c, pc)) return;
+#endif
+    const UnitInfo *u = unit_for(pc);
+    const std::uint16_t id = u ? u->entries[(pc - u->base) >> 2] : 0;
+'''),
+        ('''    c.pc = target;
+    if (!stack_ok()) return;
+    dispatch(c, 0);
+}
+''',
+         '''    c.pc = target;
+    if (!stack_ok()) return;
+#ifdef __3DS__
+    if (try_fast(c, target)) return;
+#endif
+    dispatch(c, 0);
+}
+'''),
+    ],
+    'runtime/src/dmac.cpp': [
+        ('''    const std::size_t room = (address & 0x80000000u) ? kScratchpadSize - (address & (kScratchpadSize - 1)) : kRamSize - (address & (kRamSize - 16));
+    const std::uint8_t *data = source(address);
+    if (bytes > room || ch == 9) {
+        buffer.resize(bytes);
+''',
+         '''    const std::size_t room = (address & 0x80000000u) ? kScratchpadSize - (address & (kScratchpadSize - 1)) : kRamSize - (address & (kRamSize - 16));
+    const std::uint8_t *data = source(address);
+    if (ch == 9 && bytes <= room) {
+        std::uint32_t sadr = g_ch[9].sadr & (kScratchpadSize - 1);
+        std::uint32_t left = qwc;
+        const std::uint8_t *src = data;
+        while (left) {
+            const std::uint32_t n = std::min<std::uint32_t>(left, (kScratchpadSize - sadr) / 16u);
+            std::memcpy(g_spr + sadr, src, static_cast<std::size_t>(n) * 16u);
+            src += static_cast<std::size_t>(n) * 16u;
+            sadr = (sadr + n * 16u) & (kScratchpadSize - 1);
+            left -= n;
+        }
+        g_ch[9].sadr = sadr;
+        return;
+    }
+    if (bytes > room || ch == 9) {
+        buffer.resize(bytes);
+'''),
+        ('''        const std::uint32_t addr = static_cast<std::uint32_t>(tag >> 32) & 0x7FFFFFF0u;
+        const std::uint32_t addr_full = addr | (static_cast<std::uint32_t>(tag >> 63) << 31);
+        if (tte && (ch == 0 || ch == 1)) {
+            std::uint8_t q[16];
+''',
+         '''        const std::uint32_t addr = static_cast<std::uint32_t>(tag >> 32) & 0x7FFFFFF0u;
+        const std::uint32_t addr_full = addr | (static_cast<std::uint32_t>(tag >> 63) << 31);
+#ifdef PS2_PICA
+        std::uint32_t tte_words[2];
+        bool tte_deferred = false;
+        if (tte && (ch == 0 || ch == 1)) {
+            std::memcpy(tte_words, tagp + 8, 8);
+            if (ch == 1 && qwc) {
+                tte_deferred = true;
+            } else {
+                vif::transfer_tte(ch, tte_words);
+            }
+        }
+#else
+        if (tte && (ch == 0 || ch == 1)) {
+            std::uint8_t q[16];
+'''),
+        ('''            vif::transfer(ch, q, 1);
+        }
+        bool end = false;
+        const std::uint32_t tag_at = c.tadr;
+''',
+         '''            vif::transfer(ch, q, 1);
+        }
+#endif
+        bool end = false;
+        const std::uint32_t tag_at = c.tadr;
+'''),
+        (r'''        if (trace_tags && ch == 1) std::fprintf(stderr, "[dma] ch1 tag at 0x%08X id %u qwc %u irq %d addr 0x%08X next 0x%08X\n", tag_at, id, qwc, irq ? 1 : 0, addr_full, c.tadr);
+        if (mfifo && (id == 1 || id == 7)) {
+            deliver_ring(ch, data, qwc);
+            c.madr = ring(data + qwc * 16);
+        } else {
+            deliver(ch, data, qwc);
+            c.madr = data + qwc * 16;
+''',
+         r'''        if (trace_tags && ch == 1) std::fprintf(stderr, "[dma] ch1 tag at 0x%08X id %u qwc %u irq %d addr 0x%08X next 0x%08X\n", tag_at, id, qwc, irq ? 1 : 0, addr_full, c.tadr);
+        if (mfifo && (id == 1 || id == 7)) {
+#ifdef PS2_PICA
+            const std::uint32_t ring_room = ((g_rbsr - (data & g_rbsr)) >> 4) + 1u;
+            const std::size_t bytes = static_cast<std::size_t>(qwc) * 16u;
+            const std::size_t ram_room = kRamSize - (data & (kRamSize - 16u));
+            if (ch == 1 && qwc && qwc <= ring_room && bytes <= ram_room) {
+                if (tte_deferred) vif::transfer_tte_data(1, tte_words, source(data), qwc, false);
+                else vif::transfer_dynamic(1, source(data), qwc);
+            } else {
+                if (tte_deferred) vif::transfer_tte(1, tte_words);
+                deliver_ring(ch, data, qwc);
+            }
+#else
+            deliver_ring(ch, data, qwc);
+#endif
+            c.madr = ring(data + qwc * 16);
+        } else {
+#ifdef PS2_PICA
+            if (tte_deferred) {
+                const std::size_t bytes = static_cast<std::size_t>(qwc) * 16u;
+                const std::size_t room = (data & 0x80000000u) ? kScratchpadSize - (data & (kScratchpadSize - 1)) : kRamSize - (data & (kRamSize - 16));
+                if (bytes <= room) {
+                    vif::transfer_tte_data(1, tte_words, source(data), qwc, true);
+                } else {
+                    vif::transfer_tte(1, tte_words);
+                    deliver(1, data, qwc);
+                }
+            } else
+#endif
+            deliver(ch, data, qwc);
+            c.madr = data + qwc * 16;
+'''),
+    ],
+    'runtime/src/gs/gif.cpp': [
+        ('''        default: {
+            const std::uint32_t run = std::min(qwc - i, p.nloop - p.loop);
+            sink.image(data + static_cast<std::size_t>(i) * 16, run);
+            p.loop += run;
+            i += run - 1;
+''',
+         '''        default: {
+            const std::uint32_t run = std::min(qwc - i, p.nloop - p.loop);
+            sink.image(data + static_cast<std::size_t>(i) * 16, run, i);
+            p.loop += run;
+            i += run - 1;
+'''),
+        ('''struct GsSink {
+    int path;
+    void tag(const Path &p, const Reg128 &q) {
+        ++g_tags[path][p.flg];
+''',
+         '''struct GsSink {
+    int path;
+#ifdef PS2_PICA
+    std::uint32_t chunk_hash = 0;
+    bool ram_backed = false;
+#endif
+    void tag(const Path &p, const Reg128 &q) {
+        ++g_tags[path][p.flg];
+'''),
+        ('''    void packed(std::uint32_t reg, const Reg128 &q) { gs::write_packed(reg, q); }
+    void reglist(std::uint32_t reg, std::uint64_t value) { gs::write(reg, value); }
+    void image(const std::uint8_t *data, std::uint32_t qwords) { gs::write_image(data, qwords); }
+};
+
+''',
+         '''    void packed(std::uint32_t reg, const Reg128 &q) { gs::write_packed(reg, q); }
+    void reglist(std::uint32_t reg, std::uint64_t value) { gs::write(reg, value); }
+    void image(const std::uint8_t *data, std::uint32_t qwords, std::uint32_t qoff) {
+#ifdef PS2_PICA
+        const std::uint32_t h = chunk_hash ? ((chunk_hash ^ (qoff * 0x9E3779B1u) ^ (qwords * 0x85EBCA6Bu)) | 1u) : 0u;
+        gs::write_image(data, qwords, h, ram_backed);
+#else
+        (void)qoff;
+        gs::write_image(data, qwords);
+#endif
+    }
+};
+
+'''),
+        ('''}
+
+void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
+#ifdef PS2_PICA
+    if (gs::queue::g_split_pica && gs::queue::role() == gs::queue::Role::Vu) {
+        // The VU reuses its packet memory after this call. Copy complete qwords
+        // into the ring; the GS retains the parser state across chunks.
+''',
+         '''}
+
+void render_chunk(int path, const std::uint8_t *data, std::uint32_t qwc, std::uint32_t known_hash, bool ram_backed) {
+#ifdef PS2_PICA
+    if (gs::queue::g_split_pica && gs::queue::is_vu_thread()) {
+        // The VU reuses its packet memory after this call. Copy complete qwords
+        // into the ring; the GS retains the parser state across chunks.
+'''),
+        ('''        return;
+    }
+#endif
+    GsSink sink{path};
+    walk(g_paths[path], data, qwc, sink);
+}
+
+void transfer_direct(int path, const std::uint8_t *data, std::uint32_t qwc);
+
+namespace {
+std::vector<std::uint8_t> g_pend3;
+std::size_t g_pend3_head = 0;   // bytes already sent: moving what is left down on every packet took 200 MB of copying per picture
+bool g_released = false;
+bool g_vmask = false;  // the VU thread's own view of the mask (threaded build)
+bool mask_up() { return gs::queue::vu_active() ? g_vmask : (g_stat & 2u) != 0; }
+
+// Length in qwords of the GIF packet (tags up to and including the next one with EOP) at the front of the queue.
+''',
+         '''        return;
+    }
+    GsSink sink{path, known_hash, ram_backed};
+#else
+    (void)known_hash, (void)ram_backed;
+    GsSink sink{path};
+#endif
+    walk(g_paths[path], data, qwc, sink);
+}
+
+void render(int path, const std::uint8_t *data, std::uint32_t qwc) { render_chunk(path, data, qwc, 0, false); }
+
+void transfer_direct(int path, const std::uint8_t *data, std::uint32_t qwc, std::uint32_t known_hash = 0, bool ram_backed = false);
+
+namespace {
+bool g_released = false;
+bool g_vmask = false;  // the VU thread's own view of the mask (threaded build)
+bool mask_up() { return gs::queue::vu_active() ? g_vmask : (g_stat & 2u) != 0; }
+
+#ifdef PS2_PICA
+struct Pend3Chunk {
+    const std::uint8_t *ram;   // non-null when zero-copy in g_ram
+    std::uint32_t buf_off;     // byte offset in g_pend3_buf when ram == nullptr
+    std::uint32_t qwc;
+    std::uint32_t hash;        // non-zero when ram came from unchanging()
+};
+std::vector<Pend3Chunk> g_pend3_chunks;
+std::size_t g_pend3_chunk_head = 0;
+std::uint32_t g_pend3_chunk_off = 0;
+std::vector<std::uint8_t> g_pend3_buf;
+std::size_t g_pend3_buf_head = 0;
+
+bool pend3_empty() { return g_pend3_chunk_head >= g_pend3_chunks.size(); }
+
+std::size_t pend3_qwords() {
+    std::size_t total = 0;
+    for (std::size_t i = g_pend3_chunk_head; i < g_pend3_chunks.size(); ++i)
+        total += g_pend3_chunks[i].qwc - (i == g_pend3_chunk_head ? g_pend3_chunk_off : 0u);
+    return total;
+}
+
+void pend3_reset_if_empty() {
+    if (g_pend3_chunk_head >= g_pend3_chunks.size()) {
+        g_pend3_chunks.clear();
+        g_pend3_chunk_head = 0;
+        g_pend3_chunk_off = 0;
+        g_pend3_buf.clear();
+        g_pend3_buf_head = 0;
+    }
+}
+
+void release(bool everything) {
+    if (everything) {
+        while (g_pend3_chunk_head < g_pend3_chunks.size()) {
+            const Pend3Chunk c = g_pend3_chunks[g_pend3_chunk_head++];
+            const std::uint32_t off = g_pend3_chunk_off;
+            g_pend3_chunk_off = 0;
+            const std::uint32_t n = c.qwc - off;
+            const std::uint8_t *ptr = (c.ram ? c.ram : g_pend3_buf.data() + c.buf_off) + static_cast<std::size_t>(off) * 16;
+            if (!c.ram) g_pend3_buf_head = c.buf_off + static_cast<std::size_t>(c.qwc) * 16;
+            const std::uint32_t h = c.hash ? (off == 0 ? c.hash : ((c.hash ^ (off * 0x9E3779B1u)) | 1u)) : 0u;
+            transfer_direct(3, ptr, n, h, c.ram != nullptr);
+        }
+        pend3_reset_if_empty();
+        return;
+    }
+    std::uint32_t tag_left = 0;
+    bool seen_eop = false;
+    while (g_pend3_chunk_head < g_pend3_chunks.size()) {
+        const Pend3Chunk c = g_pend3_chunks[g_pend3_chunk_head];
+        const std::uint8_t *base = c.ram ? c.ram : g_pend3_buf.data() + c.buf_off;
+        const std::uint32_t start = g_pend3_chunk_off;
+        std::uint32_t off = start;
+        while (off < c.qwc) {
+            if (tag_left == 0) {
+                std::uint64_t tag;
+                std::memcpy(&tag, base + static_cast<std::size_t>(off) * 16, 8);
+                const std::uint32_t nloop = static_cast<std::uint32_t>(tag) & 0x7FFFu;
+                const std::uint32_t flg = static_cast<std::uint32_t>(tag >> 58) & 3u;
+                std::uint32_t nreg = static_cast<std::uint32_t>(tag >> 60) & 0xFu;
+                if (!nreg) nreg = 16;
+                seen_eop = (tag >> 15) & 1u;
+                const std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+                tag_left = 1u + body;
+            }
+            const std::uint32_t take = std::min(c.qwc - off, tag_left);
+            off += take;
+            tag_left -= take;
+            if (tag_left == 0 && seen_eop) break;
+        }
+        const std::uint32_t n = off - start;
+        if (off >= c.qwc) {
+            ++g_pend3_chunk_head;
+            g_pend3_chunk_off = 0;
+            if (!c.ram) g_pend3_buf_head = c.buf_off + static_cast<std::size_t>(c.qwc) * 16;
+        } else {
+            g_pend3_chunk_off = off;
+        }
+        const std::uint32_t h = c.hash ? ((start == 0 && n == c.qwc) ? c.hash : ((c.hash ^ (start * 0x9E3779B1u) ^ (n * 0x85EBCA6Bu)) | 1u)) : 0u;
+        transfer_direct(3, base + static_cast<std::size_t>(start) * 16, n, h, c.ram != nullptr);
+        if (tag_left == 0 && seen_eop) break;
+    }
+    pend3_reset_if_empty();
+}
+#else
+std::vector<std::uint8_t> g_pend3;
+std::size_t g_pend3_head = 0;   // bytes already sent: moving what is left down on every packet took 200 MB of copying per picture
+bool pend3_empty() { return g_pend3.empty(); }
+std::size_t pend3_qwords() { return g_pend3.size() / 16; }
+
+// Length in qwords of the GIF packet (tags up to and including the next one with EOP) at the front of the queue.
+'''),
+        (r'''    }
+}
+}
+
+void flush_path3() {
+    if (gs::queue::vu_active() && gs::queue::role() != gs::queue::Role::Vu) {
+        gs::queue::post(gs::queue::kPath3Flush, 0, 0, nullptr, 0);
+        return;
+    }
+    static int shown = 0;
+    if (!g_pend3.empty() && shown++ < 20)
+        std::fprintf(stderr, "[path3] %zu qwords still waiting at vblank (masked %u, released %u)\n", g_pend3.size() / 16, (mask_up() ? 1u : 0u), g_released ? 1u : 0u);
+    if (g_released || !mask_up()) {
+        release(true);
+        g_released = false;
+''',
+         r'''    }
+}
+#endif
+}
+
+void flush_path3() {
+    if (gs::queue::vu_active() && !gs::queue::is_vu_thread()) {
+        gs::queue::post(gs::queue::kPath3Flush, 0, 0, nullptr, 0);
+        return;
+    }
+    static int shown = 0;
+    if (!pend3_empty() && shown++ < 20)
+        std::fprintf(stderr, "[path3] %zu qwords still waiting at vblank (masked %u, released %u)\n", pend3_qwords(), (mask_up() ? 1u : 0u), g_released ? 1u : 0u);
+    if (g_released || !mask_up()) {
+        release(true);
+        g_released = false;
+    }
+}
+
+void release_if_pending() {
+    if (g_released) {
+        release(true);
+        g_released = false;
+'''),
+        ('''// The VIF1 chain ended while PATH3 was left unmasked: the GIF had the rest of the frame to drain its queue.
+void chain_end() {
+    if (gs::queue::vu_active() && gs::queue::role() != gs::queue::Role::Vu) {
+        gs::queue::post(gs::queue::kPath3ChainEnd, 0, 0, nullptr, 0);
+        return;
+''',
+         '''// The VIF1 chain ended while PATH3 was left unmasked: the GIF had the rest of the frame to drain its queue.
+void chain_end() {
+    if (gs::queue::vu_active() && !gs::queue::is_vu_thread()) {
+        gs::queue::post(gs::queue::kPath3ChainEnd, 0, 0, nullptr, 0);
+        return;
+'''),
+        ('''}
+
+void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    if (path == 3 && gs::queue::vu_active() && gs::queue::role() != gs::queue::Role::Vu) {
+        transfer_direct(path, data, qwc);
+        return;
+    }
+''',
+         '''}
+
+void transfer_impl(int path, const std::uint8_t *data, std::uint32_t qwc, std::uint32_t known_hash, bool ram_backed) {
+    if (path == 3 && gs::queue::vu_active() && !gs::queue::is_vu_thread()) {
+        transfer_direct(path, data, qwc, known_hash, ram_backed);
+        return;
+    }
+'''),
+        ('''        g_released = false;
+    }
+    if (path == 3 && (mask_up() || !g_pend3.empty())) {
+        bool compact = g_pend3_head > g_pend3.size() / 2;   // only now and then, and only here, where the vector may move anyway
+#ifdef __3DS__
+        // Memory here has no room for this queue to double in size, so it gets a fixed block. A burst bigger than that goes out
+        // early, which risks a texture arriving ahead of its turn but not running out of memory.
+        constexpr std::size_t kPend3Limit = 2u << 20;
+        const std::size_t incoming = static_cast<std::size_t>(qwc) * 16;
+        if (!g_pend3.capacity()) g_pend3.reserve(kPend3Limit);
+        if (g_pend3.size() - g_pend3_head + incoming > kPend3Limit) release(true);
+        if (incoming > kPend3Limit) {
+            transfer_direct(path, data, qwc);
+            return;
+        }
+        compact = compact || g_pend3.size() + incoming > kPend3Limit;
+#endif
+        if (compact) {
+            g_pend3.erase(g_pend3.begin(), g_pend3.begin() + static_cast<std::ptrdiff_t>(g_pend3_head));
+''',
+         '''        g_released = false;
+    }
+    if (path == 3 && (mask_up() || !pend3_empty())) {
+#ifdef PS2_PICA
+        if (g_pend3_chunk_head > 64 && g_pend3_chunk_head > g_pend3_chunks.size() / 2) {
+            g_pend3_chunks.erase(g_pend3_chunks.begin(), g_pend3_chunks.begin() + static_cast<std::ptrdiff_t>(g_pend3_chunk_head));
+            g_pend3_chunk_head = 0;
+        }
+        if (ram_backed) {
+            g_pend3_chunks.push_back(Pend3Chunk{data, 0u, qwc, known_hash});
+            return;
+        }
+        constexpr std::size_t kPend3Limit = 2u << 20;
+        const std::size_t incoming = static_cast<std::size_t>(qwc) * 16;
+        if (!g_pend3_buf.capacity()) g_pend3_buf.reserve(kPend3Limit);
+        if (g_pend3_buf.size() - g_pend3_buf_head + incoming > kPend3Limit) release(true);
+        if (incoming > kPend3Limit) {
+            transfer_direct(path, data, qwc, known_hash, false);
+            return;
+        }
+        if ((g_pend3_buf_head > g_pend3_buf.size() / 2 || g_pend3_buf.size() + incoming > kPend3Limit) && g_pend3_buf_head > 0) {
+            g_pend3_buf.erase(g_pend3_buf.begin(), g_pend3_buf.begin() + static_cast<std::ptrdiff_t>(g_pend3_buf_head));
+            for (std::size_t i = g_pend3_chunk_head; i < g_pend3_chunks.size(); ++i)
+                if (!g_pend3_chunks[i].ram) g_pend3_chunks[i].buf_off -= static_cast<std::uint32_t>(g_pend3_buf_head);
+            g_pend3_buf_head = 0;
+        }
+        const std::uint32_t off = static_cast<std::uint32_t>(g_pend3_buf.size());
+        g_pend3_buf.insert(g_pend3_buf.end(), data, data + incoming);
+        g_pend3_chunks.push_back(Pend3Chunk{nullptr, off, qwc, known_hash});
+        return;
+#else
+        bool compact = g_pend3_head > g_pend3.size() / 2;   // only now and then, and only here, where the vector may move anyway
+        if (compact) {
+            g_pend3.erase(g_pend3.begin(), g_pend3.begin() + static_cast<std::ptrdiff_t>(g_pend3_head));
+'''),
+        (r'''        { static const bool t = std::getenv("PS2_TRACE_M3") != nullptr; if (t) std::fprintf(stderr, "[p3] queued %u qwords, %zu waiting\n", qwc, g_pend3.size() / 16); }
+        return;
+    }
+    transfer_direct(path, data, qwc);
+}
+
+void vu_path3(const std::uint8_t *data, std::uint32_t qwc) { transfer(3, data, qwc); }
+
+void transfer_direct(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    { static const bool t = std::getenv("PS2_TRACE_M3") != nullptr; if (t) std::fprintf(stderr, "[gifx] path=%d qwc=%u\n", path, qwc); }
+    if (!gs::queue::active()) {
+        render(path, data, qwc);
+        return;
+    }
+    if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
+#ifdef PS2_PICA
+    if (gs::queue::role() == gs::queue::Role::Vu) {   // the 3DS has no third thread: the VU thread also draws
+        render(path, data, qwc);
+        return;
+    }
+#endif
+#ifdef PS2_PICA
+    // Texture data for a skipped picture is read from PS2 memory by the VU thread, not copied: see run_skipped in vif.cpp. Each
+    // cache line of this copy costs about 230 cycles, nearly all of them waiting on memory.
+    // A shown picture's goes the same way if the game has sent the same bytes from the same place several times running.
+    if (path == 3 && data >= g_ram && data + qwc * 16u <= g_ram + kRamSize &&
+        ((qwc >= 256 && gs::queue::g_ee_skip) || (qwc >= 16 && gs::queue::vu_active() && gs::queue::unchanging(data, qwc * 16u)))) {
+        gs::queue::post(gs::queue::kGifAddress, 3, qwc, &data, sizeof data);
+        return;
+    }
+#endif
+''',
+         r'''        { static const bool t = std::getenv("PS2_TRACE_M3") != nullptr; if (t) std::fprintf(stderr, "[p3] queued %u qwords, %zu waiting\n", qwc, g_pend3.size() / 16); }
+        return;
+#endif
+    }
+    transfer_direct(path, data, qwc, known_hash, ram_backed);
+}
+
+void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) { transfer_impl(path, data, qwc, 0, false); }
+#ifdef PS2_PICA
+void transfer_ram(int path, const std::uint8_t *data, std::uint32_t qwc) { transfer_impl(path, data, qwc, 0x80000000u, true); }
+#endif
+
+void vu_path3(const std::uint8_t *data, std::uint32_t qwc, std::uint32_t known_hash, bool ram_backed) {
+    transfer_impl(3, data, qwc, known_hash, ram_backed);
+}
+
+void transfer_direct(int path, const std::uint8_t *data, std::uint32_t qwc, std::uint32_t known_hash, bool ram_backed) {
+    { static const bool t = std::getenv("PS2_TRACE_M3") != nullptr; if (t) std::fprintf(stderr, "[gifx] path=%d qwc=%u\n", path, qwc); }
+    if (!gs::queue::active()) {
+        render_chunk(path, data, qwc, known_hash, ram_backed);
+        return;
+    }
+    if (gs::queue::is_vu_thread()) {
+#ifdef PS2_PICA
+        render_chunk(path, data, qwc, known_hash, ram_backed);
+        return;
+#endif
+    } else {
+        scan(g_scan[path], data, qwc);
+    }
+#ifdef PS2_PICA
+    // Texture data for a skipped picture is read from PS2 memory by the VU thread, not copied: see run_skipped in vif.cpp. Each
+    // cache line of this copy costs about 230 cycles, nearly all of them waiting on memory.
+    // A shown picture's goes the same way if the game has sent the same bytes from the same place several times running.
+    if (path == 3 && data >= g_ram && data + qwc * 16u <= g_ram + kRamSize) {
+        const bool skip_ref = qwc >= 256 && gs::queue::g_ee_skip;
+        if (skip_ref) {
+            gs::queue::post(gs::queue::kGifAddress, 0u, qwc, &data, sizeof data);
+            return;
+        }
+        if (qwc >= 4 && gs::queue::vu_active()) {
+            const bool stable = gs::queue::unchanging(data, qwc * 16u);
+            const std::uint32_t raw = gs::queue::g_unchanging_hash;
+            const std::uint32_t hash = raw ? ((raw & 0x3FFFFFFFu) ? (raw & 0x3FFFFFFFu) : 1u) : 0u;
+            if (stable) {
+                gs::queue::post(gs::queue::kGifAddress, hash, qwc, &data, sizeof data);
+                return;
+            }
+            if (hash) {
+                gs::queue::post(gs::queue::kGif, 3u | (hash << 2), qwc, data, qwc * 16);
+                return;
+            }
+        }
+    }
+#endif
+'''),
+        ('''void set_path3_masked(bool masked) {
+    if (gs::queue::vu_active()) {
+        if (gs::queue::role() != gs::queue::Role::Vu) {
+            g_stat = (g_stat & ~2u) | (masked ? 2u : 0u);  // EE thread: only the status bit the CPU reads
+            return;
+''',
+         '''void set_path3_masked(bool masked) {
+    if (gs::queue::vu_active()) {
+        if (!gs::queue::is_vu_thread()) {
+            g_stat = (g_stat & ~2u) | (masked ? 2u : 0u);  // EE thread: only the status bit the CPU reads
+            return;
+'''),
+    ],
+    'runtime/src/gs/gif.hpp': [
+        ('''void stats();
+void transfer(int path, const std::uint8_t *data, std::uint32_t qwc);
+void render(int path, const std::uint8_t *data, std::uint32_t qwc);
+void render_reset();
+''',
+         '''void stats();
+void transfer(int path, const std::uint8_t *data, std::uint32_t qwc);
+#ifdef PS2_PICA
+void transfer_ram(int path, const std::uint8_t *data, std::uint32_t qwc);
+#endif
+void render(int path, const std::uint8_t *data, std::uint32_t qwc);
+void render_reset();
+'''),
+        ('''// Release everything still waiting behind the PATH3 mask when it is off (called at vertical blank)
+void flush_path3();
+// Called when a VIF1 DMA chain finishes
+void chain_end();
+// VU thread: PATH3 data posted by the EE thread, passed through the mask rule
+void vu_path3(const std::uint8_t *data, std::uint32_t qwc);
+
+}
+''',
+         '''// Release everything still waiting behind the PATH3 mask when it is off (called at vertical blank)
+void flush_path3();
+void release_if_pending();
+// Called when a VIF1 DMA chain finishes
+void chain_end();
+// VU thread: PATH3 data posted by the EE thread, passed through the mask rule
+void vu_path3(const std::uint8_t *data, std::uint32_t qwc, std::uint32_t known_hash = 0, bool ram_backed = false);
+
+}
+'''),
+    ],
+    'runtime/src/gs/gs.cpp': [
+        ('''    }
+}
+#endif
+
+unsigned long long g_up_bytes = 0, g_up_nz = 0;
+
+void feed_image(const std::uint8_t *data, std::size_t bytes) {
+    PS2_PROF(ps2::prof::Upload);
+#ifdef PS2_PICA
+    if (pica::active()) pica::note_data(data, bytes);
+#endif
+#ifndef PS2_PICA   // a count for tracing that cost more than the upload itself
+''',
+         '''    }
+}
+
+struct DeferredUpload {
+    bool active = false;
+    bool full_pages = false;
+    std::uint16_t first_block = 0, end_block = 0;
+    std::uint16_t dsax = 0, dsay = 0, rrw = 0, rrh = 0;
+    std::uint32_t psm = 0;
+    std::uint32_t first_page = 0, page_count = 0;
+    std::uint32_t vblank_age = 0;
+    std::uint64_t seq = 0;
+    std::uint64_t bitbltbuf = 0, trxpos = 0, trxreg = 0;
+    const std::uint8_t *data = nullptr;
+    std::size_t bytes = 0;
+};
+
+constexpr int kMaxDeferred = 128;
+DeferredUpload g_deferred[kMaxDeferred];
+std::uint32_t g_def_range[kMaxDeferred]{};   // packed first_block | (end_block << 16), 0 if inactive (512 B SoA)
+std::uint64_t g_page_max_seq[512]{};
+std::int8_t g_clut_slot[256];
+bool g_clut_slot_init = false;
+std::uint32_t g_deferred_mask[16]{};
+std::uint32_t g_deferred_count = 0;
+int g_deferred_hi = 0;
+std::uint32_t g_deferred_vblank = 0;
+std::uint64_t g_deferred_seq = 0;
+
+void psm_page_dims(std::uint32_t psm, std::uint32_t &pw, std::uint32_t &ph) {
+    if (psm == PSMT8) { pw = 128; ph = 64; }
+    else if (psm == PSMT4) { pw = 128; ph = 128; }
+    else if (psm == PSMCT16 || psm == PSMCT16S || psm == PSMZ16 || psm == PSMZ16S) { pw = 64; ph = 64; }
+    else { pw = 64; ph = 32; }
+}
+
+void upload_block_range(std::uint32_t psm, std::uint32_t dbp, std::uint32_t dbw, std::uint32_t dsax, std::uint32_t dsay,
+                        std::uint32_t rrw, std::uint32_t rrh, std::uint32_t &first_block, std::uint32_t &end_block) {
+    std::uint32_t pw, ph;
+    psm_page_dims(psm, pw, ph);
+    const std::uint32_t fb_byte = page_address(dbp, dbw, dsax, dsay, pw, ph);
+    const std::uint32_t lb_byte = page_address(dbp, dbw, dsax + rrw - 1u, dsay + rrh - 1u, pw, ph);
+    first_block = fb_byte >> 8;
+    if (fb_byte == lb_byte && dsax == 0 && dsay == 0 && rrw <= pw && rrh <= ph) {
+        int max_b = 31;
+        if (psm == PSMCT32 || psm == PSMCT24) {
+            const int bx = static_cast<int>((rrw - 1u) >> 3), by = static_cast<int>((rrh - 1u) >> 3);
+            max_b = 0;
+            for (int y = 0; y <= by; ++y)
+                for (int x = 0; x <= bx; ++x) max_b = std::max(max_b, kBlock32[y][x]);
+        } else if (psm == PSMCT16 || psm == PSMCT16S) {
+            const auto &kb = psm == PSMCT16 ? kBlock16 : kBlock16S;
+            const int bx = static_cast<int>((rrw - 1u) >> 4), by = static_cast<int>((rrh - 1u) >> 3);
+            max_b = 0;
+            for (int y = 0; y <= by; ++y)
+                for (int x = 0; x <= bx; ++x) max_b = std::max(max_b, kb[y][x]);
+        } else if (psm == PSMT8) {
+            const int bx = static_cast<int>((rrw - 1u) >> 4), by = static_cast<int>((rrh - 1u) >> 4);
+            max_b = 0;
+            for (int y = 0; y <= by; ++y)
+                for (int x = 0; x <= bx; ++x) max_b = std::max(max_b, kBlock32[y][x]);
+        } else if (psm == PSMT4) {
+            const int bx = static_cast<int>((rrw - 1u) >> 5), by = static_cast<int>((rrh - 1u) >> 4);
+            max_b = 0;
+            for (int y = 0; y <= by; ++y)
+                for (int x = 0; x <= bx; ++x) max_b = std::max(max_b, kBlock16[y][x]);
+        }
+        end_block = first_block + static_cast<std::uint32_t>(max_b) + 1u;
+    } else {
+        end_block = (lb_byte >> 8) + 32u;
+    }
+}
+
+void set_deferred_bits(std::uint32_t first, std::uint32_t count) {
+    const std::uint32_t end = std::min<std::uint32_t>(first + count, 512u);
+    for (std::uint32_t p = first; p < end; ++p) g_deferred_mask[p >> 5] |= 1u << (p & 31u);
+}
+
+void rebuild_deferred_mask() {
+    std::memset(g_deferred_mask, 0, sizeof g_deferred_mask);
+    int hi = 0;
+    if (!g_deferred_count) {
+        g_deferred_hi = 0;
+        return;
+    }
+    for (int i = 0; i < g_deferred_hi; ++i) {
+        if (g_deferred[i].active) {
+            set_deferred_bits(g_deferred[i].first_page, g_deferred[i].page_count);
+            hi = i + 1;
+        }
+    }
+    g_deferred_hi = hi;
+}
+
+bool any_deferred_in(std::uint32_t first, std::uint32_t count) {
+    if (!g_deferred_count || !count) return false;
+    const std::uint32_t end = std::min<std::uint32_t>(first + count, 512u);
+    for (std::uint32_t p = first; p < end; ++p)
+        if (g_deferred_mask[p >> 5] & (1u << (p & 31u))) return true;
+    return false;
+}
+
+void materialize_deferred(int idx) {
+    DeferredUpload &u = g_deferred[idx];
+    u.active = false;
+    g_def_range[idx] = 0u;
+    --g_deferred_count;
+    const std::uint64_t saved_buf = g_state.bitbltbuf, saved_pos = g_state.trxpos, saved_reg = g_state.trxreg;
+    const Transfer saved_tr = g_transfer;
+    const std::size_t saved_carried = g_carried;
+    g_state.bitbltbuf = u.bitbltbuf;
+    g_state.trxpos = u.trxpos;
+    g_state.trxreg = u.trxreg;
+    g_transfer = Transfer{true, 0, 0};
+    g_carried = 0;
+    image_fast(u.psm, u.data, u.bytes);
+    g_state.bitbltbuf = saved_buf;
+    g_state.trxpos = saved_pos;
+    g_state.trxreg = saved_reg;
+    g_transfer = saved_tr;
+    g_carried = saved_carried;
+}
+
+void flush_deferred_blocks(std::uint32_t first_block, std::uint32_t end_block) {
+    if (!g_deferred_count || first_block >= end_block) return;
+    const std::uint32_t clamped_end = std::min<std::uint32_t>(end_block, 16384u);
+    if (first_block >= clamped_end) return;
+    const std::uint32_t fp = first_block >> 5, lp = (clamped_end - 1u) >> 5;
+    if (!any_deferred_in(fp, lp - fp + 1u)) return;
+    int order[kMaxDeferred];
+    int n = 0;
+    for (int i = 0; i < g_deferred_hi; ++i) {
+        const std::uint32_t r = g_def_range[i];
+        if (r && (r & 0xFFFFu) < clamped_end && (r >> 16) > first_block) order[n++] = i;
+    }
+    if (!n) return;
+    if (n > 1) std::sort(order, order + n, [](int a, int b) { return g_deferred[a].seq < g_deferred[b].seq; });
+    for (int i = 0; i < n; ++i) materialize_deferred(order[i]);
+    rebuild_deferred_mask();
+}
+
+void flush_deferred_range(std::uint32_t first, std::uint32_t count) {
+    if (!count) return;
+    const std::uint32_t end = std::min<std::uint32_t>(first + count, 512u);
+    flush_deferred_blocks(first * 32u, end * 32u);
+}
+
+void clear_all_deferred() {
+    for (int i = 0; i < g_deferred_hi; ++i) {
+        g_deferred[i].active = false;
+        g_def_range[i] = 0u;
+    }
+    std::memset(g_deferred_mask, 0, sizeof g_deferred_mask);
+    std::memset(g_clut_slot, -1, sizeof g_clut_slot);
+    g_clut_slot_init = true;
+    g_deferred_count = 0;
+    g_deferred_hi = 0;
+}
+
+void flush_all_deferred_impl() {
+    if (!g_deferred_count) return;
+    flush_deferred_blocks(0u, 16384u);
+}
+
+bool defer_or_prepare_image(std::uint32_t psm, std::uint32_t bits, const std::uint8_t *data, std::size_t bytes, std::uint32_t known_hash, bool ram_backed) {
+    const std::uint64_t buf = g_state.bitbltbuf, pos = g_state.trxpos, reg = g_state.trxreg;
+    const std::uint32_t dbp = static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu;
+    const std::uint32_t dbw = static_cast<std::uint32_t>(buf >> 48) & 0x3Fu;
+    const std::uint32_t dsax = static_cast<std::uint32_t>(pos >> 32) & 0x7FFu;
+    const std::uint32_t dsay = static_cast<std::uint32_t>(pos >> 48) & 0x7FFu;
+    const std::uint32_t rrw = static_cast<std::uint32_t>(reg) & 0xFFFu;
+    const std::uint32_t rrh = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
+    if (!rrw || !rrh) return false;
+    std::uint32_t pw, ph;
+    psm_page_dims(psm, pw, ph);
+    const bool no_wrap = dsax + rrw <= 2048u && dsay + rrh <= 2048u;
+    std::uint32_t first_block = 0, end_block = 16384u;
+    if (no_wrap) upload_block_range(psm, dbp, dbw, dsax, dsay, rrw, rrh, first_block, end_block);
+    const bool contig = no_wrap && end_block > first_block && end_block <= 16384u;
+    const std::uint32_t first_page = contig ? (first_block >> 5) : 0u;
+    const std::uint32_t last_page = contig ? ((end_block - 1u) >> 5) : 511u;
+    const std::uint32_t page_count = contig ? (last_page - first_page + 1u) : 512u;
+
+    // Defer static unchanging g_ram texture and CLUT uploads (>= 64 B) that complete in one chunk.
+    const bool can_defer = ram_backed && known_hash != 0 && contig && pica::active() && g_transfer.x == 0 && g_transfer.y == 0 && g_carried == 0 &&
+                           bytes >= 64u &&
+                           (psm == PSMT8 || psm == PSMT4 || psm == PSMCT32 || psm == PSMCT24 || psm == PSMCT16 || psm == PSMCT16S) &&
+                           bytes * 8u >= static_cast<std::size_t>(rrw) * rrh * bits;
+    if (!can_defer) {
+        if (g_deferred_count) {
+            if (contig) flush_deferred_blocks(first_block, end_block);
+            else flush_all_deferred_impl();
+        }
+        return false;
+    }
+
+    if (!g_clut_slot_init) {
+        std::memset(g_clut_slot, -1, sizeof g_clut_slot);
+        g_clut_slot_init = true;
+    }
+    const std::uint32_t stride_pages = std::max<std::uint32_t>(std::max<std::uint32_t>(dbw, 1u) * 64u / pw, 1u);
+    const bool full_pages = (dbp % 32u == 0) && dsax == 0 && dsay == 0 && (rrw % pw == 0) && (rrh % ph == 0) &&
+                            (rrw / pw == stride_pages) &&
+                            (static_cast<std::size_t>(rrw) * rrh * bits == static_cast<std::size_t>(page_count) * 65536u);
+    if (any_deferred_in(first_page, page_count)) {
+        bool dropped = false;
+        for (int i = 0; i < g_deferred_hi; ++i) {
+            const std::uint32_t r = g_def_range[i];
+            if (!r || (r & 0xFFFFu) >= end_block || (r >> 16) <= first_block) continue;
+            DeferredUpload &u = g_deferred[i];
+            const bool covered = (full_pages && first_block <= u.first_block && end_block >= u.end_block) ||
+                                 (u.bitbltbuf == buf && u.trxpos == pos && u.trxreg == reg) ||
+                                 (u.first_block == first_block && u.end_block == end_block && u.psm == psm && u.dsax == dsax && u.dsay == dsay && u.rrw == rrw && u.rrh == rrh);
+            if (covered) {
+                u.active = false;
+                g_def_range[i] = 0u;
+                --g_deferred_count;
+                dropped = true;
+            }
+        }
+        if (dropped) rebuild_deferred_mask();
+    }
+    if (g_deferred_count >= kMaxDeferred) {
+        int oldest = -1;
+        for (int i = 0; i < g_deferred_hi; ++i)
+            if (g_def_range[i] && (oldest < 0 || g_deferred[i].seq < g_deferred[oldest].seq)) oldest = i;
+        if (oldest >= 0) {
+            materialize_deferred(oldest);
+            rebuild_deferred_mask();
+        }
+    }
+    for (int i = 0; i < kMaxDeferred; ++i) {
+        if (!g_def_range[i]) {
+            const std::uint64_t seq = ++g_deferred_seq;
+            g_deferred[i] = DeferredUpload{true, full_pages, static_cast<std::uint16_t>(first_block), static_cast<std::uint16_t>(end_block),
+                                           static_cast<std::uint16_t>(dsax), static_cast<std::uint16_t>(dsay),
+                                           static_cast<std::uint16_t>(rrw), static_cast<std::uint16_t>(rrh),
+                                           psm, first_page, page_count, g_deferred_vblank, seq, buf, pos, reg, data, bytes};
+            g_def_range[i] = first_block | (end_block << 16);
+            if (i + 1 > g_deferred_hi) g_deferred_hi = i + 1;
+            ++g_deferred_count;
+            set_deferred_bits(first_page, page_count);
+            for (std::uint32_t p = first_page; p < first_page + page_count && p < 512u; ++p) g_page_max_seq[p] = seq;
+            if (dsax == 0 && dsay == 0 && ((rrw == 16 && rrh == 16) || (rrw == 8 && rrh == 2)))
+                g_clut_slot[first_block & 255u] = static_cast<std::int8_t>(i);
+            g_transfer.active = false;
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
+unsigned long long g_up_bytes = 0, g_up_nz = 0;
+
+void feed_image(const std::uint8_t *data, std::size_t bytes, std::uint32_t known_hash = 0, bool ram_backed = false) {
+    PS2_PROF(ps2::prof::Upload);
+#ifdef PS2_PICA
+    if (pica::active()) pica::note_data(data, bytes, known_hash == 0x80000000u ? 0u : known_hash);
+#else
+    (void)known_hash, (void)ram_backed;
+#endif
+#ifndef PS2_PICA   // a count for tracing that cost more than the upload itself
+'''),
+        ('''    const std::uint32_t bits = bits_per_pixel(psm);
+#ifdef PS2_PICA
+    if (psm == PSMT8 || psm == PSMT4 || psm == PSMCT32 || psm == PSMCT24 || psm == PSMCT16 || psm == PSMCT16S) {
+        image_fast(psm, data, bytes);
+''',
+         '''    const std::uint32_t bits = bits_per_pixel(psm);
+#ifdef PS2_PICA
+    if (defer_or_prepare_image(psm, bits, data, bytes, known_hash, ram_backed)) return;
+    if (psm == PSMT8 || psm == PSMT4 || psm == PSMCT32 || psm == PSMCT24 || psm == PSMCT16 || psm == PSMCT16S) {
+        image_fast(psm, data, bytes);
+'''),
+        ('''
+void local_copy() {
+    const std::uint64_t buf = g_state.bitbltbuf, pos = g_state.trxpos, reg = g_state.trxreg;
+    const std::uint32_t sbp = static_cast<std::uint32_t>(buf) & 0x3FFFu, sbw = static_cast<std::uint32_t>(buf >> 16) & 0x3Fu, spsm = static_cast<std::uint32_t>(buf >> 24) & 0x3Fu;
+''',
+         '''
+void local_copy() {
+#ifdef PS2_PICA
+    flush_all_deferred_impl();
+#endif
+    const std::uint64_t buf = g_state.bitbltbuf, pos = g_state.trxpos, reg = g_state.trxreg;
+    const std::uint32_t sbp = static_cast<std::uint32_t>(buf) & 0x3FFFu, sbw = static_cast<std::uint32_t>(buf >> 16) & 0x3Fu, spsm = static_cast<std::uint32_t>(buf >> 24) & 0x3Fu;
+'''),
+        ('''    if (!cpu_raster()) return;
+    const bool eight = psm == PSMT8 || psm == PSMT8H;
+    const std::uint32_t entries = eight ? 256u : 16u;
+    const std::uint32_t texclut = static_cast<std::uint32_t>(g_state.texclut);
+''',
+         '''    if (!cpu_raster()) return;
+    const bool eight = psm == PSMT8 || psm == PSMT8H;
+    const std::uint32_t eff_cpsm = cpsm == 0 ? PSMCT32 : cpsm;
+#ifdef PS2_PICA
+    const std::uint32_t clut_blocks = csm ? 64u : ((eff_cpsm == PSMCT32 || eff_cpsm == PSMCT24) ? (eight ? 4u : 1u) : (eight ? 2u : 1u));
+    const std::uint32_t q_end = std::min<std::uint32_t>(cbp + clut_blocks, 16384u);
+    if (!csm && g_deferred_count && (eff_cpsm == PSMCT32 || eff_cpsm == PSMCT16 || eff_cpsm == PSMCT16S)) {
+        const std::uint32_t fp = cbp >> 5, lp = (q_end - 1u) >> 5;
+        if (any_deferred_in(fp, lp - fp + 1u)) {
+            int best = -1;
+            const int hint = g_clut_slot_init ? static_cast<int>(g_clut_slot[cbp & 255u]) : -1;
+            if (hint >= 0 && g_def_range[hint] && g_deferred[hint].first_block == cbp &&
+                g_deferred[hint].seq == g_page_max_seq[fp] && (fp == lp || g_deferred[hint].seq == g_page_max_seq[lp])) {
+                best = hint;
+            } else {
+                std::uint64_t best_seq = 0;
+                for (int i = 0; i < g_deferred_hi; ++i) {
+                    const std::uint32_t r = g_def_range[i];
+                    if (r && (r & 0xFFFFu) < q_end && (r >> 16) > cbp && g_deferred[i].seq > best_seq) {
+                        best = i;
+                        best_seq = g_deferred[i].seq;
+                    }
+                }
+            }
+            if (best >= 0) {
+                const DeferredUpload &u = g_deferred[best];
+                const std::uint32_t need_w = eight ? 16u : 8u, need_h = eight ? 16u : 2u;
+                if (u.first_block == cbp && u.dsax == 0 && u.dsay == 0 && u.psm == eff_cpsm && u.rrw == need_w && u.rrh == need_h) {
+                    if (eff_cpsm == PSMCT32) {
+                        if (eight) {
+                            for (std::uint32_t g = 0; g < 256u; g += 32u) {
+                                std::memcpy(g_state.clut + g + 0u,  u.data + (g + 0u) * 4u, 32u);
+                                std::memcpy(g_state.clut + g + 8u,  u.data + (g + 16u) * 4u, 32u);
+                                std::memcpy(g_state.clut + g + 16u, u.data + (g + 8u) * 4u, 32u);
+                                std::memcpy(g_state.clut + g + 24u, u.data + (g + 24u) * 4u, 32u);
+                            }
+                        } else {
+                            std::memcpy(g_state.clut + (csa & 15u) * 16u, u.data, 64u);
+                        }
+                    } else {
+                        if (eight) {
+                            for (std::uint32_t i = 0; i < 256u; ++i) {
+                                const std::uint32_t j = (i & ~0x18u) | ((i & 0x08u) << 1) | ((i & 0x10u) >> 1);
+                                std::uint16_t v;
+                                std::memcpy(&v, u.data + j * 2u, 2u);
+                                g_state.clut[i] = v;
+                            }
+                        } else {
+                            std::uint32_t *dst = g_state.clut + (csa & 15u) * 16u;
+                            for (std::uint32_t i = 0; i < 16u; ++i) {
+                                std::uint16_t v;
+                                std::memcpy(&v, u.data + i * 2u, 2u);
+                                dst[i] = v;
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    flush_deferred_blocks(cbp, q_end);
+#endif
+    const std::uint32_t entries = eight ? 256u : 16u;
+    const std::uint32_t texclut = static_cast<std::uint32_t>(g_state.texclut);
+'''),
+        ('''
+void render_reset() {
+#ifdef PS2_GPU
+    g_seen_ranges.clear();
+''',
+         '''
+void render_reset() {
+#ifdef PS2_PICA
+    clear_all_deferred();
+#endif
+#ifdef PS2_GPU
+    g_seen_ranges.clear();
+'''),
+        ('''}
+
+void kick(bool draw) {
+    State &s = g_state;
+''',
+         '''}
+
+int draw_g3_direct(const ::g3::Input &in, ::g3::Gpu &g, const ::g3::BatchPlan &plan) {   // ps2run_3ds_patch.py
+#ifdef PS2_PICA
+    if (!pica::active() || !pica::g3_ready()) return -1;
+    if (!queue::g_skip_picture) {
+        const int r = pica::draw_g3_direct(g_state, gpu_clamp(g_state), in, g, plan);
+        if (r != 0) return r;
+    }
+    ++g_primitives;
+    return 0;
+#else
+    (void)in; (void)g; (void)plan;
+    return -1;
+#endif
+}
+
+bool draw_im2d_tris(const std::uint8_t *vu_mem, std::uint32_t top, std::uint32_t count, bool xyzf) {   // ps2run_3ds_patch.py
+#ifdef PS2_PICA
+    if (!pica::active()) return false;
+    if (!queue::g_skip_picture && !pica::draw_im2d_tris(g_state, gpu_clamp(g_state), vu_mem, top, count, xyzf)) return false;
+    g_primitives += count;
+    return true;
+#else
+    (void)vu_mem; (void)top; (void)count; (void)xyzf;
+    return false;
+#endif
+}
+
+void kick(bool draw) {
+    State &s = g_state;
+'''),
+        ('''    ++g_writes[reg & 127u];
+    constexpr std::uint64_t kVertexRegs = (1ull << 0x01) | (1ull << 0x02) | (1ull << 0x03) | (1ull << 0x04) | (1ull << 0x05) | (1ull << 0x0A) | (1ull << 0x0C) | (1ull << 0x0D);
+    if (reg >= 64 || !((kVertexRegs >> reg) & 1u)) ++g_setup_generation;
+    static const char *seq = std::getenv("PS2_TRACE_GSSEQ");
+    if (seq) {
+''',
+         '''    ++g_writes[reg & 127u];
+    constexpr std::uint64_t kVertexRegs = (1ull << 0x01) | (1ull << 0x02) | (1ull << 0x03) | (1ull << 0x04) | (1ull << 0x05) | (1ull << 0x0A) | (1ull << 0x0C) | (1ull << 0x0D);
+    if (reg == 0x00) {
+        if ((s.prim & ~7ull) != (value & ~7ull)) ++g_setup_generation;
+    } else if (reg >= 64 || !((kVertexRegs >> reg) & 1u)) {
+        ++g_setup_generation;
+    }
+    static const char *seq = std::getenv("PS2_TRACE_GSSEQ");
+    if (seq) {
+'''),
+        ('''
+#ifdef PS2_PICA
+// PACKED loops that only set vertex registers make up nearly all of a 3D scene. They skip write_packed and write, and so the
+// trip through two switches and the tracing checks for each register.
+''',
+         '''
+#ifdef PS2_PICA
+void write_image(const std::uint8_t *data, std::uint32_t qwords, std::uint32_t known_hash, bool ram_backed) {
+    feed_image(data, static_cast<std::size_t>(qwords) * 16, known_hash, ram_backed);
+}
+
+void upload_blocks(std::uint32_t psm, std::uint32_t dbp, std::uint32_t dbw, std::uint32_t dsax, std::uint32_t dsay,
+                   std::uint32_t rrw, std::uint32_t rrh, std::uint32_t &first_block, std::uint32_t &end_block) {
+    if (!rrw || !rrh) {
+        first_block = dbp;
+        end_block = dbp;
+        return;
+    }
+    upload_block_range(psm, dbp, dbw, dsax, dsay, rrw, rrh, first_block, end_block);
+}
+
+void flush_deferred_pages(std::uint32_t first_page, std::uint32_t page_count) {
+    flush_deferred_range(first_page, page_count);
+}
+
+void flush_all_deferred() {
+    flush_all_deferred_impl();
+}
+
+void age_deferred_uploads() {
+    ++g_deferred_vblank;
+}
+#endif
+
+#ifdef PS2_PICA
+// PACKED loops that only set vertex registers make up nearly all of a 3D scene. They skip write_packed and write, and so the
+// trip through two switches and the tracing checks for each register.
+'''),
+        ('''
+void render_read_image(std::uint8_t *data, std::uint32_t qwords) {
+    const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
+    std::memset(data, 0, bytes);
+''',
+         '''
+void render_read_image(std::uint8_t *data, std::uint32_t qwords) {
+#ifdef PS2_PICA
+    flush_all_deferred_impl();
+#endif
+    const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
+    std::memset(data, 0, bytes);
+'''),
+        ('''std::uint32_t g_max_vu_lag = 10;
+
+void vblank(bool start) {
+    if (start) {
+''',
+         '''std::uint32_t g_max_vu_lag = 10;
+
+void note_vblank_aborted() {
+    g_vblanks_served.fetch_add(1);
+    queue::notify(g_vblanks_served);
+}
+
+void vblank(bool start) {
+    if (start) {
+'''),
+        ('''            queue::post(queue::kVblank, static_cast<std::uint32_t>(ps2::frame_count()), message.picture, &message, sizeof message);
+            ++g_vblanks_posted;
+            if (g_max_vu_lag && g_vblanks_posted - g_vblanks_served.load() > g_max_vu_lag) {
+                PS2_PROF(ps2::prof::Full);   // counts as a full queue: the picture skipping goes by that
+                for (std::uint32_t done = g_vblanks_served.load(); g_vblanks_posted - done > g_max_vu_lag; done = g_vblanks_served.load())
+                    queue::wait(g_vblanks_served, done);
+            }
+''',
+         '''            queue::post(queue::kVblank, static_cast<std::uint32_t>(ps2::frame_count()), message.picture, &message, sizeof message);
+            ++g_vblanks_posted;
+            if (g_max_vu_lag && !ps2::vu_aborting() && g_vblanks_posted - g_vblanks_served.load() > g_max_vu_lag) {
+                PS2_PROF(ps2::prof::Full);   // counts as a full queue: the picture skipping goes by that
+                for (std::uint32_t done = g_vblanks_served.load(); !ps2::vu_aborting() && g_vblanks_posted - done > g_max_vu_lag; done = g_vblanks_served.load())
+                    queue::wait(g_vblanks_served, done);
+            }
+'''),
+        ('''void render_state(ps2::state::Stream &s) {
+    flush_and_wait();
+    s.pod(g_state);
+    ++g_setup_generation;
+''',
+         '''void render_state(ps2::state::Stream &s) {
+    flush_and_wait();
+#ifdef PS2_PICA
+    if (s.saving()) flush_all_deferred_impl();
+    else clear_all_deferred();
+#endif
+    s.pod(g_state);
+    ++g_setup_generation;
+'''),
+    ],
+    'runtime/src/gs/gs.hpp': [
+        ('''}
+
+namespace g3 { struct Gpu; }   // ps2run_3ds_patch.py
+
+namespace ps2::gs {
+''',
+         '''}
+
+namespace g3 { struct Gpu; struct Input; struct BatchPlan; }   // ps2run_3ds_patch.py
+
+namespace ps2::gs {
+'''),
+        ('''void write(std::uint32_t reg, std::uint64_t value);
+bool draw_g3(const ::g3::Gpu &g);   // ps2run_3ds_patch.py: false when the PICA renderer cannot take it (PRIM already set)
+void signal(std::uint32_t reg, std::uint64_t value);
+void note_transfer(std::uint32_t reg, std::uint64_t value);
+void write_packed(std::uint32_t reg, const Reg128 &q);
+void write_image(const std::uint8_t *data, std::uint32_t qwords);
+bool packed_vertex_regs(std::uint64_t regs, std::uint32_t nreg, std::uint8_t *kinds);   // ps2run_3ds_patch.py
+void packed_run(const std::uint8_t *kinds, std::uint32_t nreg, std::uint32_t loops, const std::uint8_t *data);
+''',
+         '''void write(std::uint32_t reg, std::uint64_t value);
+bool draw_g3(const ::g3::Gpu &g);   // ps2run_3ds_patch.py: false when the PICA renderer cannot take it (PRIM already set)
+int draw_g3_direct(const ::g3::Input &in, ::g3::Gpu &g, const ::g3::BatchPlan &plan);   // ps2run_3ds_patch.py: zero-copy into ring (0 ok, -1 cmd full, >0 GpuDecline)
+bool draw_im2d_tris(const std::uint8_t *vu_mem, std::uint32_t top, std::uint32_t count, bool xyzf);   // ps2run_3ds_patch.py
+void signal(std::uint32_t reg, std::uint64_t value);
+void note_transfer(std::uint32_t reg, std::uint64_t value);
+void write_packed(std::uint32_t reg, const Reg128 &q);
+void write_image(const std::uint8_t *data, std::uint32_t qwords);
+#ifdef PS2_PICA
+void write_image(const std::uint8_t *data, std::uint32_t qwords, std::uint32_t known_hash, bool ram_backed);
+void upload_blocks(std::uint32_t psm, std::uint32_t dbp, std::uint32_t dbw, std::uint32_t dsax, std::uint32_t dsay,
+                   std::uint32_t rrw, std::uint32_t rrh, std::uint32_t &first_block, std::uint32_t &end_block);
+void flush_deferred_pages(std::uint32_t first_page, std::uint32_t page_count);
+void flush_all_deferred();
+void age_deferred_uploads();
+#endif
+bool packed_vertex_regs(std::uint64_t regs, std::uint32_t nreg, std::uint8_t *kinds);   // ps2run_3ds_patch.py
+void packed_run(const std::uint8_t *kinds, std::uint32_t nreg, std::uint32_t loops, const std::uint8_t *data);
+'''),
+        ('''void write_privileged(std::uint32_t address, std::uint64_t value);
+void vblank(bool start);
+extern std::uint32_t g_max_vu_lag;   // ps2run_3ds_patch.py: vblanks the drawing side may be behind; 0 for no limit
+bool interlaced_odd_field();
+''',
+         '''void write_privileged(std::uint32_t address, std::uint64_t value);
+void vblank(bool start);
+void note_vblank_aborted();
+extern std::uint32_t g_max_vu_lag;   // ps2run_3ds_patch.py: vblanks the drawing side may be behind; 0 for no limit
+bool interlaced_odd_field();
+'''),
+    ],
+    'runtime/src/gs/queue.cpp': [
+        ('''}
+
+Ring g_render, g_vu;
+thread_local Role g_role = Role::Emulation;
+
+''',
+         '''}
+
+Ring g_render;
+thread_local Role g_role = Role::Emulation;
+
+'''),
+        ('''    const std::uint8_t *data;
+    std::uint32_t bytes, hash, sample;
+    std::uint8_t same, rest;
+};
+Unchanging g_unchanging[16384];
+''',
+         '''    const std::uint8_t *data;
+    std::uint32_t bytes, hash, sample;
+    std::uint16_t rest;
+    std::uint8_t same;
+};
+Unchanging g_unchanging[16384];
+'''),
+        ('''namespace {
+
+// Four words: the first, the last, and two between (blocks are whole quadwords, at least 16 bytes).
+std::uint32_t sample(const std::uint8_t *data, std::uint32_t bytes) {
+    const std::uint32_t q = (bytes >> 2) & ~3u;
+    std::uint32_t a, b, c, d;
+    std::memcpy(&a, data, 4);
+    std::memcpy(&b, data + q, 4);
+    std::memcpy(&c, data + q * 2 + 4, 4);
+    std::memcpy(&d, data + bytes - 4, 4);
+    return a ^ (b * 3u) ^ (c * 5u) ^ (d * 7u);
+}
+}
+''',
+         '''namespace {
+
+// Two words: the first and the last (blocks are whole quadwords, at least 16 bytes) — halves L1D misses on Core 0.
+std::uint32_t sample(const std::uint8_t *data, std::uint32_t bytes) {
+    std::uint32_t a, d;
+    std::memcpy(&a, data, 4);
+    std::memcpy(&d, data + bytes - 4, 4);
+    return a ^ (d * 7u);
+}
+}
+'''),
+        ('''    return false;
+#else
+    Unchanging &e = g_unchanging[(static_cast<std::uint32_t>(data - g_ram) >> 4) * 2654435761u >> 18];
+    const bool known = e.data == data && e.bytes == bytes;
+    if (known && e.rest && sample(data, bytes) == e.sample) {
+''',
+         '''    return false;
+#else
+    const std::uint32_t off = static_cast<std::uint32_t>(data - g_ram);
+    const std::uint32_t first = off >> 12, last = (off + bytes - 1u) >> 12;
+    if (first == last) {
+        if (g_rewritten[first >> 5] & (1u << (first & 31u))) {
+            g_unchanging_hash = 0;
+            return false;
+        }
+    } else {
+        for (std::uint32_t p = first; p <= last; ++p)
+            if (g_rewritten[p >> 5] & (1u << (p & 31u))) {
+                g_unchanging_hash = 0;
+                return false;
+            }
+    }
+    Unchanging &e = g_unchanging[(off >> 4) * 2654435761u >> 18];
+    const bool known = e.data == data && e.bytes == bytes;
+    if (known && e.rest && sample(data, bytes) == e.sample) {
+'''),
+        ('''        return true;
+    }
+    const std::uint32_t first = static_cast<std::uint32_t>(data - g_ram) >> 12, last = static_cast<std::uint32_t>(data - g_ram + bytes - 1) >> 12;
+    for (std::uint32_t p = first; p <= last; ++p)
+        if (g_rewritten[p >> 5] & (1u << (p & 31u))) return false;
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i + 4 <= bytes; i += 4) {
+''',
+         '''        return true;
+    }
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i + 4 <= bytes; i += 4) {
+'''),
+        ('''        h = (h ^ w) * 16777619u;
+    }
+    if (known && h == e.hash) {
+        if (e.same < 3) ++e.same;
+        if (e.same >= 3) {
+            e.rest = static_cast<std::uint8_t>(24u + (h >> 28));
+            e.sample = sample(data, bytes);
+        }
+    } else {
+        if (known) rewritten(data, bytes);
+        e = Unchanging{data, bytes, h, 0, 0, 0};
+    }
+''',
+         '''        h = (h ^ w) * 16777619u;
+    }
+    g_unchanging_hash = h ? h : 1u;
+    if (known && h == e.hash) {
+        if (e.same < 3) ++e.same;
+        if (e.same >= 3) {
+            e.rest = static_cast<std::uint16_t>(1000u + (h >> 24));
+            e.sample = sample(data, bytes);
+            return true;
+        }
+    } else {
+        if (known) {
+            rewritten(data, bytes);
+            g_unchanging_hash = 0;
+        }
+        e = Unchanging{data, bytes, h, 0, 0, 0};
+    }
+'''),
+        ('''}
+
+Ring &render() { return g_render; }
+Ring &vu() { return g_vu; }
+Role &role() { return g_role; }
+
+Ring &outbox() {
+    if (g_role == Role::Emulation && g_vu.active()) return g_vu;
+    return g_render;
+}
+
+bool active() { return g_render.active(); }
+bool vu_active() { return g_vu.active(); }
+
+void post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *data, std::uint32_t bytes) { outbox().post(type, arg0, arg1, data, bytes); }
+''',
+         '''}
+
+Ring g_vu;
+bool g_vu_active = false;
+#ifdef __3DS__
+void *g_vu_tls = nullptr;
+#endif
+
+Ring &render() { return g_render; }
+Role &role() { return g_role; }
+void set_vu_thread() {
+    g_role = Role::Vu;
+#ifdef __3DS__
+    void *tls;
+    asm("mrc p15, 0, %0, c13, c0, 3" : "=r"(tls));
+    g_vu_tls = tls;
+#endif
+}
+
+Ring &outbox() {
+    if (g_vu_active && !is_vu_thread() && g_role == Role::Emulation) return g_vu;
+    return g_render;
+}
+
+bool active() { return g_render.active(); }
+
+void post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *data, std::uint32_t bytes) { outbox().post(type, arg0, arg1, data, bytes); }
+'''),
+        ('''    buffer_ = std::make_unique<std::uint8_t[]>(capacity);
+    capacity_ = static_cast<std::uint32_t>(capacity);
+}
+
+''',
+         '''    buffer_ = std::make_unique<std::uint8_t[]>(capacity);
+    capacity_ = static_cast<std::uint32_t>(capacity);
+    if (this == &g_vu) g_vu_active = true;
+}
+
+'''),
+        ('''}
+
+std::uint8_t *Ring::extend(Type type, std::uint32_t bytes) {
+    if (open_bytes_ + bytes > kOpenBytes) close();
+    if (!open_bytes_) {
+        open_at_ = room(sizeof(Header) + kOpenBytes);
+''',
+         '''}
+
+std::uint8_t *Ring::extend_slow(Type type, std::uint32_t bytes) {
+    if (open_bytes_ && (open_type_ != type || open_bytes_ + bytes > kOpenBytes)) close();
+    if (!open_bytes_) {
+        open_at_ = room(sizeof(Header) + kOpenBytes);
+'''),
+    ],
+    'runtime/src/gs/queue.hpp': [
+        ('''    // A message built a little at a time, in place, by the one thread that posts. It goes when full or when anything else is posted.
+    static constexpr std::uint32_t kOpenBytes = 16u << 10;
+    std::uint8_t *extend(Type type, std::uint32_t bytes);
+    void close();
+    bool peek(Header &header, const std::uint8_t *&payload);
+''',
+         '''    // A message built a little at a time, in place, by the one thread that posts. It goes when full or when anything else is posted.
+    static constexpr std::uint32_t kOpenBytes = 16u << 10;
+    inline std::uint8_t *extend(Type type, std::uint32_t bytes) {
+        if (open_bytes_ && open_type_ == type && open_bytes_ + bytes <= kOpenBytes) {
+            std::uint8_t *at = open_at_ + sizeof(Header) + open_bytes_;
+            open_bytes_ += bytes;
+            return at;
+        }
+        return extend_slow(type, bytes);
+    }
+    void close();
+    bool peek(Header &header, const std::uint8_t *&payload);
+'''),
+        ('''
+private:
+    std::uint8_t *room(std::uint32_t need);
+    void publish(std::uint32_t need);
+''',
+         '''
+private:
+    std::uint8_t *extend_slow(Type type, std::uint32_t bytes);
+    std::uint8_t *room(std::uint32_t need);
+    void publish(std::uint32_t need);
+'''),
+        ('''};
+
+Ring &render();
+Ring &vu();
+Role &role();
+Ring &outbox();
+
+bool active();
+bool vu_active();
+extern bool g_ee_skip;        // ps2run_3ds_patch.py: the same for the game thread, which is ahead of the drawing side
+#ifdef PS2_PICA
+''',
+         '''};
+
+extern Ring g_vu;
+extern bool g_vu_active;
+#ifdef __3DS__
+extern void *g_vu_tls;
+#endif
+
+Ring &render();
+inline Ring &vu() { return g_vu; }
+Role &role();
+void set_vu_thread();
+inline bool is_vu_thread() {
+#ifdef __3DS__
+    void *tls;
+    asm("mrc p15, 0, %0, c13, c0, 3" : "=r"(tls));
+    return tls == g_vu_tls;
+#else
+    return role() == Role::Vu;
+#endif
+}
+Ring &outbox();
+
+bool active();
+inline bool vu_active() { return g_vu_active; }
+extern bool g_ee_skip;        // ps2run_3ds_patch.py: the same for the game thread, which is ahead of the drawing side
+#ifdef PS2_PICA
+'''),
+    ],
+    'runtime/src/system.cpp': [
+        ('''
+void sync_vu_thread() {
+    if (!gs::queue::vu_active()) return;
+    const std::uint32_t seen = g_vu_fence.load();
+    gs::queue::vu().post(gs::queue::kVuFence, 0, 0, nullptr, 0);
+    while (g_vu_fence.load() == seen) gs::queue::wait(g_vu_fence, seen);
+}
+
+''',
+         '''
+void sync_vu_thread() {
+    if (!gs::queue::vu_active() || vu_aborting()) return;
+    const std::uint32_t seen = g_vu_fence.load();
+    gs::queue::vu().post(gs::queue::kVuFence, 0, 0, nullptr, 0);
+    while (!vu_aborting() && g_vu_fence.load() == seen) gs::queue::wait(g_vu_fence, seen);
+}
+
+'''),
+        ('''void init_graphics() { gs::init(); }
+void start_render_thread() { gs::start_thread(); }
+#ifdef __3DS__
+void start_vu_thread() { gs::queue::vu().start(7u << 20); }   // 7 MB: enough for a whole picture to wait while the last one is drawn
+void stop_vu_thread() { gs::queue::vu().post(gs::queue::kVuStop, 0, 0, nullptr, 0); }
+#else
+void start_vu_thread() { gs::queue::vu().start(32u << 20); }
+#endif
+
+''',
+         '''void init_graphics() { gs::init(); }
+void start_render_thread() { gs::start_thread(); }
+std::atomic<bool> g_vu_abort{false};
+bool vu_aborting() { return g_vu_abort.load(std::memory_order_acquire); }
+void abort_vu_thread() {
+    g_vu_abort.store(true, std::memory_order_release);
+    gs::note_vblank_aborted();
+    g_vu_fence.fetch_add(1);
+    gs::queue::notify(g_vu_fence);
+}
+#ifdef __3DS__
+void start_vu_thread() { g_vu_abort.store(false, std::memory_order_release); gs::queue::vu().start(7u << 20); }   // 7 MB: enough for a whole picture to wait while the last one is drawn
+void stop_vu_thread() { g_vu_abort.store(true, std::memory_order_release); gs::queue::vu().post(gs::queue::kVuStop, 0, 0, nullptr, 0); }
+#else
+void start_vu_thread() { g_vu_abort.store(false, std::memory_order_release); gs::queue::vu().start(32u << 20); }
+#endif
+
+'''),
+        ('''
+void run_vu_thread() {
+    gs::queue::role() = gs::queue::Role::Vu;
+    gs::queue::Ring &in = gs::queue::vu();
+    for (;;) {
+''',
+         '''
+void run_vu_thread() {
+    gs::queue::set_vu_thread();
+    gs::queue::Ring &in = gs::queue::vu();
+    for (;;) {
+'''),
+        ('''        const std::uint8_t *payload = nullptr;
+        while (in.peek(h, payload)) {
+            switch (h.type) {
+            case gs::queue::kVif1: vif::transfer(1, payload, h.arg0); break;
+''',
+         '''        const std::uint8_t *payload = nullptr;
+        while (in.peek(h, payload)) {
+            if (g_vu_abort.load(std::memory_order_relaxed)) {
+                if (h.type == gs::queue::kVuStop) {
+#ifdef PS2_PICA
+                    if (gs::queue::g_split_pica) gs::queue::render().post(gs::queue::kVuStop, 0, 0, nullptr, 0);
+#endif
+                    in.pop(h);
+                    return;
+                }
+                if (h.type == gs::queue::kVuFence) {
+                    g_vu_fence.fetch_add(1);
+                    gs::queue::notify(g_vu_fence);
+                }
+                if (h.type == gs::queue::kVblank) gs::note_vblank_aborted();
+                in.pop(h);
+                continue;
+            }
+            switch (h.type) {
+            case gs::queue::kVif1: vif::transfer(1, payload, h.arg0); break;
+'''),
+        ('''                const std::uint8_t *data;
+                std::memcpy(&data, payload, sizeof data);
+                gif::vu_path3(data, h.arg1);
+                break;
+            }
+''',
+         '''                const std::uint8_t *data;
+                std::memcpy(&data, payload, sizeof data);
+                gif::vu_path3(data, h.arg1, h.arg0, true);
+                break;
+            }
+'''),
+        ('''                break;
+            case gs::queue::kGif:
+                if (h.arg0 == 3) {
+                    PS2_PROF_EXTRA(5);
+                    gif::vu_path3(payload, h.arg1);
+                }
+#ifdef PS2_PICA
+                else {
+                    PS2_PROF_EXTRA(6);
+                    gif::render(static_cast<int>(h.arg0), payload, h.arg1);
+                }
+#else
+                else gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes);
+#endif
+                break;
+''',
+         '''                break;
+            case gs::queue::kGif:
+#ifdef PS2_PICA
+                if ((h.arg0 & 3u) == 3u) {
+                    PS2_PROF_EXTRA(5);
+                    gif::vu_path3(payload, h.arg1, h.arg0 >> 2, false);
+                } else {
+                    PS2_PROF_EXTRA(6);
+                    gif::render(static_cast<int>(h.arg0 & 3u), payload, h.arg1);
+                }
+#else
+                if (h.arg0 == 3) {
+                    PS2_PROF_EXTRA(5);
+                    gif::vu_path3(payload, h.arg1);
+                } else gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes);
+#endif
+                break;
+'''),
+    ],
+    'runtime/src/vif.cpp': [
+        ('''// stop, the PATH3 mask, data for the GIF, or an unpack in mode 2, which adds to the row registers). g_wrote: which registers, as kW bits.
+bool g_side = false;
+std::uint32_t g_wrote = 0;
+Unit g_units[2];
+''',
+         '''// stop, the PATH3 mask, data for the GIF, or an unpack in mode 2, which adds to the row registers). g_wrote: which registers, as kW bits.
+bool g_side = false;
+bool g_skip_unsafe = false;
+std::uint32_t g_wrote = 0;
+Unit g_units[2];
+'''),
+        ('''std::uint8_t g_dry_run[16384];
+
+bool on_vu_thread() { return gs::queue::role() == gs::queue::Role::Vu; }
+bool shadow(int unit) { return unit == 1 && gs::queue::vu_active() && !on_vu_thread(); }
+Unit &state(int unit) { return unit == 1 && on_vu_thread() ? g_vu_side : g_units[unit]; }
+''',
+         '''std::uint8_t g_dry_run[16384];
+
+inline bool on_vu_thread() { return gs::queue::is_vu_thread(); }
+bool shadow(int unit) { return unit == 1 && gs::queue::vu_active() && !on_vu_thread(); }
+Unit &state(int unit) { return unit == 1 && on_vu_thread() ? g_vu_side : g_units[unit]; }
+'''),
+        ('''}
+
+void run_vu(int unit, Unit &u, bool is_shadow, std::uint32_t address, bool resume = false) {
+    if (unit == 1) {
+''',
+         '''}
+
+#ifdef PS2_PICA
+struct DeferredUnpack {
+    const std::uint8_t *src;
+    std::uint16_t addr, num;
+    std::uint8_t vn, vl, cl, rel;
+    bool usn, in_ram;
+};
+DeferredUnpack g_def_unpack[8];
+int g_def_count = 0;
+std::uint16_t g_def_tops = 0;
+std::uint8_t g_def_cl = 0, g_def_slot_mask = 0;
+std::uint32_t g_def_min = 1024u, g_def_max = 0u;
+bool g_def_any_non_ram = false;
+
+struct DeferredMpg {
+    const std::uint8_t *src;
+    std::uint16_t first, bytes;
+};
+constexpr int kMaxDefMpg = 32;
+DeferredMpg g_def_mpg[kMaxDefMpg];
+int g_def_mpg_count = 0;
+std::uint64_t g_def_mpg_pages = 0;
+
+struct MpgCacheEntry {
+    std::uint64_t sig = 0;
+    std::uint64_t pages = 0;
+    std::uint32_t address = 0;
+    std::uint8_t count = 0;
+    std::uintptr_t fn = 0;
+};
+constexpr int kMpgCacheSize = 64;
+MpgCacheEntry g_mpg_cache[kMpgCacheSize];
+struct LastMpg {
+    std::uint32_t pc = ~0u;
+    std::uintptr_t fn = 0;
+};
+LastMpg g_last_mpg[2];
+#endif
+
+void run_vu(int unit, Unit &u, bool is_shadow, std::uint32_t address, bool resume = false) {
+    if (unit == 1) {
+'''),
+        ('''        vu::set_tops(u.top, u.itop);
+#ifdef PS2_PICA
+        // A picture that will not be shown needs no vertices. Uploads and registers all still happen, so the next picture finds
+        // the same machine state, and a program not seen before runs in case it is one that sets things up once.
+        const bool skip = gs::queue::g_split_pica ? gs::queue::g_vu_skip_picture : gs::queue::g_skip_picture;
+        if (skip && (resume || vu::seen(address))) return;
+        if (skip) {
+            gs::queue::g_quiet = true;   // its input was left out, so what it draws would be wrong
+            vu::run(unit, address);
+''',
+         '''        vu::set_tops(u.top, u.itop);
+#ifdef PS2_PICA
+        if (g_def_count && g_def_tops != u.top) flush_deferred_unpacks();
+        // A picture that will not be shown needs no vertices. Uploads and registers all still happen, so the next picture finds
+        // the same machine state, and a program not seen before runs in case it is one that sets things up once.
+        const bool skip = gs::queue::g_split_pica ? gs::queue::g_vu_skip_picture : gs::queue::g_skip_picture;
+        if (skip && (resume || vu::seen(address))) {
+            discard_deferred_unpacks();
+            return;
+        }
+        if (skip) {
+            flush_deferred_unpacks();
+            gs::queue::g_quiet = true;   // its input was left out, so what it draws would be wrong
+            vu::run(unit, address);
+'''),
+        ('''    const std::uint32_t wrap = vu_qwords(unit);
+    if (!masked && u.mode == 0 && !(wl > cl) && !(vn == 3 && vl == 3)) {
+        if (vn == 3 && vl == 0 && cl == wl) {
+            // V4-32 with no gaps writes the payload verbatim. At most one wrap is possible.
+''',
+         '''    const std::uint32_t wrap = vu_qwords(unit);
+    if (!masked && u.mode == 0 && !(wl > cl) && !(vn == 3 && vl == 3)) {
+#ifdef PS2_PICA
+        if (unit == 1 && !dry) {
+            if (((cmd >> 15) & 1u) && wl == 1u && (cl == 4u || cl == 5u)) {
+                const std::uint32_t rel = cmd & 0x3FFu;
+                const std::uint32_t full_addr = (rel + u.tops) & 1023u;
+                if (rel < cl && full_addr + (num - 1u) * cl < 0x2B8u) {
+                    if (g_def_count && (g_def_tops != u.tops || g_def_cl != cl || g_def_count >= 8 || (g_def_slot_mask & (1u << rel))))
+                        flush_deferred_unpacks();
+                    const auto *bytes_ptr = reinterpret_cast<const std::uint8_t *>(data);
+                    const std::size_t byte_len = static_cast<std::size_t>(num) * components * (bits / 8u);
+                    const bool in_ram = bytes_ptr >= g_ram && bytes_ptr + byte_len <= g_ram + kRamSize;
+                    g_def_unpack[g_def_count++] = DeferredUnpack{bytes_ptr, static_cast<std::uint16_t>(full_addr), static_cast<std::uint16_t>(num),
+                                                                 static_cast<std::uint8_t>(vn), static_cast<std::uint8_t>(vl), static_cast<std::uint8_t>(cl),
+                                                                 static_cast<std::uint8_t>(rel), usn, in_ram};
+                    g_def_tops = static_cast<std::uint16_t>(u.tops);
+                    g_def_cl = static_cast<std::uint8_t>(cl);
+                    g_def_slot_mask |= static_cast<std::uint8_t>(1u << rel);
+                    g_def_min = std::min<std::uint32_t>(g_def_min, full_addr);
+                    g_def_max = std::max<std::uint32_t>(g_def_max, full_addr + (num - 1u) * cl + 1u);
+                    g_def_any_non_ram = g_def_any_non_ram || !in_ram;
+                    u.num = 0;
+                    return;
+                }
+            }
+            if (g_def_count) {
+                if (cl == wl && (addr & 1023u) + num <= 1024u) {
+                    const std::uint32_t w0 = addr & 1023u, w1 = w0 + num;
+                    if (w0 < g_def_max && w1 > g_def_min) flush_deferred_unpacks();
+                } else {
+                    flush_deferred_unpacks();
+                }
+            }
+        }
+#endif
+        if (vn == 3 && vl == 0 && cl == wl) {
+            // V4-32 with no gaps writes the payload verbatim. At most one wrap is possible.
+'''),
+        ('''        return;
+    }
+    for (std::uint32_t n = 0; n < num; ++n) {
+        const bool fill = wl > cl && cycle >= cl;
+''',
+         '''        return;
+    }
+#ifdef PS2_PICA
+    if (unit == 1 && !dry) {
+        if (g_def_count) flush_deferred_unpacks();
+        // Fast pointer-based path for mode == 0 masked or filling unpacks (eliminates per-element bit_pos div/mod & memcpy)
+        if (u.mode == 0 && !(vn == 3 && vl == 3)) {
+            const std::uint32_t wrap_mask = wrap - 1u;
+            const std::uint8_t *src = reinterpret_cast<const std::uint8_t *>(data);
+            if (masked && vn == 3 && vl == 0 && cl == 4 && wl == 4 && u.mask == 0xC000C000u && (addr & wrap_mask) + num <= wrap) {
+                std::uint8_t *dst = mem + (addr & wrap_mask) * 16u;
+                std::uint32_t n = 0;
+                for (; n + 1u < num; n += 2u, dst += 32u, src += 32u) std::memcpy(dst, src, 28u);
+                if (n < num) std::memcpy(dst, src, 16u);
+                u.num = 0;
+                return;
+            }
+            const std::uint32_t elem_bytes = components * (bits >> 3);
+            const bool zero_zw = v2_zero(), keep_zw = v2_keep();
+            const bool filling = wl > cl;
+            for (std::uint32_t n = 0; n < num; ++n) {
+                const bool fill = filling && cycle >= cl;
+                auto *q = reinterpret_cast<std::uint32_t *>(mem + (addr & wrap_mask) * 16u);
+                if (!masked) {
+                    if (fill) {
+                        q[0] = u.row[0]; q[1] = u.row[1]; q[2] = u.row[2]; q[3] = u.row[3];
+                    } else if (vl == 0 && vn == 3) {
+                        std::memcpy(q, src, 16u);
+                        src += 16u;
+                    } else {
+                        std::uint32_t v[4];
+                        if (vl == 0) {
+                            for (std::uint32_t j = 0; j < components; ++j) std::memcpy(&v[j], src + j * 4u, 4u);
+                        } else if (vl == 1) {
+                            for (std::uint32_t j = 0; j < components; ++j) {
+                                std::uint16_t h;
+                                std::memcpy(&h, src + j * 2u, 2u);
+                                v[j] = usn ? h : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(h)));
+                            }
+                        } else {
+                            for (std::uint32_t j = 0; j < components; ++j)
+                                v[j] = usn ? src[j] : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(src[j])));
+                        }
+                        src += elem_bytes;
+                        if (components == 1) { v[1] = v[2] = v[3] = v[0]; }
+                        else if (components == 2) {
+                            if (keep_zw) { v[2] = q[2]; v[3] = q[3]; }
+                            else if (zero_zw) { v[2] = v[3] = 0u; }
+                            else { v[2] = v[0]; v[3] = v[1]; }
+                        } else if (components == 3) { v[3] = 0u; }
+                        q[0] = v[0]; q[1] = v[1]; q[2] = v[2]; q[3] = v[3];
+                    }
+                } else {
+                    std::uint32_t v[4] = {0u, 0u, 0u, 0u};
+                    if (!fill) {
+                        if (vl == 0) {
+                            for (std::uint32_t j = 0; j < components; ++j) std::memcpy(&v[j], src + j * 4u, 4u);
+                        } else if (vl == 1) {
+                            for (std::uint32_t j = 0; j < components; ++j) {
+                                std::uint16_t h;
+                                std::memcpy(&h, src + j * 2u, 2u);
+                                v[j] = usn ? h : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(h)));
+                            }
+                        } else {
+                            for (std::uint32_t j = 0; j < components; ++j)
+                                v[j] = usn ? src[j] : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(src[j])));
+                        }
+                        src += elem_bytes;
+                        if (components == 1) { v[1] = v[2] = v[3] = v[0]; }
+                        else if (components == 2) {
+                            if (zero_zw) { v[2] = v[3] = 0u; }
+                            else { v[2] = v[0]; v[3] = v[1]; }
+                        }
+                    }
+                    const std::uint32_t mrow = cycle < 3u ? cycle : 3u;
+                    const std::uint32_t mbyte = (u.mask >> (mrow * 8u)) & 0xFFu;
+                    for (std::uint32_t j = 0; j < 4u; ++j) {
+                        std::uint32_t m = (mbyte >> (j * 2u)) & 3u;
+                        if (fill && m == 0u) m = 1u;
+                        if ((!fill && components == 2u && j >= 2u && keep_zw) || m == 3u) continue;
+                        q[j] = m == 1u ? u.row[j] : (m == 2u ? u.col[mrow] : v[j]);
+                    }
+                }
+                ++addr;
+                ++cycle;
+                if (!filling) {
+                    if (cycle >= wl) { addr += cl - wl; cycle = 0u; }
+                } else if (cycle >= wl) {
+                    cycle = 0u;
+                }
+            }
+            u.num = 0;
+            return;
+        }
+    }
+#endif
+    for (std::uint32_t n = 0; n < num; ++n) {
+        const bool fill = wl > cl && cycle >= cl;
+'''),
+        ('''            }
+        }
+        std::uint8_t *q = mem + (addr % wrap) * 16;
+        const std::uint32_t mrow = std::min<std::uint32_t>(cycle, 3u);
+        for (std::uint32_t j = 0; j < 4; ++j) {
+''',
+         '''            }
+        }
+        std::uint8_t *q = mem + (addr & (wrap - 1u)) * 16;
+        const std::uint32_t mrow = std::min<std::uint32_t>(cycle, 3u);
+        for (std::uint32_t j = 0; j < 4; ++j) {
+'''),
+        ('''}
+
+void execute(int unit, Unit &u, bool from_vu, bool is_shadow, std::uint32_t cmd, const std::uint32_t *data) {
+    const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
+    if (is_shadow) {
+        if ((cmd & 0x80000000u) || op == 0x06 || op == 0x50 || op == 0x51) g_side = true;
+        switch (op) {
+        case 0x01: g_wrote |= 1u; break;
+''',
+         '''}
+
+template <bool FromVu, bool IsShadow>
+void execute(int unit, Unit &u, std::uint32_t cmd, const std::uint32_t *data) {
+    const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
+    if constexpr (IsShadow) {
+        if ((cmd & 0x80000000u) || op == 0x06 || op == 0x50 || op == 0x51) g_side = true;
+        if (op == 0x4A || op == 0x14 || op == 0x15 || ((op & 0x60u) == 0x60u && !(cmd & 0x8000u))) g_skip_unsafe = true;
+        switch (op) {
+        case 0x01: g_wrote |= 1u; break;
+'''),
+        ('''    }
+    u.code = cmd;
+    if (!from_vu) ++g_commands[unit][op];
+    switch (op) {
+    case 0x00: break;
+''',
+         '''    }
+    u.code = cmd;
+    if constexpr (!FromVu) ++g_commands[unit][op];
+    switch (op) {
+    case 0x00: break;
+'''),
+        (r'''    case 0x07: u.mark = imm; break;
+    case 0x10: case 0x11: case 0x13: break;
+    case 0x14: case 0x15: run_vu(unit, u, is_shadow, imm * 8u); break;
+    case 0x17: run_vu(unit, u, is_shadow, is_shadow ? 0u : vu::tpc(unit), true); break;
+    case 0x20: u.mask = data[0]; break;
+    case 0x30: std::memcpy(u.row, data, 16); break;
+    case 0x31: std::memcpy(u.col, data, 16); break;
+    case 0x4A: {
+        if (is_shadow) break;
+        std::uint8_t *code = unit ? g_vu1_code : g_vu0_code;
+        const std::uint32_t size = unit ? 16384u : 4096u;
+        const std::uint32_t count = num ? num : 256u;
+        const std::uint32_t at_first = (imm * 8u) & (size - 1);
+        if (at_first + count * 8u <= size) {
+            if (std::memcmp(code + at_first, data, count * 8u) == 0) break;
+            // This game swaps programs in and out many times a picture. A block that does not wrap is copied in one piece, and the
+            // program cache is told which part changed.
+            std::memcpy(code + at_first, data, count * 8u);
+            vu::code_changed(unit, at_first, count * 8u);
+            break;
+        }
+        bool changed = false;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::uint8_t *at = code + ((imm * 8u + i * 8u) & (size - 1));
+            if (std::memcmp(at, data + i * 2, 8) == 0) continue;
+            std::memcpy(at, data + i * 2, 8);
+            changed = true;
+        }
+        if (changed) vu::code_changed(unit);
+        break;
+    }
+    case 0x50: case 0x51:
+        if (is_shadow) gif::scan_signals(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
+        else gif::transfer(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
+        break;
+    default:
+        if ((op & 0x60u) == 0x60u) {
+            if (is_shadow && u.mode != 2) u.num = 0;
+            else unpack(unit, u, is_shadow, cmd, data);
+        }
+        else std::fprintf(stderr, "[vif%d] unknown command 0x%08X\n", unit, cmd);
+''',
+         r'''    case 0x07: u.mark = imm; break;
+    case 0x10: case 0x11: case 0x13: break;
+    case 0x14: case 0x15: run_vu(unit, u, IsShadow, imm * 8u); break;
+    case 0x17: run_vu(unit, u, IsShadow, IsShadow ? 0u : vu::tpc(unit), true); break;
+    case 0x20: u.mask = data[0]; break;
+    case 0x30: std::memcpy(u.row, data, 16); break;
+    case 0x31: std::memcpy(u.col, data, 16); break;
+    case 0x4A: {
+        if constexpr (IsShadow) break;
+        else {
+            std::uint8_t *code = unit ? g_vu1_code : g_vu0_code;
+            const std::uint32_t size = unit ? 16384u : 4096u;
+            const std::uint32_t count = num ? num : 256u;
+            const std::uint32_t at_first = (imm * 8u) & (size - 1);
+            const std::uint32_t bytes = count * 8u;
+#ifdef PS2_PICA
+            if (unit == 1 && at_first + bytes <= size) {
+                const auto *src = reinterpret_cast<const std::uint8_t *>(data);
+                if (src >= g_ram && src + bytes <= g_ram + kRamSize) {
+                    int w = 0;
+                    for (int i = 0; i < g_def_mpg_count; ++i) {
+                        const DeferredMpg &d = g_def_mpg[i];
+                        if (at_first <= d.first && at_first + bytes >= static_cast<std::uint32_t>(d.first) + d.bytes) continue;
+                        if (w != i) g_def_mpg[w] = d;
+                        ++w;
+                    }
+                    g_def_mpg_count = w;
+                    if (g_def_mpg_count >= kMaxDefMpg) flush_deferred_mpg();
+                    g_def_mpg[g_def_mpg_count++] = DeferredMpg{src, static_cast<std::uint16_t>(at_first), static_cast<std::uint16_t>(bytes)};
+                    for (std::uint32_t p = at_first >> 8; p <= (at_first + bytes - 1u) >> 8; ++p)
+                        g_def_mpg_pages |= std::uint64_t{1} << p;
+                    g_last_mpg[0].fn = g_last_mpg[1].fn = 0;
+                    break;
+                }
+            }
+            if (unit == 1 && g_def_mpg_count) flush_deferred_mpg();
+#endif
+            if (at_first + bytes <= size) {
+                if (std::memcmp(code + at_first, data, bytes) == 0) break;
+                // This game swaps programs in and out many times a picture. A block that does not wrap is copied in one piece, and the
+                // program cache is told which part changed.
+                std::memcpy(code + at_first, data, bytes);
+                vu::code_changed(unit, at_first, bytes);
+                break;
+            }
+            bool changed = false;
+            for (std::uint32_t i = 0; i < count; ++i) {
+                std::uint8_t *at = code + ((imm * 8u + i * 8u) & (size - 1));
+                if (std::memcmp(at, data + i * 2, 8) == 0) continue;
+                std::memcpy(at, data + i * 2, 8);
+                changed = true;
+            }
+            if (changed) vu::code_changed(unit);
+            break;
+        }
+    }
+    case 0x50: case 0x51: {
+        const std::uint32_t qwc = imm ? imm : 0x10000u;
+        const auto *p = reinterpret_cast<const std::uint8_t *>(data);
+        if constexpr (IsShadow) gif::scan_signals(2, p, qwc);
+#ifdef PS2_PICA
+        else if (unit == 1 && p >= g_ram && p + static_cast<std::size_t>(qwc) * 16u <= g_ram + kRamSize)
+            gif::transfer_ram(2, p, qwc);
+#endif
+        else gif::transfer(2, p, qwc);
+        break;
+    }
+    default:
+        if ((op & 0x60u) == 0x60u) {
+            if constexpr (IsShadow) {
+                if (u.mode != 2) u.num = 0;
+                else unpack(unit, u, true, cmd, data);
+            } else {
+                unpack(unit, u, false, cmd, data);
+            }
+        }
+        else std::fprintf(stderr, "[vif%d] unknown command 0x%08X\n", unit, cmd);
+'''),
+        ('''        u.stat |= 0xC00u;
+        u.stalled = true;
+        if (!from_vu) hw::intc_raise(4u + static_cast<unsigned>(unit));
+    }
+}
+
+std::size_t run(int unit, Unit &u, bool from_vu, bool is_shadow, const std::uint32_t *words, std::size_t count) {
+    const std::uint32_t *at = words;
+    const std::uint32_t *const end = words + count;
+''',
+         '''        u.stat |= 0xC00u;
+        u.stalled = true;
+        if constexpr (!FromVu) hw::intc_raise(4u + static_cast<unsigned>(unit));
+    }
+}
+
+template <bool FromVu, bool IsShadow>
+std::size_t run(int unit, Unit &u, const std::uint32_t *words, std::size_t count) {
+    const std::uint32_t *at = words;
+    const std::uint32_t *const end = words + count;
+'''),
+        ('''            continue;
+        }
+        const std::uint32_t need = data_words(u, cmd);
+        if (static_cast<std::size_t>(end - at) < need) {
+''',
+         '''            continue;
+        }
+        if constexpr (FromVu || IsShadow) {
+            if (!(cmd & 0x80000000u)) {
+                const std::uint32_t op = cmd >> 24;
+                if (op <= 0x13u) {
+                    u.code = cmd;
+                    const std::uint32_t imm = cmd & 0xFFFFu;
+                    switch (op) {
+                    case 0x01: u.cycle = imm; continue;
+                    case 0x02: u.ofst = imm & 0x3FFu; u.dbf = false; u.tops = u.base; continue;
+                    case 0x03: u.base = imm & 0x3FFu; continue;
+                    case 0x04: u.itops = imm & 0x3FFu; continue;
+                    case 0x05: u.mode = imm & 3u; continue;
+                    case 0x07: u.mark = imm; continue;
+                    case 0x10: case 0x11: case 0x13: continue;
+                    default: break;
+                    }
+                }
+            }
+        }
+        const std::uint32_t need = data_words(u, cmd);
+        if (static_cast<std::size_t>(end - at) < need) {
+'''),
+        ('''            break;
+        }
+        execute(unit, u, from_vu, is_shadow, cmd, at);
+        at += need;
+    }
+''',
+         '''            break;
+        }
+        execute<FromVu, IsShadow>(unit, u, cmd, at);
+        at += need;
+    }
+'''),
+        ('''                       kWItop = 512, kWMask = 1024, kWRow = 2048, kWCol = 4096, kWNum = 8192, kWCode = 16384 };
+struct Key {
+    std::uint32_t cycle, mode, base, ofst, tops, itops, dbf;
+    bool operator==(const Key &o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
+};
+Key key_of(const Unit &u) { return Key{u.cycle, u.mode, u.base, u.ofst, u.tops, u.itops, u.dbf ? 1u : 0u}; }
+struct Replay {
+    const std::uint8_t *data;
+    std::uint32_t qwc, wrote;
+    Key before;
+    std::uint32_t cycle, ofst, tops, base, itops, mode, mark, top, itop, mask, row[4], col[4], num, code;
+    std::uint32_t records, words, epoch;   // what to send the VU thread: g_records[records], words long, if epoch is still g_epoch
+    std::uint32_t hash;   // of the bytes then: the same place can hold other unchanging data later (a new area's models)
+    bool dbf;
+};
+void record(Replay &r, const Unit &u) {
+    r.cycle = u.cycle; r.ofst = u.ofst; r.tops = u.tops; r.base = u.base; r.itops = u.itops; r.mode = u.mode; r.mark = u.mark;
+    r.top = u.top; r.itop = u.itop; r.mask = u.mask; r.num = u.num; r.code = u.code; r.dbf = u.dbf;
+    std::memcpy(r.row, u.row, sizeof r.row);
+    std::memcpy(r.col, u.col, sizeof r.col);
+}
+void replay(const Replay &r, Unit &u) {
+    const std::uint32_t w = r.wrote;
+    if (w & kWCycle) u.cycle = r.cycle;
+    if (w & kWOfst) u.ofst = r.ofst;
+    if (w & kWDbf) u.dbf = r.dbf;
+    if (w & kWTops) u.tops = r.tops;
+    if (w & kWBase) u.base = r.base;
+''',
+         '''                       kWItop = 512, kWMask = 1024, kWRow = 2048, kWCol = 4096, kWNum = 8192, kWCode = 16384 };
+struct Key {
+    std::uint32_t a, b, c;
+    bool operator==(const Key &o) const { return a == o.a && b == o.b && c == o.c; }
+};
+inline Key key_of(const Unit &u) {
+    return Key{(u.cycle & 0xFFFFu) | ((u.mode & 3u) << 16) | (u.dbf ? 0x100000u : 0u),
+               (u.base & 0x3FFu) | ((u.ofst & 0x3FFu) << 16),
+               (u.tops & 0x3FFu) | ((u.itops & 0x3FFu) << 16)};
+}
+struct ReplayRowCol {
+    std::uint32_t row[4], col[4];
+};
+struct Replay {
+    const std::uint8_t *data;
+    Key before;
+    std::uint32_t qwc, epoch, hash;
+    std::uint32_t records, mask, code;
+    std::uint16_t words, wrote, cycle, mark, ofst, tops, base, itops, top, itop;
+    std::uint8_t mode, num, flags;   // bit 0: dbf, bit 1: skip_safe
+};
+constexpr std::uint32_t kReplays = 4096;
+Replay *g_replays = nullptr;   // ~272 KB, from the heap on first use
+ReplayRowCol *g_replay_rc = nullptr;
+void record(Replay &r, std::uint32_t idx, const Unit &u) {
+    r.cycle = static_cast<std::uint16_t>(u.cycle);
+    r.ofst = static_cast<std::uint16_t>(u.ofst);
+    r.tops = static_cast<std::uint16_t>(u.tops);
+    r.base = static_cast<std::uint16_t>(u.base);
+    r.itops = static_cast<std::uint16_t>(u.itops);
+    r.mode = static_cast<std::uint8_t>(u.mode);
+    r.mark = static_cast<std::uint16_t>(u.mark);
+    r.top = static_cast<std::uint16_t>(u.top);
+    r.itop = static_cast<std::uint16_t>(u.itop);
+    r.mask = u.mask;
+    r.num = static_cast<std::uint8_t>(u.num);
+    r.code = u.code;
+    r.flags = (u.dbf ? 1u : 0u) | (r.flags & 2u);
+    if (r.wrote & (kWRow | kWCol)) {
+        if (!g_replay_rc) g_replay_rc = new ReplayRowCol[kReplays]();
+        if (r.wrote & kWRow) std::memcpy(g_replay_rc[idx].row, u.row, sizeof u.row);
+        if (r.wrote & kWCol) std::memcpy(g_replay_rc[idx].col, u.col, sizeof u.col);
+    }
+}
+void replay(const Replay &r, std::uint32_t idx, Unit &u) {
+    const std::uint32_t w = r.wrote;
+    if (w & kWCycle) u.cycle = r.cycle;
+    if (w & kWOfst) u.ofst = r.ofst;
+    if (w & kWDbf) u.dbf = (r.flags & 1u) != 0;
+    if (w & kWTops) u.tops = r.tops;
+    if (w & kWBase) u.base = r.base;
+'''),
+        ('''    if (w & kWItop) u.itop = r.itop;
+    if (w & kWMask) u.mask = r.mask;
+    if (w & kWRow) std::memcpy(u.row, r.row, sizeof r.row);
+    if (w & kWCol) std::memcpy(u.col, r.col, sizeof r.col);
+    if (w & kWNum) u.num = r.num;
+    if (w & kWCode) u.code = r.code;
+}
+constexpr std::uint32_t kReplays = 4096;
+Replay *g_replays = nullptr;   // 512 KB, from the heap on first use
+std::uint32_t replay_slot(const std::uint8_t *data, std::uint32_t qwc, const Key &k) {
+    std::uint32_t h = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(data)) * 2654435761u ^ qwc;
+    const auto *w = reinterpret_cast<const std::uint32_t *>(&k);
+    for (std::size_t i = 0; i < sizeof k / 4; ++i) h = (h ^ w[i]) * 16777619u;
+    return (h ^ (h >> 15)) & (kReplays - 1);
+}
+''',
+         '''    if (w & kWItop) u.itop = r.itop;
+    if (w & kWMask) u.mask = r.mask;
+    if (w & (kWRow | kWCol)) {
+        if (w & kWRow) std::memcpy(u.row, g_replay_rc[idx].row, sizeof u.row);
+        if (w & kWCol) std::memcpy(u.col, g_replay_rc[idx].col, sizeof u.col);
+    }
+    if (w & kWNum) u.num = r.num;
+    if (w & kWCode) u.code = r.code;
+}
+inline std::uint32_t replay_slot(const std::uint8_t *data, std::uint32_t qwc, const Key &k) {
+    std::uint32_t h = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(data)) * 2654435761u ^ qwc;
+    h = (h ^ k.a) * 16777619u;
+    h = (h ^ k.b) * 16777619u;
+    h = (h ^ k.c) * 16777619u;
+    return (h ^ (h >> 15)) & (kReplays - 1);
+}
+'''),
+        ('''    const std::size_t count = static_cast<std::size_t>(qwc) * 4;
+    const Key before = key_of(u);
+    Replay &slot = g_replays[replay_slot(data, qwc, before)];
+    if (g_kept_words) send_kept();
+    if (slot.data == data && slot.qwc == qwc && slot.before == before && slot.epoch == g_epoch && slot.hash == gs::queue::g_unchanging_hash) {
+        std::uint32_t at = slot.records, left = slot.words;
+        while (left) {   // in pieces no bigger than send_kept's
+            std::uint32_t n = 0;
+            while (n < left) {
+                const std::uint32_t r = g_records[at + n], size = r >> 31 ? 2u : 1u + r;
+                if (n && n + size > 1u + kCopiedWords) break;
+                n += size;
+            }
+            std::memcpy(gs::queue::vu().extend(gs::queue::kVif1Records, n * 4u), g_records + at, n * 4u);
+            at += n;
+            left -= n;
+        }
+        replay(slot, u);
+        return true;
+    }
+''',
+         '''    const std::size_t count = static_cast<std::size_t>(qwc) * 4;
+    const Key before = key_of(u);
+    const std::uint32_t slot_idx = replay_slot(data, qwc, before);
+    Replay &slot = g_replays[slot_idx];
+    if (g_kept_words) send_kept();
+    if (slot.data == data && slot.qwc == qwc && slot.before == before && slot.epoch == g_epoch && slot.hash == gs::queue::g_unchanging_hash) {
+        if (gs::queue::g_ee_skip && (slot.flags & 2u)) {
+            std::uint32_t buf[22];
+            std::uint32_t n = 0;
+            const std::uint32_t w = slot.wrote;
+            buf[n++] = 0x40000000u | (w & 0x7FFFu) | ((slot.flags & 1u) ? 0x00010000u : 0u);
+            if (w & kWCycle) buf[n++] = slot.cycle;
+            if (w & kWOfst) buf[n++] = slot.ofst;
+            if (w & kWTops) buf[n++] = slot.tops;
+            if (w & kWBase) buf[n++] = slot.base;
+            if (w & kWItops) buf[n++] = slot.itops;
+            if (w & kWMode) buf[n++] = slot.mode;
+            if (w & kWMark) buf[n++] = slot.mark;
+            if (w & kWTop) buf[n++] = slot.top;
+            if (w & kWItop) buf[n++] = slot.itop;
+            if (w & kWMask) buf[n++] = slot.mask;
+            if (w & kWRow) { std::memcpy(buf + n, g_replay_rc[slot_idx].row, 16); n += 4; }
+            if (w & kWCol) { std::memcpy(buf + n, g_replay_rc[slot_idx].col, 16); n += 4; }
+            if (w & kWNum) buf[n++] = slot.num;
+            if (w & kWCode) buf[n++] = slot.code;
+            std::memcpy(gs::queue::vu().extend(gs::queue::kVif1Records, n * 4u), buf, n * 4u);
+            replay(slot, slot_idx, u);
+            return true;
+        }
+        std::uint32_t at = slot.records, left = slot.words;
+        if (left <= 1u + kCopiedWords) {
+            if (left) std::memcpy(gs::queue::vu().extend(gs::queue::kVif1Records, left * 4u), g_records + at, left * 4u);
+        } else {
+            while (left) {   // in pieces no bigger than send_kept's
+                std::uint32_t n = 0;
+                while (n < left) {
+                    const std::uint32_t r = g_records[at + n];
+                    const std::uint32_t size = (r >> 31) ? ((r & 0x40000000u) ? 3u : 2u) : 1u + r;
+                    if (n && n + size > 1u + kCopiedWords) break;
+                    n += size;
+                }
+                std::memcpy(gs::queue::vu().extend(gs::queue::kVif1Records, n * 4u), g_records + at, n * 4u);
+                at += n;
+                left -= n;
+            }
+        }
+        replay(slot, slot_idx, u);
+        return true;
+    }
+'''),
+        ('''    }
+    g_side = false;
+    g_wrote = kWCode;   // a transfer of only padding still clears the code register
+    const std::size_t pos = run_skipped(unit, u, words, count);
+''',
+         '''    }
+    g_side = false;
+    g_skip_unsafe = false;
+    g_wrote = kWCode;   // a transfer of only padding still clears the code register
+    const std::size_t pos = run_skipped(unit, u, words, count);
+'''),
+        ('''        slot.data = data;
+        slot.qwc = qwc;
+        slot.wrote = g_wrote;
+        slot.before = before;
+        slot.records = g_records_used;
+        slot.words = g_capture_words;
+        slot.epoch = g_epoch;
+        slot.hash = gs::queue::g_unchanging_hash;
+        g_records_used += g_capture_words;
+        record(slot, u);
+    }
+    return true;
+''',
+         '''        slot.data = data;
+        slot.qwc = qwc;
+        slot.wrote = static_cast<std::uint16_t>(g_wrote);
+        slot.before = before;
+        slot.records = g_records_used;
+        slot.words = static_cast<std::uint16_t>(g_capture_words);
+        slot.epoch = g_epoch;
+        slot.hash = gs::queue::g_unchanging_hash;
+        slot.flags = g_skip_unsafe ? 0u : 2u;
+        g_records_used += g_capture_words;
+        record(slot, slot_idx, u);
+    }
+    return true;
+'''),
+        ('''        const bool whole = start + need <= count;
+        const bool unpacks = (cmd & 0x60000000u) == 0x60000000u && u.mode != 2;
+        // These two do nothing with their data on this side, so they can run before it has all arrived, unless they also stop the DMA.
+        if (!whole && !((unpacks || ((cmd >> 24) & 0x7Fu) == 0x4A) && !(cmd >> 31))) break;
+        const bool buffered = drop && unpacks && (cmd & 0x80008000u) == 0x8000u;
+        execute(unit, u, false, true, cmd, words + start);
+        if (whole) {
+            if (!buffered && unpacks) {
+                keep(words + pos, 1);
+                keep_data(words + start, need);
+            } else if (!buffered) {
+                keep(words + pos, 1u + need);
+''',
+         '''        const bool whole = start + need <= count;
+        const bool unpacks = (cmd & 0x60000000u) == 0x60000000u && u.mode != 2;
+        const bool is_mpg = ((cmd >> 24) & 0x7Fu) == 0x4Au;
+        const bool is_direct = !drop && (((cmd >> 24) & 0x7Fu) == 0x50u || ((cmd >> 24) & 0x7Fu) == 0x51u);
+        // These two do nothing with their data on this side, so they can run before it has all arrived, unless they also stop the DMA.
+        if (!whole && !((unpacks || is_mpg) && !(cmd >> 31))) break;
+        const bool buffered = drop && unpacks && (cmd & 0x80008000u) == 0x8000u;
+        execute<false, true>(unit, u, cmd, words + start);
+        if (whole) {
+            if (!buffered && (unpacks || is_mpg || is_direct)) {
+                const auto *at_bytes = reinterpret_cast<const std::uint8_t *>(words + start);
+                if ((need >= kAddressedWords || (is_mpg && need >= 4u)) && at_bytes >= g_ram && at_bytes + need * 4u <= g_ram + kRamSize) {
+                    if (g_kept_words) send_kept();
+                    auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 12u));
+                    rec[0] = static_cast<std::uint32_t>(need) | 0xC0000000u;
+                    rec[1] = cmd;
+                    rec[2] = static_cast<std::uint32_t>(at_bytes - g_ram);
+                    capture(rec, 3u);
+                } else {
+                    keep(words + pos, 1u + need);
+                }
+            } else if (!buffered) {
+                keep(words + pos, 1u + need);
+'''),
+        ('''// the next transfer. If only the command is pending, read the complete payload
+// from the new transfer without copying it through the pending vector.
+[[gnu::always_inline]] inline bool run_transfer(int unit, Unit &u, bool from_vu, bool is_shadow, const std::uint32_t *words, std::size_t count) {
+    if (u.stalled) return false;
+    std::size_t pos = 0;
+''',
+         '''// the next transfer. If only the command is pending, read the complete payload
+// from the new transfer without copying it through the pending vector.
+template <bool FromVu, bool IsShadow>
+[[gnu::always_inline]] inline bool run_transfer(int unit, Unit &u, const std::uint32_t *words, std::size_t count) {
+    if (u.stalled) return false;
+    std::size_t pos = 0;
+'''),
+        ('''        const std::uint32_t need = data_words(u, cmd);
+        if (!need || need > count) return false;
+        execute(unit, u, from_vu, is_shadow, cmd, words);
+        u.pending.clear();
+        pos = need;
+    }
+    pos += run(unit, u, from_vu, is_shadow, words + pos, count - pos);
+    if (pos < count) u.pending.assign(words + pos, words + count);
+    return true;
+''',
+         '''        const std::uint32_t need = data_words(u, cmd);
+        if (!need || need > count) return false;
+        execute<FromVu, IsShadow>(unit, u, cmd, words);
+        u.pending.clear();
+        pos = need;
+    }
+    pos += run<FromVu, IsShadow>(unit, u, words + pos, count - pos);
+    if (pos < count) u.pending.assign(words + pos, words + count);
+    return true;
+'''),
+        ('''
+void process(int unit, Unit &u, bool from_vu, bool is_shadow) {
+    const std::size_t pos = run(unit, u, from_vu, is_shadow, u.pending.data(), u.pending.size());
+    u.pending.erase(u.pending.begin(), u.pending.begin() + static_cast<std::ptrdiff_t>(pos));
+}
+''',
+         '''
+void process(int unit, Unit &u, bool from_vu, bool is_shadow) {
+    const std::size_t pos = from_vu ? run<true, false>(unit, u, u.pending.data(), u.pending.size())
+                          : is_shadow ? run<false, true>(unit, u, u.pending.data(), u.pending.size())
+                                      : run<false, false>(unit, u, u.pending.data(), u.pending.size());
+#ifdef PS2_PICA
+    if (from_vu && g_def_any_non_ram) flush_deferred_unpacks();
+#endif
+    u.pending.erase(u.pending.begin(), u.pending.begin() + static_cast<std::ptrdiff_t>(pos));
+}
+'''),
+        ('''}
+
+void reset_vu_side() { g_vu_side = Unit{}; }
+
+void stats() {
+''',
+         '''}
+
+void reset_vu_side() {
+#ifdef PS2_PICA
+    discard_deferred_unpacks();
+    discard_deferred_mpg();
+#endif
+    g_vu_side = Unit{};
+}
+
+void stats() {
+'''),
+        ('''        // command runs here now, and the VU thread, which also holds it, gets the data as an address.
+        const std::uint32_t cmd = u.pending.front(), need = data_words(u, cmd);
+        if ((cmd & 0xE0000000u) == 0x60000000u && u.mode != 2 && need && need <= static_cast<std::size_t>(qwc) * 4) {
+            execute(unit, u, false, true, cmd, reinterpret_cast<const std::uint32_t *>(data));
+            u.pending.clear();
+            u.passing = need;
+''',
+         '''        // command runs here now, and the VU thread, which also holds it, gets the data as an address.
+        const std::uint32_t cmd = u.pending.front(), need = data_words(u, cmd);
+        const bool is_unpack = (cmd & 0xE0000000u) == 0x60000000u && u.mode != 2;
+        const bool is_mpg = ((cmd >> 24) & 0x7Fu) == 0x4Au && !(cmd >> 31);
+        const bool is_direct = (((cmd >> 24) & 0x7Fu) == 0x50u || ((cmd >> 24) & 0x7Fu) == 0x51u) && !(cmd >> 31);
+        if ((is_unpack || is_mpg || is_direct) && need && need <= static_cast<std::size_t>(qwc) * 4) {
+            execute<false, true>(unit, u, cmd, reinterpret_cast<const std::uint32_t *>(data));
+            u.pending.clear();
+            u.passing = need;
+'''),
+        ('''    }
+#endif
+    if (is_shadow) gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16);
+    const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+    const std::size_t count = static_cast<std::size_t>(qwc) * 4;
+    if (run_transfer(unit, u, from_vu, is_shadow, words, count)) return;
+    const std::size_t old = u.pending.size();
+    u.pending.resize(old + static_cast<std::size_t>(qwc) * 4);
+    std::memcpy(u.pending.data() + old, data, static_cast<std::size_t>(qwc) * 16);
+    process(unit, u, from_vu, is_shadow);
+}
+
+#ifdef PS2_PICA
+void transfer_words(const std::uint32_t *words, std::size_t count) {
+    Unit &u = g_vu_side;
+    if (run_transfer(1, u, true, false, words, count)) return;
+    u.pending.insert(u.pending.end(), words, words + count);
+    process(1, u, true, false);
+''',
+         '''    }
+#endif
+    if (is_shadow) {
+#ifdef PS2_PICA
+        if (qwc <= 512u) {
+            const std::uint32_t w = qwc * 4u;
+            auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 4u + w * 4u));
+            rec[0] = w;
+            std::memcpy(rec + 1, data, w * 4u);
+        } else
+#endif
+        gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16);
+    }
+    const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+    const std::size_t count = static_cast<std::size_t>(qwc) * 4;
+    const bool done = from_vu ? run_transfer<true, false>(unit, u, words, count)
+                    : is_shadow ? run_transfer<false, true>(unit, u, words, count)
+                                : run_transfer<false, false>(unit, u, words, count);
+    if (done) {
+#ifdef PS2_PICA
+        if (from_vu && g_def_any_non_ram) flush_deferred_unpacks();
+#endif
+        return;
+    }
+    const std::size_t old = u.pending.size();
+    u.pending.resize(old + static_cast<std::size_t>(qwc) * 4);
+    std::memcpy(u.pending.data() + old, data, static_cast<std::size_t>(qwc) * 16);
+    process(unit, u, from_vu, is_shadow);
+#ifdef PS2_PICA
+    if (from_vu && g_def_any_non_ram) flush_deferred_unpacks();
+#endif
+}
+
+#ifdef PS2_PICA
+void flush_deferred_unpacks() {
+    if (!g_def_count) return;
+    std::uint8_t *const mem = g_vu1_mem;
+    for (int i = 0; i < g_def_count; ++i) {
+        const DeferredUnpack &d = g_def_unpack[i];
+        kFastUnpack[d.vl][d.vn][d.usn ? 1 : 0](mem, 1023u, d.addr, 1u, d.cl - 1u, d.src, d.num);
+    }
+    g_def_count = 0;
+    g_def_slot_mask = 0;
+    g_def_min = 1024u;
+    g_def_max = 0u;
+    g_def_any_non_ram = false;
+}
+
+void discard_deferred_unpacks() {
+    g_def_count = 0;
+    g_def_slot_mask = 0;
+    g_def_min = 1024u;
+    g_def_max = 0u;
+    g_def_any_non_ram = false;
+}
+
+bool has_deferred_mpg() { return g_def_mpg_count != 0; }
+
+std::uintptr_t lookup_deferred_mpg(std::uint32_t address, std::uint64_t &sig_out, std::uint64_t &pages_out, std::uint8_t &count_out) {
+    const std::uint32_t pc = address & 16383u;
+    if (g_last_mpg[0].fn && g_last_mpg[0].pc == pc) return g_last_mpg[0].fn;
+    if (g_last_mpg[1].fn && g_last_mpg[1].pc == pc) return g_last_mpg[1].fn;
+    std::uint64_t h = 0xCBF29CE484222325ull ^ (static_cast<std::uint64_t>(pc) * 0x9E3779B97F4A7C15ull);
+    for (int i = 0; i < g_def_mpg_count; ++i) {
+        const DeferredMpg &d = g_def_mpg[i];
+        std::uint32_t w0, wm;
+        std::memcpy(&w0, d.src, 4);
+        std::memcpy(&wm, d.src + (d.bytes >> 1), 4);
+        h = (h ^ static_cast<std::uint64_t>(d.src - g_ram)) * 0x100000001B3ull;
+        h = (h ^ (static_cast<std::uint64_t>(d.first) | (static_cast<std::uint64_t>(d.bytes) << 16))) * 0x100000001B3ull;
+        h = (h ^ (static_cast<std::uint64_t>(w0) | (static_cast<std::uint64_t>(wm) << 32))) * 0x100000001B3ull;
+    }
+    sig_out = h;
+    pages_out = g_def_mpg_pages;
+    count_out = static_cast<std::uint8_t>(g_def_mpg_count);
+    const MpgCacheEntry &e = g_mpg_cache[(h ^ (h >> 16) ^ (h >> 32)) & (kMpgCacheSize - 1)];
+    if (e.fn && e.sig == h && e.pages == g_def_mpg_pages && e.address == pc && e.count == count_out) {
+        g_last_mpg[1] = g_last_mpg[0];
+        g_last_mpg[0] = LastMpg{pc, e.fn};
+        return e.fn;
+    }
+    return 0;
+}
+
+void cache_deferred_mpg(std::uint32_t address, std::uint64_t sig, std::uint64_t pages, std::uint8_t count, std::uintptr_t fn) {
+    MpgCacheEntry &e = g_mpg_cache[(sig ^ (sig >> 16) ^ (sig >> 32)) & (kMpgCacheSize - 1)];
+    e = MpgCacheEntry{sig, pages, address & 16383u, count, fn};
+}
+
+void flush_deferred_mpg() {
+    if (!g_def_mpg_count) return;
+    g_last_mpg[0].fn = g_last_mpg[1].fn = 0;
+    for (int i = 0; i < g_def_mpg_count; ++i) {
+        const DeferredMpg &d = g_def_mpg[i];
+        if (std::memcmp(g_vu1_code + d.first, d.src, d.bytes) != 0) {
+            std::memcpy(g_vu1_code + d.first, d.src, d.bytes);
+            vu::code_changed(1, d.first, d.bytes);
+        }
+    }
+    g_def_mpg_count = 0;
+    g_def_mpg_pages = 0;
+}
+
+void discard_deferred_mpg() {
+    g_last_mpg[0].fn = g_last_mpg[1].fn = 0;
+    g_def_mpg_count = 0;
+    g_def_mpg_pages = 0;
+}
+
+bool get_g3_streams(std::uint32_t top, std::uint32_t stride, DirectStreams &out) {
+    if (!g_def_count || g_def_tops != top || g_def_cl != stride) return false;
+    out.top = g_def_tops;
+    out.stride = g_def_cl;
+    out.mask = g_def_slot_mask;
+    for (int i = 0; i < g_def_count; ++i) {
+        const DeferredUnpack &d = g_def_unpack[i];
+        if (d.rel < 5) out.s[d.rel] = DirectStream{d.src, d.num, d.vn, d.vl, d.usn};
+    }
+    return true;
+}
+
+void transfer_tte(int unit, const std::uint32_t words[2]) {
+    if (unit == 1 && gs::queue::vu_active() && !on_vu_thread()) {
+        Unit &u = g_units[1];
+        if (!words[0] && !words[1] && !u.stalled && u.pending.empty() && !u.dropping && !u.passing) {
+            u.code = 0;
+            return;
+        }
+        if (!gs::queue::g_ee_skip && !u.stalled && u.pending.empty() && !u.dropping && !u.passing) {
+            PS2_PROF(ps2::prof::Vif);
+            auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 12u));
+            rec[0] = 2u;
+            rec[1] = words[0];
+            rec[2] = words[1];
+            const std::size_t pos = run<false, true>(1, u, words, 2);
+            if (pos < 2) u.pending.assign(words + pos, words + 2);
+            return;
+        }
+    }
+    alignas(16) std::uint32_t q[4] = {0, 0, words[0], words[1]};
+    transfer(unit, reinterpret_cast<const std::uint8_t *>(q), 1);
+}
+
+void transfer_dynamic(int unit, const std::uint8_t *data, std::uint32_t qwc) {
+    if (unit == 1 && gs::queue::vu_active() && !on_vu_thread() && !gs::queue::g_ee_skip && qwc > 0) {
+        Unit &u = g_units[1];
+        if (!u.stalled && !u.dropping && !u.passing) {
+            PS2_PROF(ps2::prof::Vif);
+            if (qwc <= 512u) {
+                const std::uint32_t w = qwc * 4u;
+                auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 4u + w * 4u));
+                rec[0] = w;
+                std::memcpy(rec + 1, data, w * 4u);
+            } else {
+                gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16u);
+            }
+            const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+            const std::size_t count = static_cast<std::size_t>(qwc) * 4u;
+            if (!run_transfer<false, true>(1, u, words, count)) {
+                const std::size_t old = u.pending.size();
+                u.pending.resize(old + count);
+                std::memcpy(u.pending.data() + old, data, count * 4u);
+                process(1, u, false, true);
+            }
+            return;
+        }
+    }
+    transfer(unit, data, qwc);
+}
+
+void transfer_tte_data(int unit, const std::uint32_t words[2], const std::uint8_t *data, std::uint32_t qwc, bool may_unchanging) {
+    if (unit == 1 && gs::queue::vu_active() && !on_vu_thread() && !gs::queue::g_ee_skip && qwc > 0) {
+        Unit &u = g_units[1];
+        if (!u.stalled && u.pending.empty() && !u.dropping && !u.passing) {
+            const std::uint32_t w0 = words[0], w1 = words[1];
+            if (!w0 && !w1 && !may_unchanging) {
+                u.code = 0;
+                transfer_dynamic(unit, data, qwc);
+                return;
+            }
+            const std::uint32_t op0 = w0 >> 24;
+            const bool w0_ok = !w0 || (!(w0 & 0x80000000u) && (op0 <= 0x05u || op0 == 0x07u || op0 == 0x10u || op0 == 0x11u || op0 == 0x13u));
+            const bool is_unpack = (w1 & 0xE0000000u) == 0x60000000u;
+            const bool is_mpg = ((w1 >> 24) & 0x7Fu) == 0x4Au && !(w1 >> 31);
+            if (w0_ok && (is_unpack || is_mpg)) {
+                const std::uint32_t eff_mode = (w0 && op0 == 0x05u) ? (w0 & 3u) : u.mode;
+                if (!is_unpack || eff_mode != 2u) {
+                    std::uint32_t need;
+                    if (is_mpg) {
+                        const std::uint32_t num = (w1 >> 16) & 0xFFu;
+                        need = (num ? num : 256u) * 2u;
+                    } else {
+                        Unit tmp = u;
+                        if (w0 && op0 == 0x01u) tmp.cycle = w0 & 0xFFFFu;
+                        need = data_words(tmp, w1);
+                    }
+                    if (need == qwc * 4u) {
+                        PS2_PROF(ps2::prof::Vif);
+                        if (w0) {
+                            const std::uint32_t imm0 = w0 & 0xFFFFu;
+                            switch (op0) {
+                            case 0x01: u.cycle = imm0; break;
+                            case 0x02: u.ofst = imm0 & 0x3FFu; u.dbf = false; u.tops = u.base; break;
+                            case 0x03: u.base = imm0 & 0x3FFu; break;
+                            case 0x04: u.itops = imm0 & 0x3FFu; break;
+                            case 0x05: u.mode = imm0 & 3u; break;
+                            case 0x07: u.mark = imm0; break;
+                            default: break;
+                            }
+                        }
+                        u.code = w1;
+                        if (is_unpack) u.num = 0;
+                        if (may_unchanging && qwc >= 4u && data >= g_ram && data + static_cast<std::size_t>(qwc) * 16u <= g_ram + kRamSize &&
+                            gs::queue::unchanging(data, qwc * 16u)) {
+                            const std::uint32_t off = static_cast<std::uint32_t>(data - g_ram);
+                            if (w0) {
+                                auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 20u));
+                                rec[0] = 1u;
+                                rec[1] = w0;
+                                rec[2] = need | 0xC0000000u;
+                                rec[3] = w1;
+                                rec[4] = off;
+                            } else {
+                                auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 12u));
+                                rec[0] = need | 0xC0000000u;
+                                rec[1] = w1;
+                                rec[2] = off;
+                            }
+                            return;
+                        }
+                        if (qwc <= 512u) {
+                            if (w0) {
+                                auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, (3u + need) * 4u));
+                                rec[0] = 2u + need;
+                                rec[1] = w0;
+                                rec[2] = w1;
+                                std::memcpy(rec + 3, data, need * 4u);
+                            } else {
+                                auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, (2u + need) * 4u));
+                                rec[0] = 1u + need;
+                                rec[1] = w1;
+                                std::memcpy(rec + 2, data, need * 4u);
+                            }
+                            return;
+                        }
+                        if (w0) {
+                            auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 12u));
+                            rec[0] = 2u;
+                            rec[1] = w0;
+                            rec[2] = w1;
+                        } else {
+                            auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 8u));
+                            rec[0] = 1u;
+                            rec[1] = w1;
+                        }
+                        gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16u);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    transfer_tte(unit, words);
+    if (may_unchanging) transfer(unit, data, qwc);
+    else transfer_dynamic(unit, data, qwc);
+}
+
+void transfer_words(const std::uint32_t *words, std::size_t count) {
+    Unit &u = g_vu_side;
+    if (run_transfer<true, false>(1, u, words, count)) return;
+    u.pending.insert(u.pending.end(), words, words + count);
+    process(1, u, true, false);
+'''),
+        ('''    while (at < end) {
+        const std::uint32_t count = *at++;
+        if (count >> 31) transfer_words(reinterpret_cast<const std::uint32_t *>(g_ram + *at++), count & 0x7FFFFFFFu);
+        else {
+            transfer_words(at, count);
+            at += count;
+        }
+    }
+}
+#endif
+''',
+         '''    while (at < end) {
+        const std::uint32_t count = *at++;
+        if ((count & 0xC0000000u) == 0xC0000000u) {
+            const std::uint32_t cmd = *at++;
+            const std::uint32_t off = *at++;
+            if (g_vu_side.pending.empty() && !g_vu_side.stalled) {
+                execute<true, false>(1, g_vu_side, cmd, reinterpret_cast<const std::uint32_t *>(g_ram + off));
+            } else {
+                transfer_words(&cmd, 1);
+                transfer_words(reinterpret_cast<const std::uint32_t *>(g_ram + off), count & 0x3FFFFFFFu);
+            }
+        } else if (count >> 31) {
+            transfer_words(reinterpret_cast<const std::uint32_t *>(g_ram + *at++), count & 0x7FFFFFFFu);
+        } else if (count & 0x40000000u) {
+            discard_deferred_unpacks();
+            Unit &u = g_vu_side;
+            const std::uint32_t w = count & 0x7FFFu;
+            if (w & kWCycle) u.cycle = *at++;
+            if (w & kWOfst) u.ofst = *at++;
+            if (w & kWDbf) u.dbf = ((count >> 16) & 1u) != 0;
+            if (w & kWTops) u.tops = *at++;
+            if (w & kWBase) u.base = *at++;
+            if (w & kWItops) u.itops = *at++;
+            if (w & kWMode) u.mode = *at++;
+            if (w & kWMark) u.mark = *at++;
+            if (w & kWTop) u.top = *at++;
+            if (w & kWItop) u.itop = *at++;
+            if (w & kWMask) u.mask = *at++;
+            if (w & kWRow) { std::memcpy(u.row, at, 16); at += 4; }
+            if (w & kWCol) { std::memcpy(u.col, at, 16); at += 4; }
+            if (w & kWNum) u.num = *at++;
+            if (w & kWCode) u.code = *at++;
+            if (w & (kWTop | kWItop)) vu::set_tops(u.top, u.itop);
+        } else {
+            transfer_words(at, count);
+            at += count;
+        }
+    }
+    if (g_def_any_non_ram) flush_deferred_unpacks();
+}
+#endif
+'''),
+        ('''
+void state(ps2::state::Stream &s) {
+    s.tag("vif");
+    for (Unit *u : {&g_units[0], &g_units[1], &g_vu_side}) {
+''',
+         '''
+void state(ps2::state::Stream &s) {
+#ifdef PS2_PICA
+    flush_deferred_unpacks();
+    flush_deferred_mpg();
+#endif
+    s.tag("vif");
+    for (Unit *u : {&g_units[0], &g_units[1], &g_vu_side}) {
+'''),
+    ],
+    'runtime/src/vif.hpp': [
+        ('''void reset_vu_side();
+void stats();
+void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc);
+void transfer_records(const std::uint8_t *payload, std::uint32_t bytes);   // ps2run_3ds_patch.py: on the VU thread
+bool stalled(int unit);
+std::uint32_t read(int unit, std::uint32_t reg);
+''',
+         '''void reset_vu_side();
+void stats();
+
+void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc);
+void transfer_records(const std::uint8_t *payload, std::uint32_t bytes);   // ps2run_3ds_patch.py: on the VU thread
+#ifdef PS2_PICA
+struct DirectStream {
+    const std::uint8_t *src;
+    std::uint16_t num;
+    std::uint8_t vn, vl;
+    bool usn;
+};
+struct DirectStreams {
+    std::uint16_t top;
+    std::uint8_t stride;
+    std::uint8_t mask;
+    DirectStream s[5];
+};
+bool get_g3_streams(std::uint32_t top, std::uint32_t stride, DirectStreams &out);
+void flush_deferred_unpacks();
+void discard_deferred_unpacks();
+bool has_deferred_mpg();
+std::uintptr_t lookup_deferred_mpg(std::uint32_t address, std::uint64_t &sig_out, std::uint64_t &pages_out, std::uint8_t &count_out);
+void cache_deferred_mpg(std::uint32_t address, std::uint64_t sig, std::uint64_t pages, std::uint8_t count, std::uintptr_t fn);
+void flush_deferred_mpg();
+void discard_deferred_mpg();
+void transfer_tte(int unit, const std::uint32_t words[2]);
+void transfer_tte_data(int unit, const std::uint32_t words[2], const std::uint8_t *data, std::uint32_t qwc, bool may_unchanging = true);
+void transfer_dynamic(int unit, const std::uint8_t *data, std::uint32_t qwc);
+#endif
+bool stalled(int unit);
+std::uint32_t read(int unit, std::uint32_t reg);
+'''),
+    ],
+    'runtime/src/vu_micro.cpp': [
+        ('''#include "gs/gif.hpp"
+#include "gs/queue.hpp"
+#include "vu_jit_web.hpp"
+#include "hw.hpp"
+''',
+         '''#include "gs/gif.hpp"
+#include "gs/queue.hpp"
+#include "vif.hpp"
+#include "vu_jit_web.hpp"
+#include "hw.hpp"
+'''),
+        ('''
+void reset() {
+    if (gs::queue::vu_active() && gs::queue::role() != gs::queue::Role::Vu) {
+        gs::queue::vu().post(gs::queue::kVuReset, 0, 0, nullptr, 0);
+        return;
+''',
+         '''
+void reset() {
+    if (gs::queue::vu_active() && !gs::queue::is_vu_thread()) {
+        gs::queue::vu().post(gs::queue::kVuReset, 0, 0, nullptr, 0);
+        return;
+'''),
+        ('''
+std::uintptr_t program_at(std::uint32_t address);
+void run_program(std::uint32_t address) { interpret(1, address); }   // ps2run_3ds_patch.py
+
+ProgramFn lookup(std::uint32_t address) {
+    EntryCache &e = g_entries[(address & 16383u) >> 3];
+    if (e.generation == g_generation[1]) return e.function;
+''',
+         '''
+std::uintptr_t program_at(std::uint32_t address);
+void run_program(std::uint32_t address) {
+#ifdef PS2_PICA
+    vif::flush_deferred_mpg();
+#endif
+    interpret(1, address);
+}   // ps2run_3ds_patch.py
+
+ProgramFn lookup_flushed(std::uint32_t address) {
+    EntryCache &e = g_entries[(address & 16383u) >> 3];
+    if (e.generation == g_generation[1]) return e.function;
+'''),
+        ('''    }
+    return e.function;
+}
+
+''',
+         '''    }
+    return e.function;
+}
+
+ProgramFn lookup(std::uint32_t address) {
+#ifdef PS2_PICA
+    if (vif::has_deferred_mpg()) {
+        std::uint64_t sig = 0, pages = 0;
+        std::uint8_t cnt = 0;
+        if (const std::uintptr_t cached = vif::lookup_deferred_mpg(address, sig, pages, cnt))
+            return reinterpret_cast<ProgramFn>(cached);
+        vif::flush_deferred_mpg();
+        const ProgramFn fn = lookup_flushed(address);
+        if (fn) {
+            const EntryCache &e = g_entries[(address & 16383u) >> 3];
+            if ((pages & e.pages) == e.pages)
+                vif::cache_deferred_mpg(address, sig, pages, cnt, reinterpret_cast<std::uintptr_t>(fn));
+        }
+        return fn;
+    }
+#endif
+    return lookup_flushed(address);
+}
+
+'''),
+        ('''    if (n == 1 && !exact) {
+        if (g_native_hook && g_native_hook(address)) return;   // ps2run_3ds_patch.py
+        interpret(n, address);
+        return;
+    }
+    Unit u = unit_of(n);
+    Vu0Regs &r = *u.regs;
+''',
+         '''    if (n == 1 && !exact) {
+        if (g_native_hook && g_native_hook(address)) return;   // ps2run_3ds_patch.py
+#ifdef PS2_PICA
+        vif::flush_deferred_unpacks();
+        vif::flush_deferred_mpg();
+#endif
+        interpret(n, address);
+        return;
+    }
+#ifdef PS2_PICA
+    if (n == 1) {
+        vif::flush_deferred_unpacks();
+        vif::flush_deferred_mpg();
+    }
+#endif
+    Unit u = unit_of(n);
+    Vu0Regs &r = *u.regs;
+'''),
+        ('''
+void state(ps2::state::Stream &s) {
+    s.tag("vu");
+    s.pod(g_vu1);
+''',
+         '''
+void state(ps2::state::Stream &s) {
+#ifdef PS2_PICA
+    vif::flush_deferred_mpg();
+#endif
+    s.tag("vu");
+    s.pod(g_vu1);
+'''),
+    ],
+}
+
+
+# Core 2: a deferred texture upload that newer uploads wrote over whole is dropped instead of copied into GS memory.
+UPLOAD_EDITS = {
+    'runtime/src/gs/gs.cpp': [
+        ('''void materialize_deferred(int idx) {
+    DeferredUpload &u = g_deferred[idx];
+''',
+         '''// The newest upload (its g_deferred_seq, truncated) that wrote every byte of each block. A deferred upload whose blocks have all
+// been written whole since is dropped instead of copied into GS memory: nothing can read what it left there.
+std::uint32_t g_block_full[16384];
+
+// Calls fn(block, whole) for each block the rectangle touches, whole when it writes all 256 bytes of it, until fn returns false.
+// False when the format is not one this knows.
+template <class F>
+bool rect_blocks(std::uint32_t psm, std::uint32_t dbp, std::uint32_t dbw, std::uint32_t dsax, std::uint32_t dsay, std::uint32_t rrw,
+                 std::uint32_t rrh, F &&fn) {
+    std::uint32_t bw, bh, cols;
+    const int *table;
+    switch (psm) {
+    case PSMCT32: case PSMCT24: bw = 8; bh = 8; cols = 8; table = &kBlock32[0][0]; break;
+    case PSMCT16: bw = 16; bh = 8; cols = 4; table = &kBlock16[0][0]; break;
+    case PSMCT16S: bw = 16; bh = 8; cols = 4; table = &kBlock16S[0][0]; break;
+    case PSMT8: bw = 16; bh = 16; cols = 8; table = &kBlock32[0][0]; break;
+    case PSMT4: bw = 32; bh = 16; cols = 4; table = &kBlock16[0][0]; break;
+    default: return false;
+    }
+    if (!rrw || !rrh || dsax + rrw > 2048u || dsay + rrh > 2048u) return false;
+    std::uint32_t pw, ph;
+    psm_page_dims(psm, pw, ph);
+    const std::uint32_t per_row = std::max<std::uint32_t>(1, dbw * 64 / pw);
+    const bool can_be_whole = psm != PSMCT24;   // 24-bit pixels leave the top byte of each word as it was
+    const std::uint32_t x0 = dsax / bw, x1 = (dsax + rrw - 1u) / bw, y0 = dsay / bh, y1 = (dsay + rrh - 1u) / bh;
+    for (std::uint32_t by = y0; by <= y1; ++by) {
+        const std::uint32_t py = by * bh;
+        const bool whole_y = can_be_whole && py >= dsay && py + bh <= dsay + rrh;
+        for (std::uint32_t bx = x0; bx <= x1; ++bx) {
+            const std::uint32_t px = bx * bw;
+            const std::uint32_t block = dbp + ((px / pw) + (py / ph) * per_row) * 32u +
+                                        static_cast<std::uint32_t>(table[((py % ph) / bh) * cols + (px % pw) / bw]);
+            if (!fn(block & 16383u, whole_y && px >= dsax && px + bw <= dsax + rrw)) return true;
+        }
+    }
+    return true;
+}
+
+void mark_whole_blocks(std::uint32_t psm, std::uint32_t dbp, std::uint32_t dbw, std::uint32_t dsax, std::uint32_t dsay, std::uint32_t rrw,
+                       std::uint32_t rrh, std::uint64_t seq) {
+    rect_blocks(psm, dbp, dbw, dsax, dsay, rrw, rrh, [seq](std::uint32_t b, bool whole) {
+        if (whole) g_block_full[b] = static_cast<std::uint32_t>(seq);
+        return true;
+    });
+}
+
+bool superseded(const DeferredUpload &u) {
+    const std::uint32_t seq = static_cast<std::uint32_t>(u.seq);
+    bool all = true;
+    const bool known = rect_blocks(u.psm, static_cast<std::uint32_t>(u.bitbltbuf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(u.bitbltbuf >> 48) & 0x3Fu,
+                                   u.dsax, u.dsay, u.rrw, u.rrh,
+                                   [&](std::uint32_t b, bool) { return all = static_cast<std::int32_t>(g_block_full[b] - seq) > 0; });
+    return known && all;
+}
+
+void drop_deferred(int idx) {
+    g_deferred[idx].active = false;
+    g_def_range[idx] = 0u;
+    --g_deferred_count;
+}
+
+void materialize_deferred(int idx) {
+    DeferredUpload &u = g_deferred[idx];
+    if (superseded(u)) {
+        drop_deferred(idx);
+        return;
+    }
+'''),
+        ('''    if (!can_defer) {
+        if (g_deferred_count) {
+            if (contig) flush_deferred_blocks(first_block, end_block);
+            else flush_all_deferred_impl();
+        }
+        const std::uint64_t seq = ++g_deferred_seq;
+        for (std::uint32_t p = first_page; p <= last_page; ++p) g_page_max_seq[p] = seq;
+        return false;
+    }
+''',
+         '''    if (!can_defer) {
+        if (g_deferred_count) {
+            if (contig) flush_deferred_blocks(first_block, end_block);
+            else flush_all_deferred_impl();
+        }
+        const std::uint64_t seq = ++g_deferred_seq;
+        for (std::uint32_t p = first_page; p <= last_page; ++p) g_page_max_seq[p] = seq;
+        // Written now and in one piece: the blocks it fills whole make older deferred uploads there unneeded.
+        if (no_wrap && g_transfer.x == 0 && g_transfer.y == 0 && g_carried == 0 && bytes * 8u >= static_cast<std::size_t>(rrw) * rrh * bits)
+            mark_whole_blocks(psm, dbp, dbw, dsax, dsay, rrw, rrh, seq);
+        return false;
+    }
+'''),
+        ('''    if (any_deferred_in(first_page, page_count)) {
+        bool dropped = false;''',
+         '''    const std::uint64_t new_seq = ++g_deferred_seq;
+    mark_whole_blocks(psm, dbp, dbw, dsax, dsay, rrw, rrh, new_seq);
+    if (any_deferred_in(first_page, page_count)) {
+        bool dropped = false;'''),
+        ('''            if (covered) {
+                u.active = false;
+                g_def_range[i] = 0u;
+                --g_deferred_count;
+                dropped = true;
+            }''',
+         '''            if (covered || superseded(u)) {
+                drop_deferred(i);
+                dropped = true;
+            }'''),
+        ('''    if (g_deferred_count >= kMaxDeferred) {
+        int oldest = -1;''',
+         '''    if (g_deferred_count >= kMaxDeferred) {   // a full table first loses what newer uploads wrote over
+        bool dropped = false;
+        for (int i = 0; i < g_deferred_hi; ++i)
+            if (g_def_range[i] && superseded(g_deferred[i])) {
+                drop_deferred(i);
+                dropped = true;
+            }
+        if (dropped) rebuild_deferred_mask();
+    }
+    if (g_deferred_count >= kMaxDeferred) {
+        int oldest = -1;'''),
+        ('''        if (!g_def_range[i]) {
+            const std::uint64_t seq = ++g_deferred_seq;
+            g_deferred[i] = DeferredUpload{''',
+         '''        if (!g_def_range[i]) {
+            const std::uint64_t seq = new_seq;
+            g_deferred[i] = DeferredUpload{'''),
+    ],
+}
+
 def fail(msg):
     print("PATCH NOT APPLIED:", msg)
     raise SystemExit(1)
@@ -6131,7 +9310,7 @@ originals = {}
 texts = {}
 pending = 0
 
-for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items(), *IOPAHEAD_EDITS.items(), *STALE_EDITS.items(), *MOVIE_EDITS.items(), *SPLIT_SKIP_EDITS.items(), *SAMPLE_EDITS.items(), *G3_EDITS.items()):
+for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items(), *IOPAHEAD_EDITS.items(), *STALE_EDITS.items(), *MOVIE_EDITS.items(), *SPLIT_SKIP_EDITS.items(), *SAMPLE_EDITS.items(), *G3_EDITS.items(), *RT_OPT_EDITS.items(), *UPLOAD_EDITS.items()):
     rel = key.split('#')[0]   # the part after # only keeps two lists for one file apart
     if rel in texts:
         t = texts[rel]
@@ -6142,7 +9321,7 @@ for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(),
         except OSError:
             fail("cannot read " + rel)
         # Unwind the later stages in memory so their inputs can be verified.
-        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()), *IOPAHEAD_EDITS.get(rel, ()), *STALE_EDITS.get(rel, ()), *MOVIE_EDITS.get(rel, ()), *SPLIT_SKIP_EDITS.get(rel, ()), *SAMPLE_EDITS.get(rel, ()), *G3_EDITS.get(rel, ()))):
+        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()), *IOPAHEAD_EDITS.get(rel, ()), *STALE_EDITS.get(rel, ()), *MOVIE_EDITS.get(rel, ()), *SPLIT_SKIP_EDITS.get(rel, ()), *SAMPLE_EDITS.get(rel, ()), *G3_EDITS.get(rel, ()), *RT_OPT_EDITS.get(rel, ()), *UPLOAD_EDITS.get(rel, ()))):
             if t.count(new) == 1:
                 t = t.replace(new, old)
                 pending -= 1

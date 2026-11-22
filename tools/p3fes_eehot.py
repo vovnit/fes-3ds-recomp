@@ -62,6 +62,12 @@ RE_RET = re.compile(r'^\{ (const std::uint32_t t = c\.r\[31\]\.w\[0\];) (.*?) ?c
 RE_JR = re.compile(r'^\{ (const std::uint32_t t = [^;]*;) (.*?) ?c\.pc = t; if \(t - ' + H + r' < \d+u\) \{ entry = \w+\[\(t - ' + H +
                    r'\) >> 2\]; if \(entry\) goto dispatch_entry; \} \[\[clang::musttail\]\] return dispatch\(c, 0u\); \}$')
 RE_REG = re.compile(r'c\.r\[(\d+)\]')
+RE_FREG = re.compile(r'c\.f\[(\d+)\]')
+RE_FACC = re.compile(r'\bc\.facc\b')
+RE_FDIV = re.compile(r'fpu_(div|rsqrt)\(c, (\d+)u, ')
+RE_FCMP = re.compile(r'^fpu_compare\(c, fp::key\(c\.f\[(\d+)\]\) (<|<=|==) fp::key\(c\.f\[(\d+)\]\)\);$')
+RE_FASSIGN = re.compile(r'^(?:c\.f\[(\d+)\]|(c\.facc)) = (.*);$')
+RE_FSTORE = re.compile(r'^(bud_st32\(c, bud, |sp_st32\()(.+), c\.f\[(\d+)\]\);$')
 RE_FIELD = re.compile(r'\.(w|d|sd)\[0\]')
 RE_CCALL = re.compile(r'([A-Za-z_][A-Za-z0-9_:]*)\(c[,)]')
 RE_MEM = re.compile(r'(?<![A-Za-z0-9_])(ld8|ld16|ld32|ld64|ld128|st8|st16|st32|st64|st128|lwl|lwr|ldl|ldr|swl|swr|sdl|sdr)\(')
@@ -82,7 +88,14 @@ def both(r):
     return (1 << r) | (1 << (32 + r))
 
 
-ALL = sum(both(r) for r in range(1, 32))
+def fbit(r):
+    return 1 << (64 + r)
+
+
+FACC_BIT = 1 << 96
+ALL_GPR = sum(both(r) for r in range(1, 32))
+ALL_FPR = sum(fbit(r) for r in range(32)) | FACC_BIT
+ALL = ALL_GPR | ALL_FPR
 
 
 def mask_of(regs):
@@ -155,6 +168,19 @@ def scan(text):
                 other |= 1 << r
         else:
             uses |= half
+    for m in RE_FDIV.finditer(text):
+        kills |= fbit(int(m.group(2)))
+    for m in RE_FREG.finditer(text):
+        r = int(m.group(1))
+        if text.startswith(' = ', m.end()):
+            kills |= fbit(r)
+        else:
+            uses |= fbit(r)
+    for m in RE_FACC.finditer(text):
+        if text.startswith(' = ', m.end()):
+            kills |= FACC_BIT
+        else:
+            uses |= FACC_BIT
     return uses, kills, pinned, canon & ~other
 
 
@@ -224,6 +250,12 @@ def halves(mask):
             yield r, 1
 
 
+def fregs(mask):
+    for r in range(32):
+        if (mask >> (64 + r)) & 1:
+            yield r
+
+
 def flush_code(mask, canon=0):
     out = ''
     for r, h in halves(mask):
@@ -231,15 +263,25 @@ def flush_code(mask, canon=0):
             out += 'c.r[%d].w[1] = %s; ' % (r, SXHI % r)
         else:
             out += 'c.r[%d].w[%d] = %s%d; ' % (r, h, 'xy'[h], r)
+    for r in fregs(mask):
+        out += 'c.f[%d] = fstore(f%d); ' % (r, r)
+    if mask & FACC_BIT:
+        out += 'c.facc = fstore(fa); '
     return out
 
 
 def load_code(mask):
-    return ''.join('%s%d = c.r[%d].w[%d]; ' % ('xy'[h], r, r, h) for r, h in halves(mask))
+    out = ''.join('%s%d = c.r[%d].w[%d]; ' % ('xy'[h], r, r, h) for r, h in halves(mask))
+    for r in fregs(mask):
+        out += 'f%d = fload(c.f[%d]); ' % (r, r)
+    if mask & FACC_BIT:
+        out += 'fa = fload(c.facc); '
+    return out
 
 
 def regs_of(mask):
-    return (mask | (mask >> 32)) & 0xFFFFFFFF
+    g = mask & ALL_GPR
+    return (g | (g >> 32)) & 0xFFFFFFFF
 
 
 class Node:
@@ -292,6 +334,72 @@ def stmt_node(text):
     return n
 
 
+FP_OP_MAP = (
+    ('fp::add(', 'fadd('),
+    ('fp::sub(', 'fsub('),
+    ('fp::mul(', 'fmul('),
+    ('fp::sqrt(', 'fsqrt_r('),
+    ('fp::cvt_s_w(', 'fcvt_s_w('),
+    ('fp::cvt_w_s(', 'fcvt_w_s('),
+    ('fp::min(', 'fmin_r('),
+    ('fp::max(', 'fmax_r('),
+)
+
+
+def _sub_fvar(s):
+    s = RE_FREG.sub(r'f\1', s)
+    return RE_FACC.sub('fa', s)
+
+
+def rewrite_fpr(t):
+    if 'c.f[' not in t and 'c.facc' not in t and 'fpu_div(' not in t and 'fpu_rsqrt(' not in t:
+        return t
+    trail = t[len(t.rstrip()):]
+    s = t.strip()
+    m = RE_FDIV.match(s)
+    if m:
+        kind, fd = m.group(1), int(m.group(2))
+        rest = _sub_fvar(s[m.end():])
+        return 'hot_fpu_%s(c, f%d, %s' % (kind, fd, rest) + trail
+    m = RE_FCMP.match(s)
+    if m:
+        fn = {'<': 'fcmp_lt', '<=': 'fcmp_le', '==': 'fcmp_eq'}[m.group(2)]
+        return 'fpu_compare(c, %s(f%s, f%s));' % (fn, m.group(1), m.group(3)) + trail
+    m = RE_FSTORE.match(s)
+    if m:
+        fn = 'bud_stf(c, bud, ' if m.group(1).startswith('bud_') else 'sp_stf('
+        return '%s%s, f%s);' % (fn, m.group(2), m.group(3)) + trail
+    m = RE_FASSIGN.match(s)
+    if m:
+        lhs = ('f' + m.group(1)) if m.group(1) is not None else 'fa'
+        rhs = m.group(3)
+        if rhs.startswith('bud_ld32(c, bud, ') and rhs.endswith(')'):
+            return '%s = bud_ldf(c, bud, %s);' % (lhs, rhs[17:-1]) + trail
+        if rhs.startswith('sp_ld32(') and rhs.endswith(')'):
+            return '%s = sp_ldf(%s);' % (lhs, rhs[8:-1]) + trail
+        m2 = re.match(r'^c\.f\[(\d+)\]$', rhs)
+        if m2:
+            return '%s = f%s;' % (lhs, m2.group(1)) + trail
+        m2 = re.match(r'^c\.f\[(\d+)\] & fp::kAbs$', rhs)
+        if m2:
+            return '%s = fabs_r(f%s);' % (lhs, m2.group(1)) + trail
+        m2 = re.match(r'^c\.f\[(\d+)\] \^ fp::kSign$', rhs)
+        if m2:
+            return '%s = fneg_r(f%s);' % (lhs, m2.group(1)) + trail
+        if rhs.startswith('fp::'):
+            for old, new in FP_OP_MAP:
+                rhs = rhs.replace(old, new)
+            return '%s = %s;' % (lhs, _sub_fvar(rhs)) + trail
+        if 'c.f[' not in rhs and 'c.facc' not in rhs:
+            return '%s = fload(%s);' % (lhs, rhs) + trail
+        raise Unsupported('fpr assign: ' + t)
+    # Moving an FPR bit pattern into a GPR (e.g. put32(xR, yR, c.f[K]); or xR = c.f[K];)
+    out = RE_FREG.sub(r'fstore(f\1)', t)
+    if 'fstore(f' in out and ') = ' in out:
+        raise Unsupported('fpr lvalue: ' + t)
+    return out
+
+
 def stmt_text(node, text, canon=0):
     if not text:
         return ''
@@ -301,7 +409,8 @@ def stmt_text(node, text, canon=0):
         return 'put32(x%d, y%d, x%d);' % (node.move[0], node.move[0], node.move[1])
     t = rewrite(text, node.keep, canon)
     t = RE_MEM.sub(r'bud_\1(c, bud, ', t)
-    if 'c.budget' in t or 'return' in t or 'goto' in t or 'entry' in t:
+    t = rewrite_fpr(t)
+    if 'c.budget' in t or 'return' in t or 'goto' in t or 'entry' in t or 'c.f[' in t or 'c.facc' in t:
         raise Unsupported('statement: ' + text)
     return t
 
@@ -728,16 +837,18 @@ class Clone:
         pre, body, post = self.piece3(n, text)
         return (pre + body + ' ' + post) if body else ''
 
-    def target_call(self, label, unit_name, uid, hot):
+    def target_call(self, label, unit_name, uid, hot, native_fns=None):
         if label in hot:
             return 'if (!%s(c)) %s(c, %du);' % (hot[label], unit_name, uid)
+        if native_fns and label in native_fns:
+            return 'PS2_HOT_NATIVE(native_%s, %s, %du);' % (native_fns[label], unit_name, uid)
         return '%s(c, %du);' % (unit_name, uid)
 
     def edge_code(self, p, n):
         e = self.edge.get((p, n), 0)
         return flush_code(e, self.canon_out[p]) if e else ''
 
-    def jump_text(self, ln, hot, ids):
+    def jump_text(self, ln, hot, ids, native_fns=None):
         u = self.unit
         pre_pc, kind = ln.jump[0], ln.jump[1]
         out = ''
@@ -753,16 +864,21 @@ class Clone:
         out += flush_code(self.flush[n], self.canon[n]) + 'c.budget = bud; '
         if kind == 'unit':
             label = ids[ln.jump[2]][ln.jump[3]]
-            return out + self.target_call(label, ln.jump[2], ln.jump[3], hot) + ' return true;'
+            return out + self.target_call(label, ln.jump[2], ln.jump[3], hot, native_fns) + ' return true;'
         return out + 'c.pc = %s; dispatch(c, 0u); return true;' % ln.jump[2]
 
-    def emit(self, hot, ids, hints, number, gp=None):
+    def emit(self, hot, ids, hints, number, gp=None, native_fns=None):
         u = self.unit
         out = []
         decl = ''.join('x%d, y%d, ' % (r, r) for r in range(1, 32) if (self.used >> r | self.used >> (32 + r)) & 1)
+        fdecl = ''.join('f%d, ' % r for r in range(32) if (self.used >> (64 + r)) & 1)
+        if self.used & FACC_BIT:
+            fdecl += 'fa, '
         out.append('bool %s(Cpu &c) {' % hot[self.label])
         if decl:
             out.append('    std::uint32_t %s;' % decl[:-2])
+        if fdecl:
+            out.append('    FReg %s;' % fdecl[:-2])
         out.append('    PS2_HOT_GATE(%d)' % number)
         if self.label in LOSSY:   # port3ds/lossy.txt: return at once when the next picture is skipped
             out.append('    PS2_HOT_LOSSY(%s)' % ('true' if LOSSY[self.label] else 'false'))
@@ -788,7 +904,7 @@ class Clone:
                     uid = [x for x, lab in u.ids.items() if lab == other]
                     if not uid:
                         raise Unsupported('a copy starts at a label that is not an entry')
-                    out.append('    { %sc.budget = bud; %s return true; }' % (flush_code(self.flush[n], self.canon[n]), self.target_call(other, u.name, uid[0], hot)))
+                    out.append('    { %sc.budget = bud; %s return true; }' % (flush_code(self.flush[n], self.canon[n]), self.target_call(other, u.name, uid[0], hot, native_fns)))
                     last = None
                 else:
                     last = n
@@ -825,7 +941,7 @@ class Clone:
                     call = 'call(c, %s);' % ln.callee[1]
                 else:
                     label = ids[ln.callee[1]][ln.callee[2]]
-                    call = 'if (stack_ok()) { %s } else { c.pc = %s; return true; }' % (self.target_call(label, ln.callee[1], ln.callee[2], hot), ln.callee[3])
+                    call = 'if (stack_ok()) { %s } else { c.pc = %s; return true; }' % (self.target_call(label, ln.callee[1], ln.callee[2], hot, native_fns), ln.callee[3])
                 out.append('    { %s%s if (c.pc != %s) [[unlikely]] return true; bud = c.budget; %s}' % (head, call, ln.ret, load_code(self.load[n])))
                 last = n
             elif k == 'ret':
@@ -840,17 +956,17 @@ class Clone:
                 last = None
             elif k == 'branch':
                 hint = hints.get(i, '')
-                out.append('    { %s%sif (t) %s{ %s } }' % (self.piece(ln.head_node, ln.head), self.piece(ln.slot_node, ln.slot), hint, self.jump_text(ln, hot, ids)))
+                out.append('    { %s%sif (t) %s{ %s } }' % (self.piece(ln.head_node, ln.head), self.piece(ln.slot_node, ln.slot), hint, self.jump_text(ln, hot, ids, native_fns)))
                 last = ln.slot_node
             elif k == 'likely':
                 hint = hints.get(i, '')
-                out.append('    { %sif (t) %s{ %s%s } }' % (self.piece(ln.head_node, ln.head), hint, self.piece(ln.slot_node, ln.slot), self.jump_text(ln, hot, ids)))
+                out.append('    { %sif (t) %s{ %s%s } }' % (self.piece(ln.head_node, ln.head), hint, self.piece(ln.slot_node, ln.slot), self.jump_text(ln, hot, ids, native_fns)))
                 last = ln.head_node
             elif k == 'jump':
-                out.append('    { %s%s }' % (self.piece(ln.slot_node, ln.slot), self.jump_text(ln, hot, ids)))
+                out.append('    { %s%s }' % (self.piece(ln.slot_node, ln.slot), self.jump_text(ln, hot, ids, native_fns)))
                 last = None
             elif k == 'goto':
-                out.append('    ' + self.jump_text(ln, hot, ids))
+                out.append('    ' + self.jump_text(ln, hot, ids, native_fns))
                 last = None
             else:
                 raise Unsupported('line kind ' + k)
@@ -894,6 +1010,87 @@ namespace gen {
 }
 [[gnu::always_inline]] inline std::uint64_t get64(std::uint32_t lo, std::uint32_t hi) { return (static_cast<std::uint64_t>(hi) << 32) | lo; }
 
+#ifdef __3DS__
+using FReg = float;
+using AliasFloat [[gnu::may_alias]] = float;
+[[gnu::always_inline]] inline FReg fload(std::uint32_t u) { return std::bit_cast<float>(u); }
+[[gnu::always_inline]] inline std::uint32_t fstore(FReg f) { return std::bit_cast<std::uint32_t>(f); }
+[[gnu::always_inline]] inline FReg fadd(FReg a, FReg b) { return a + b; }
+[[gnu::always_inline]] inline FReg fsub(FReg a, FReg b) { return a - b; }
+[[gnu::always_inline]] inline FReg fmul(FReg a, FReg b) { return a * b; }
+[[gnu::always_inline]] inline FReg fabs_r(FReg a) { return std::fabs(a); }
+[[gnu::always_inline]] inline FReg fneg_r(FReg a) { return -a; }
+[[gnu::always_inline]] inline FReg fsqrt_r(FReg a) { return fload(ps2::fp::sqrt(fstore(a))); }
+[[gnu::always_inline]] inline FReg fcvt_s_w(FReg a) { return static_cast<float>(std::bit_cast<std::int32_t>(a)); }
+[[gnu::always_inline]] inline FReg fcvt_w_s(FReg a) { return std::bit_cast<float>(static_cast<std::int32_t>(a)); }
+[[gnu::always_inline]] inline FReg fmin_r(FReg a, FReg b) { return fload(ps2::fp::min(fstore(a), fstore(b))); }
+[[gnu::always_inline]] inline FReg fmax_r(FReg a, FReg b) { return fload(ps2::fp::max(fstore(a), fstore(b))); }
+[[gnu::always_inline]] inline bool fcmp_lt(FReg a, FReg b) { return a < b; }
+[[gnu::always_inline]] inline bool fcmp_le(FReg a, FReg b) { return a <= b; }
+[[gnu::always_inline]] inline bool fcmp_eq(FReg a, FReg b) { return a == b; }
+[[gnu::always_inline]] inline void hot_fpu_div(ps2::Cpu &c, FReg &fd, FReg a, FReg b) {
+    if (b != 0.0f) [[likely]] { fd = a / b; return; }
+    const ps2::fp::Result r = ps2::fp::div(fstore(a), fstore(b));
+    fd = fload(r.value);
+    if (r.invalid) c.fcr31 |= 0x30000u;
+}
+[[gnu::always_inline]] inline void hot_fpu_rsqrt(ps2::Cpu &c, FReg &fd, FReg a, FReg b) {
+    const ps2::fp::Result r = ps2::fp::rsqrt(fstore(a), fstore(b));
+    fd = fload(r.value);
+    if (r.invalid) c.fcr31 |= 0x30000u;
+}
+[[gnu::always_inline]] inline FReg sp_ldf(std::uint32_t sp, std::uint32_t off) {
+    return *reinterpret_cast<const AliasFloat *>(ps2::stack_at(sp, off));
+}
+[[gnu::always_inline]] inline void sp_stf(std::uint32_t sp, std::uint32_t off, FReg v) {
+    *reinterpret_cast<AliasFloat *>(ps2::stack_at(sp, off)) = v;
+}
+[[gnu::always_inline]] inline FReg bud_ldf(ps2::Cpu &c, std::int32_t &bud, std::uint32_t a) {
+    if (a < ps2::kRamSize) [[likely]] return *reinterpret_cast<const AliasFloat *>(ps2::g_ram + a);
+    c.budget = bud;
+    const FReg v = fload(ps2::slow_ld32(a));
+    bud = c.budget;
+    return v;
+}
+[[gnu::always_inline]] inline void bud_stf(ps2::Cpu &c, std::int32_t &bud, std::uint32_t a, FReg v) {
+    if (a < ps2::kRamSize) [[likely]] { *reinterpret_cast<AliasFloat *>(ps2::g_ram + a) = v; return; }
+    c.budget = bud;
+    ps2::slow_st32(a, fstore(v));
+    bud = c.budget;
+}
+#else
+using FReg = std::uint32_t;
+[[gnu::always_inline]] inline FReg fload(std::uint32_t u) { return u; }
+[[gnu::always_inline]] inline std::uint32_t fstore(FReg f) { return f; }
+[[gnu::always_inline]] inline FReg fadd(FReg a, FReg b) { return ps2::fp::add(a, b); }
+[[gnu::always_inline]] inline FReg fsub(FReg a, FReg b) { return ps2::fp::sub(a, b); }
+[[gnu::always_inline]] inline FReg fmul(FReg a, FReg b) { return ps2::fp::mul(a, b); }
+[[gnu::always_inline]] inline FReg fabs_r(FReg a) { return a & ps2::fp::kAbs; }
+[[gnu::always_inline]] inline FReg fneg_r(FReg a) { return a ^ ps2::fp::kSign; }
+[[gnu::always_inline]] inline FReg fsqrt_r(FReg a) { return ps2::fp::sqrt(a); }
+[[gnu::always_inline]] inline FReg fcvt_s_w(FReg a) { return ps2::fp::cvt_s_w(a); }
+[[gnu::always_inline]] inline FReg fcvt_w_s(FReg a) { return ps2::fp::cvt_w_s(a); }
+[[gnu::always_inline]] inline FReg fmin_r(FReg a, FReg b) { return ps2::fp::min(a, b); }
+[[gnu::always_inline]] inline FReg fmax_r(FReg a, FReg b) { return ps2::fp::max(a, b); }
+[[gnu::always_inline]] inline bool fcmp_lt(FReg a, FReg b) { return ps2::fp::key(a) < ps2::fp::key(b); }
+[[gnu::always_inline]] inline bool fcmp_le(FReg a, FReg b) { return ps2::fp::key(a) <= ps2::fp::key(b); }
+[[gnu::always_inline]] inline bool fcmp_eq(FReg a, FReg b) { return ps2::fp::key(a) == ps2::fp::key(b); }
+[[gnu::always_inline]] inline void hot_fpu_div(ps2::Cpu &c, FReg &fd, FReg a, FReg b) {
+    const ps2::fp::Result r = ps2::fp::div(a, b);
+    fd = r.value;
+    if (r.invalid) c.fcr31 |= 0x30000u;
+}
+[[gnu::always_inline]] inline void hot_fpu_rsqrt(ps2::Cpu &c, FReg &fd, FReg a, FReg b) {
+    const ps2::fp::Result r = ps2::fp::rsqrt(a, b);
+    fd = r.value;
+    if (r.invalid) c.fcr31 |= 0x30000u;
+}
+[[gnu::always_inline]] inline FReg sp_ldf(std::uint32_t sp, std::uint32_t off) { return ps2::sp_ld32(sp, off); }
+[[gnu::always_inline]] inline void sp_stf(std::uint32_t sp, std::uint32_t off, FReg v) { ps2::sp_st32(sp, off, v); }
+[[gnu::always_inline]] inline FReg bud_ldf(ps2::Cpu &c, std::int32_t &bud, std::uint32_t a) { return ps2::bud_ld32(c, bud, a); }
+[[gnu::always_inline]] inline void bud_stf(ps2::Cpu &c, std::int32_t &bud, std::uint32_t a, FReg v) { ps2::bud_st32(c, bud, a, v); }
+#endif
+
 // -DPS2_HOT_BISECT: only copies number lo to hi-1 run, from PS2_HOT_RANGE=lo:hi in the environment, to find a faulty one
 #ifdef PS2_HOT_BISECT
 extern int g_hot_lo, g_hot_hi;
@@ -915,8 +1112,10 @@ struct HotNow {
 #ifdef __3DS__
 bool lossy_return(ps2::Cpu &c, bool keep_a0);
 #define PS2_HOT_LOSSY(a0) if (lossy_return(c, a0)) return true;
+#define PS2_HOT_NATIVE(fn, unit, uid) do { if (fn(c)) c.pc = c.r[31].w[0]; else unit(c, uid); } while (0)
 #else
 #define PS2_HOT_LOSSY(a0)
+#define PS2_HOT_NATIVE(fn, unit, uid) unit(c, uid)
 #endif
 
 '''
@@ -1075,12 +1274,13 @@ def cmd_make(args):
         lost = sorted(set(LOSSY) - set(clones))
         if lost:
             raise SystemExit('--lossy: these got no hot copy: ' + ', '.join(lost))
+    native_fns = {'L_%08X' % a: name for a, name in natives.items() if not name.startswith('loop_')}
     texts = {}
     lines_total = 0
     for number, (label, c) in enumerate(sorted(clones.items())):
         hints = branch_hints(c, prof) if not args.no_hints else {}
         try:
-            texts[label] = c.emit(hot, ids, hints, number, int(args.gp, 16) if args.gp else None)
+            texts[label] = c.emit(hot, ids, hints, number, int(args.gp, 16) if args.gp else None, native_fns)
             lines_total += len(c.line_ids)
         except Unsupported as e:
             failed[label] = str(e)
@@ -1094,9 +1294,28 @@ def cmd_make(args):
     os.makedirs(args.out, exist_ok=True)
     for old in glob.glob(os.path.join(args.out, 'hot_*.cpp')) + glob.glob(os.path.join(args.out, 'hot.hpp')):
         os.remove(old)
+    native_decls = ''
+    if native_fns:
+        native_decls = '#ifdef __3DS__\n' + ''.join('bool native_%s(ps2::Cpu &c);\n' % n for n in sorted(set(native_fns.values()))) + '#endif\n'
     with open(os.path.join(args.out, 'hot.hpp'), 'w') as f:
-        f.write(HEADER + ''.join('bool %s(ps2::Cpu &c);\n' % hot[x] for x in sorted(texts)) + '\n}\n')
+        f.write(HEADER + native_decls + ''.join('bool %s(ps2::Cpu &c);\n' % hot[x] for x in sorted(texts)) + '\n}\n')
     order = sorted(texts)
+    fast_init = ''
+    if order or native_fns:
+        rows = ['            {0x%08Xu, &native_%s, true},\n' % (a, name) for a, name in sorted(natives.items()) if not name.startswith('loop_')]
+        rows += ['            {0x%su, &%s, false},\n' % (label[2:], hot[label]) for label in order]
+        fast_init = (
+            '\n#ifdef __3DS__\n'
+            'static const struct FastTargetsInit {\n'
+            '    FastTargetsInit() {\n'
+            '        static const ps2::FastTarget kTargets[] = {\n'
+            + ''.join(rows) +
+            '        };\n'
+            '        ps2::register_fast_targets(kTargets, static_cast<std::uint32_t>(sizeof kTargets / sizeof kTargets[0]));\n'
+            '    }\n'
+            '} g_fast_targets_init;\n'
+            '#endif\n'
+        )
     files = max(1, (len(order) + args.per_file - 1) // args.per_file)
     for k in range(files):
         with open(os.path.join(args.out, 'hot_%02d.cpp' % k), 'w') as f:
@@ -1104,6 +1323,8 @@ def cmd_make(args):
                     + 'namespace gen {\n\nusing namespace ps2;\n\n')
             for label in order[k * args.per_file:(k + 1) * args.per_file]:
                 f.write(texts[label] + '\n')
+            if k == 0:
+                f.write(fast_init)
             f.write('}\n')
     if args.natives_out:
         with open(args.natives_out, 'w') as f:

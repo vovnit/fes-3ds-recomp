@@ -15,7 +15,7 @@ FILES = {
     'runtime/include/ps2/memory.hpp': 'extern std::uint8_t g_ram[];\ninline void st32(std::uint32_t a, std::uint32_t v) {\n    if (a - g_swlo < g_swlen) [[unlikely]] store_watch_hit(a, 4, &v);\ninline void st64(std::uint32_t a, std::uint64_t v) {\n    if (a + 4u - g_swlo < g_swlen + 4u) [[unlikely]] store_watch_hit(a, 8, &v);\ninline void st128(std::uint32_t a, const Reg128 &v) {\n    if (a + 12u - g_swlo < g_swlen + 12u) [[unlikely]] store_watch_hit(a, 16, &v);\n    if ((a >> 14) == (kScratchpadBase >> 14)) return reinterpret_cast<T *>(g_spr + (a & (kScratchpadSize - 1)));\n    return nullptr;\nstd::uint8_t slow_ld8(std::uint32_t a);\nstd::uint16_t slow_ld16(std::uint32_t a);\nstd::uint32_t slow_ld32(std::uint32_t a);\nstd::uint64_t slow_ld64(std::uint32_t a);\nvoid slow_ld128(std::uint32_t a, Reg128 &out);\nvoid slow_st8(std::uint32_t a, std::uint8_t v);\nvoid slow_st16(std::uint32_t a, std::uint16_t v);\nvoid slow_st32(std::uint32_t a, std::uint32_t v);\nvoid slow_st64(std::uint32_t a, std::uint64_t v);\nvoid slow_st128(std::uint32_t a, const Reg128 &v);\n',
     'runtime/src/memory.cpp': 'alignas(64) std::uint8_t g_ram[kRamSize + 64];\n#include "hw.hpp"\n#include "vu_micro.hpp"\nstd::uint32_t slow_ld32(std::uint32_t a) { return read_slow<std::uint32_t>(a); }\nstd::uint64_t slow_ld64(std::uint32_t a) { return read_slow<std::uint64_t>(a); }\nvoid slow_st32(std::uint32_t a, std::uint32_t v) { write_slow(a, v); }\n',
     'runtime/src/gs/gs.hpp': 'void write_image(const std::uint8_t *data, std::uint32_t qwords);\nvoid render_reset();\n\nstd::uint64_t read_privileged',
-    'runtime/src/gs/gif.cpp': 'template <typename Sink>\nvoid walk(Path &p, const std::uint8_t *data, std::uint32_t qwc, Sink &sink) {\n        switch (p.flg) {\n        case 0:\n            sink.packed(static_cast<std::uint32_t>(p.regs >> (p.reg * 4)) & 0xFu, q);\n        ++g_tags[path][p.flg];\n        gs::g_state.q = 1.0f;\nstd::vector<std::uint8_t> g_pend3;\nbool g_released = false;\nstd::uint32_t packet_qwords(const std::vector<std::uint8_t> &q) {\n    const std::uint32_t total = static_cast<std::uint32_t>(q.size() / 16);\n    std::uint32_t at = 0;\n    while (at < total) {\n        std::uint64_t tag;\n        std::memcpy(&tag, q.data() + static_cast<std::size_t>(at) * 16, 8);\n    while (!g_pend3.empty()) {\n        const std::uint32_t n = everything ? static_cast<std::uint32_t>(g_pend3.size() / 16) : packet_qwords(g_pend3);\n        if (!n) break;\n        std::vector<std::uint8_t> chunk(g_pend3.begin(), g_pend3.begin() + static_cast<std::size_t>(n) * 16);\n        g_pend3.erase(g_pend3.begin(), g_pend3.begin() + static_cast<std::ptrdiff_t>(n) * 16);\n        transfer_direct(3, chunk.data(), n);\n        if (!everything) break;\n    }\n}\n    if (path == 3 && (mask_up() || !g_pend3.empty())) {\n        g_pend3.insert(g_pend3.end(), data, data + static_cast<std::size_t>(qwc) * 16);\n    if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);\n    gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);\n',
+    'runtime/src/gs/gif.cpp': 'template <typename Sink>\nvoid walk(Path &p, const std::uint8_t *data, std::uint32_t qwc, Sink &sink) {\n        switch (p.flg) {\n        case 0:\n            sink.packed(static_cast<std::uint32_t>(p.regs >> (p.reg * 4)) & 0xFu, q);\n        ++g_tags[path][p.flg];\n        gs::g_state.q = 1.0f;\nstd::vector<std::uint8_t> g_pend3;\nbool g_released = false;\nstd::uint32_t packet_qwords(const std::vector<std::uint8_t> &q) {\n    const std::uint32_t total = static_cast<std::uint32_t>(q.size() / 16);\n    std::uint32_t at = 0;\n    while (at < total) {\n        std::uint64_t tag;\n        std::memcpy(&tag, q.data() + static_cast<std::size_t>(at) * 16, 8);\n    while (!g_pend3.empty()) {\n        const std::uint32_t n = everything ? static_cast<std::uint32_t>(g_pend3.size() / 16) : packet_qwords(g_pend3);\n        if (!n) break;\n        std::vector<std::uint8_t> chunk(g_pend3.begin(), g_pend3.begin() + static_cast<std::size_t>(n) * 16);\n        g_pend3.erase(g_pend3.begin(), g_pend3.begin() + static_cast<std::ptrdiff_t>(n) * 16);\n        transfer_direct(3, chunk.data(), n);\n        if (!everything) break;\n    }\n}\n    if (path == 3 && (mask_up() || !g_pend3.empty())) {\n        g_pend3.insert(g_pend3.end(), data, data + static_cast<std::size_t>(qwc) * 16);\n    if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);\n    gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);\n}\n',
     'runtime/src/vif.cpp': '#include "ps2/state.hpp"\nvoid run_vu(int unit, std::uint32_t address) {\n    Unit &u = state(unit);\n        if (shadow(unit)) return;\n        vu::set_tops(u.top, u.itop);\n    std::uint32_t cycle = 0;\n    for (std::uint32_t n = 0; n < num; ++n) {\n        std::uint32_t value[4];\n            if (v2_keep()) {\n                std::uint32_t old[4];\n            } else if (v2_zero()) {\n                value[2] = value[3] = 0;\n            } else {\n                value[2] = value[0];\n                value[3] = value[1];\n            }\n        } else if constexpr (Components == 3) {\nvoid unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {\n    Unit &u = state(unit);\n    const bool dry = shadow(unit);\n    if (dry && u.mode != 2) {\n        kFastUnpack[vl][vn][usn ? 1 : 0](mem, wrap - 1, addr, wl, cl - wl, reinterpret_cast<const std::uint8_t *>(data), num);\nstd::uint32_t data_words(int unit, std::uint32_t cmd) {\n    const Unit &u = state(unit);\nvoid execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {\n    Unit &u = state(unit);\n    if (!on_vu_thread()) ++g_commands[unit][op];\n    case 0x14: case 0x15: run_vu(unit, imm * 8u); break;\n    case 0x17: run_vu(unit, shadow(unit) ? 0u : vu::tpc(unit)); break;\n        if (shadow(unit)) break;\n        std::uint8_t *code = unit ? g_vu1_code : g_vu0_code;\n        const std::uint32_t count = num ? num : 256u;\n        bool changed = false;\n        if (shadow(unit)) gif::scan_signals(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);\n        if ((op & 0x60u) == 0x60u) unpack(unit, cmd, data);\n        if (!on_vu_thread()) hw::intc_raise(4u + static_cast<unsigned>(unit));\nstd::size_t run(int unit, const std::uint32_t *words, std::size_t count) {\n    Unit &u = state(unit);\n        const std::uint32_t cmd = words[pos];\n        const std::size_t start = pos + 1;\n        const std::uint32_t need = data_words(unit, cmd);\n        if (start + need > count) break;\n        execute(unit, cmd, words + start);\nvoid process(int unit) {\n    Unit &u = state(unit);\n    const std::size_t pos = run(unit, u.pending.data(), u.pending.size());\nvoid transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {\n    if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16);\n    Unit &u = state(unit);\n        const std::size_t pos = run(unit, words, count);\n    process(unit);\n}\n                process(unit);\n',
     'runtime/src/kernel.cpp': 'void service(Cpu &c) {\n    if (g_in_handler) return;\n',
     'runtime/src/gs/queue.hpp': 'enum Type : std::uint32_t { kWrap, kGif, kGifReset, kReset, kVertexReset, kVblank, kPresent, kDownload, kVif1, kVif1Write, kVuReset, kState, kVuFence, kDownloadAsync, kPath3Flush, kPath3ChainEnd };\n    std::uint64_t capacity_ = 0;\n    alignas(64) std::atomic<std::uint64_t> head_{0};\n    alignas(64) std::atomic<std::uint64_t> tail_{0};\nbool active();\nbool vu_active();\n',
@@ -93,8 +93,15 @@ FILES["runtime/src/vif.cpp"] = FILES["runtime/src/vif.cpp"].replace(
     '        const std::size_t count = static_cast<std::size_t>(qwc) * 4;\n'
     '        const std::size_t pos = run(unit, words, count);\n'
     '        if (pos < count) u.pending.assign(words + pos, words + count);\n'
-    '        return;\n    }\n    process(unit);')
-FILES["runtime/src/vif.cpp"] += '    bool dbf = false, stalled = false;\n    std::vector<std::uint32_t> pending;\n};\nbool stalled(int unit) { return state(unit).stalled; }\n'
+    '        return;\n    }\n'
+    '    const std::size_t old = u.pending.size();\n'
+    '    u.pending.resize(old + static_cast<std::size_t>(qwc) * 4);\n'
+    '    std::memcpy(u.pending.data() + old, data, static_cast<std::size_t>(qwc) * 16);\n'
+    '    process(unit);\n}\n\nbool stalled(int unit) { return state(unit).stalled; }\n')
+FILES["runtime/src/vif.cpp"] = FILES["runtime/src/vif.cpp"].replace(
+    'bool stalled(int unit) { return state(unit).stalled; }\n}\n',
+    'bool stalled(int unit) { return state(unit).stalled; }\n', 1)
+FILES["runtime/src/vif.cpp"] += '    bool dbf = false, stalled = false;\n    std::vector<std::uint32_t> pending;\n};\n'
 FILES["runtime/src/dmac.hpp"] += 'bool ipu_pull(std::uint8_t *qword);\n'
 FILES["runtime/src/dmac.cpp"] += 'bool ipu_push(const std::uint8_t *qword) {\n'
 FILES["runtime/src/system.cpp"] += ('void run_vu_thread() {\n    gs::stats();\n'
@@ -102,18 +109,103 @@ FILES["runtime/src/system.cpp"] += ('void run_vu_thread() {\n    gs::stats();\n'
 FILES["runtime/src/gs/gif.cpp"] += '    GsSink sink{path};\n    walk(g_paths[path], data, qwc, sink);\n'
 
 # And the edits that replace the call depth with a stack check, the last ones for their files.
-earlier = {}
-for name in ("EDITS", "PERF_EDITS", "SPLIT_GS_EDITS"):
-    for key, edits in perf[name].items():
-        earlier.setdefault(key.split("#")[0], []).append(edits)
-for stage in ("STACK_EDITS", "NARROW_EDITS", "LOOP_EDITS", "SP_EDITS", "HOT_EDITS", "VIFADDR_EDITS", "VIFREC_EDITS", "IOPAHEAD_EDITS", "STALE_EDITS", "MOVIE_EDITS", "SPLIT_SKIP_EDITS"):
-    for rel, edits in perf[stage].items():
-        for old, _ in edits:
-            inserted = any(old in new for group in earlier.get(rel, ()) for _, new in group)
-            if old not in FILES.get(rel, "") and not inserted:
-                FILES[rel] = FILES.get(rel, "") + old
-    for key, edits in perf[stage].items():
-        earlier.setdefault(key.split("#")[0], []).append(edits)
+FILES['runtime/src/gs/gs.hpp'] = (
+    'namespace ps2::gs {\n'
+    'void write(std::uint32_t reg, std::uint64_t value);\n'
+    'void signal(std::uint32_t reg, std::uint64_t value);\n'
+    'void note_transfer(std::uint32_t reg, std::uint64_t value);\n'
+    'void write_packed(std::uint32_t reg, const Reg128 &q);\n'
+) + FILES['runtime/src/gs/gs.hpp']
+_sink_block = '    GsSink sink{path};\n    walk(g_paths[path], data, qwc, sink);\n'
+FILES['runtime/src/gs/gif.cpp'] = FILES['runtime/src/gs/gif.cpp'].replace(_sink_block, '', 1).replace(
+    'std::vector<std::uint8_t> g_pend3;\n', _sink_block + 'std::vector<std::uint8_t> g_pend3;\n', 1).replace(
+    '        g_pend3.insert(g_pend3.end(), data, data + static_cast<std::size_t>(qwc) * 16);\n',
+    '        g_pend3.insert(g_pend3.end(), data, data + static_cast<std::size_t>(qwc) * 16);\n'
+    '        { static const bool t = std::getenv("PS2_TRACE_M3") != nullptr; if (t) std::fprintf(stderr, "[p3] queued %u qwords, %zu waiting\\n", qwc, g_pend3.size() / 16); }\n'
+    '        return;\n    }\n'
+    '    transfer_direct(path, data, qwc);\n}\n\n'
+    'void vu_path3(const std::uint8_t *data, std::uint32_t qwc) { transfer(3, data, qwc); }\n\n'
+    'void transfer_direct(int path, const std::uint8_t *data, std::uint32_t qwc) {\n'
+    '    { static const bool t = std::getenv("PS2_TRACE_M3") != nullptr; if (t) std::fprintf(stderr, "[gifx] path=%d qwc=%u\\n", path, qwc); }\n'
+    '    if (!gs::queue::active()) {\n        render(path, data, qwc);\n        return;\n    }\n', 1)
+
+_ALL_STAGES = (
+    "EDITS", "PERF_EDITS", "SPLIT_GS_EDITS", "STACK_EDITS", "NARROW_EDITS",
+    "LOOP_EDITS", "SP_EDITS", "HOT_EDITS", "VIFADDR_EDITS", "VIFREC_EDITS",
+    "IOPAHEAD_EDITS", "STALE_EDITS", "MOVIE_EDITS", "SPLIT_SKIP_EDITS",
+    "SAMPLE_EDITS", "G3_EDITS", "RT_OPT_EDITS", "UPLOAD_EDITS",
+)
+_sim = dict(FILES)
+_applied = {}
+
+def _try_commit(rel, s_new):
+    u = s_new
+    for eo, en in reversed(_applied.get(rel, [])):
+        if u.count(en) != 1:
+            return False
+        u = u.replace(en, eo)
+    f = u
+    for eo, en in _applied.get(rel, []):
+        if f.count(eo) != 1:
+            return False
+        f = f.replace(eo, en)
+    if f != s_new:
+        return False
+    _sim[rel] = s_new
+    FILES[rel] = u
+    return True
+
+def _splice_span(s, p1, p2, ol, i1, i2):
+    pre = "".join(ol[:i1])
+    post = "".join(ol[i2 + 1:])
+    head, tail = s[:p1], s[p2:]
+    for k in range(len(pre), 0, -1):
+        if head.endswith(pre[:k]):
+            head = head[:-k]
+            break
+    for k in range(len(post), 0, -1):
+        if tail.startswith(post[len(post) - k:]):
+            tail = tail[k:]
+            break
+    return head + "".join(ol) + tail
+
+def _ensure_old(rel, old):
+    s = _sim.get(rel, "")
+    if old in s:
+        return
+    ol = old.splitlines(True)
+    hits = [(i, s.index(l), len(l)) for i, l in enumerate(ol) if len(l.strip()) >= 8 and s.count(l) == 1]
+    if len(hits) >= 2:
+        pairs = sorted(((i2 - i1, i1, p1, i2, p2, l2) for k, (i1, p1, _) in enumerate(hits)
+                        for i2, p2, l2 in hits[k + 1:] if p2 > p1), reverse=True)
+        for _, i1, p1, i2, p2, l2 in pairs:
+            for cand in (_splice_span(s, p1, p2 + l2, ol, i1, i2), s[:p1] + old + s[p2 + l2:]):
+                if _try_commit(rel, cand):
+                    return
+    cands = sorted(((len(sb), a, b, s.index(sb)) for a in range(len(ol)) for b in range(a + 1, len(ol) + 1)
+                    if (sb := "".join(ol[a:b])).strip() and s.count(sb) == 1), reverse=True)
+    for _, a, b, p in cands:
+        sb = "".join(ol[a:b])
+        for cand in (_splice_span(s, p, p + len(sb), ol, a, b - 1), s[:p] + "".join(ol[:a]) + sb + "".join(ol[b:]) + s[p + len(sb):]):
+            if _try_commit(rel, cand):
+                return
+    u = old
+    for eo, en in reversed(_applied.get(rel, [])):
+        if u.count(en) == 1:
+            u = u.replace(en, eo)
+    _sim[rel] = s + old
+    FILES[rel] = FILES.get(rel, "") + u
+
+for _stage in _ALL_STAGES:
+    for _key, _edits in perf[_stage].items():
+        _rel = _key.split("#")[0]
+        for _old, _new in _edits:
+            if _new in _sim.get(_rel, ""):
+                continue
+            if _stage not in ("EDITS", "PERF_EDITS", "SPLIT_GS_EDITS"):
+                _ensure_old(_rel, _old)
+            _sim[_rel] = _sim[_rel].replace(_old, _new)
+            _applied.setdefault(_rel, []).append((_old, _new))
 
 
 def run(folder):
@@ -165,9 +257,9 @@ with tempfile.TemporaryDirectory() as d:
     assert '"--scalar"' in vur and "fixed_to_float(r.vf" in vur and "#ifdef PS2_VU_FAST" in vu
     # The GPU path only exists in a 3DS build; the desktop draw call is still there.
     gs = read("runtime/src/gs/gs.cpp")
-    assert "#ifdef PS2_PICA\n#include \"pica.hpp\"\n#endif" in gs and "pica::draw(s, g_vertex_serial, clamp);" in gs
+    assert "#ifdef PS2_PICA\n#include \"pica.hpp\"\n#endif" in gs and "pica::draw(s, g_vertex_serial, gpu_clamp(s));" in gs
     assert "if (cpu_raster()) raster::draw(s, s.queue, needed);" in gs
-    assert "#else\n#define PS2_PROF(counter)\n#endif" in read("runtime/include/ps2/system.hpp")
+    assert "#else\n#define PS2_PROF(counter)\n#define PS2_PROF_EXTRA(k)\n#define PS2_SAMPLE_VU(fn)\n#endif" in read("runtime/include/ps2/system.hpp")
     assert "PS2_PROF(ps2::prof::Upload);" in gs
     assert "pica::note_transfer(s, value)" in gs and "pica::note_clut()" in gs and "pica::vblank(static_cast<std::uint32_t>(ps2::frame_count()), display_regs(), pica::next_picture())" in gs
     # Speed work: the PATH3 queue no longer shuffles its bytes, uploads go page by page, and floats use the FPU only on the 3DS.
@@ -209,4 +301,7 @@ with tempfile.TemporaryDirectory() as d:
     assert "inline decltype(auto) bud_x(" in read("runtime/include/ps2/memory.hpp")
     assert "stack_access(local_budget(promote_loops(out_.str())))" in read("recomp/codegen.cpp") and "inline std::uint32_t sp_ld32(" in read("runtime/include/ps2/memory.hpp")
     assert "void call(Cpu &c, std::uint32_t target) {" in read("runtime/src/dispatch.cpp")
+    assert "void register_fast_targets(" in read("runtime/src/dispatch.cpp")
+    assert "void flush_deferred_pages(" in gs and "int draw_g3_direct(" in gs
+    assert "void transfer_tte_data(" in vif
 print("ok   3DS patch applies once, is idempotent, refuses unknown source and leaves desktop paths alone")

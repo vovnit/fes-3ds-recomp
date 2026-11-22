@@ -10,12 +10,26 @@ namespace ps2 { struct Vu0Regs; }
 
 namespace g3 {
 
+struct DirectStream {
+    const std::uint8_t *src;
+    std::uint16_t num;
+    std::uint8_t vn, vl;
+    bool usn;
+};
+
+struct DirectStreams {
+    std::uint16_t top;
+    std::uint8_t stride;
+    std::uint8_t mask;
+    DirectStream s[5];
+};
+
 struct Input {
     int program;                 // 42 or 64
     const std::uint8_t *mem;     // VU1 data memory, 16 KB, as the batch finds it
     std::uint32_t top, itop;     // the VIF's TOP and ITOP for this batch
-    std::uint32_t vf[32][4];     // VU1 float registers (bit patterns) at the batch start
-    std::uint16_t vi[16];        // VU1 integer registers at the batch start
+    const std::uint8_t *vf;      // borrowed bytes of the 32 VU1 float registers for this call
+    const DirectStreams *streams = nullptr;   // optional deferred VIF1 vertex streams (skip g_vu1_mem unpack)
 };
 
 // How the batch ended, for leave_state.
@@ -28,6 +42,9 @@ struct End {
 // keep it between calls); ends gets each packet's end offset, the last being the bytes used (none when nothing is drawn).
 // False: not modelled, run the program instead.
 bool run(const Input &in, std::vector<std::uint8_t> &out, std::vector<std::uint32_t> &ends, End &end);
+
+// The MSCAL 0 init (042/064 L_0000-L_0190): computes vf28-vf31, vf2, vi13, vi14 and writes the batch jump target to M[0x3FF].y.
+void init_state(int program, std::uint8_t *mem, ps2::Vu0Regs &r);
 
 // The registers a later batch of the program reads, set as the program would have left them.
 void leave_state(int program, const End &end, ps2::Vu0Regs &r);
@@ -48,8 +65,10 @@ constexpr unsigned kGpuBones = 24;   // the shader's bone uniforms (3 vectors ea
 struct Gpu {
     std::uint64_t prim;              // what the GIF tag sets PRIM to
     bool skin;                       // g3_skin: the shader blends bones (g3_generic's bone is the identity, for g3check)
+    bool ortho;                      // g3_skin_ortho: screen-space r1.xyz (no perspective divide), linear fog from r1.w
     bool fog;                        // the XYZF2 strip: the fog value from w, and z without the 16 of FTOI4
     bool xyzf;                       // z as XYZF2 takes it (24 bits, without the 16 of XYZ2): the fog strip and lists
+    bool clipper;                    // full clipper batch: let PICA200 near-clip instead of clamping z >= -w
     bool keep_negative, keep_positive;   // which triangles the program leaves without ADC, by facing (see facing_negative)
     float proj[4][4];                // vf28-vf31 as the strip uses them (the z of vf28 and vf29 is not used: zero)
     float offset[4];                 // vf02, added to the screen position
@@ -61,9 +80,19 @@ struct Gpu {
     // The bone palette, kept between batches (so keep g too): each bone's matrix as 3 vectors, x, y and z each a dot product
     // with (position, 1). A bone keeps its slot while batches go on using it, so the shader's copy rarely needs sending.
     float bone[kGpuBones * 3][4];
+    std::uint32_t bone_gen[kGpuBones]; // generation per slot, bumped when bone[3*s..3*s+2] changes
     std::uint32_t slots;             // the palette slots this batch's vertices use (bit per slot)
     unsigned n;
+    bool alpha_uniform;              // true when every vertex in the batch shares alpha_val
+    std::uint8_t alpha_val;
     GpuVertex v[512];                // a list batch is turned into a strip, up to 2n - 3 vertices (see gpu_batch)
+    std::uint64_t prim2;             // Pass 2 PRIM for dual-texture MatFX (program 43/44)
+    float uv2[256][2];               // Pass 2 transformed UVs for program 43/44
+};
+
+struct BatchPlan {
+    bool skin, dual, dual_uv1, list, direct, lights;
+    std::uint32_t top, n, pos_w, uv_w, nrm_step;
 };
 
 // Why gpu_batch did not give a batch to draw.
@@ -77,7 +106,13 @@ enum GpuDecline : int {
     kGpuDeclines
 };
 
-// 0: g filled, draw it. -1: the program draws nothing (end says how it ended, as run()'s). Otherwise a GpuDecline.
+// Two-phase GPU batch API for zero-copy direct-to-ring emission:
+// gpu_batch_setup validates the batch and fills Gpu headers (everything except v[]/slots/alpha);
+// gpu_batch_fill writes vertices directly to dst (e.g. the PICA vertex ring).
+int gpu_batch_setup(const Input &in, Gpu &g, End &end, BatchPlan &plan);
+int gpu_batch_fill(const Input &in, Gpu &g, const BatchPlan &plan, GpuVertex *dst);
+
+// 0: g filled, draw it. -1: the program draws nothing (end says how it ended, as run()'s). -2: deferred streams did not match, flush unpacks and retry. Otherwise a GpuDecline.
 int gpu_batch(const Input &in, Gpu &g, End &end);
 
 }

@@ -43,6 +43,7 @@ static_assert(sizeof(Entry) == 16);
 
 Cut g_cuts[kMovies];
 bool g_has_copy[kMovies];
+bool g_marker_row_only = false;
 int g_cut_count = 0;
 std::FILE *g_cut_file = nullptr;
 int g_loaded = -1;            // whose entries are in g_entries
@@ -324,13 +325,14 @@ bool start(int priority, int core) {
     std::setvbuf(g_cut_file, buffer, _IOFBF, sizeof buffer);
     char magic[8];
     std::uint32_t count = 0;
-    if (std::fread(magic, 1, 8, g_cut_file) != 8 || std::memcmp(magic, "P3CUT1\0\0", 8) || std::fread(&count, 4, 1, g_cut_file) != 1 || count > kMovies ||
+    if (std::fread(magic, 1, 8, g_cut_file) != 8 || (std::memcmp(magic, "P3CUT1\0\0", 8) && std::memcmp(magic, "P3CUT2\0\0", 8)) || std::fread(&count, 4, 1, g_cut_file) != 1 || count > kMovies ||
         std::fread(g_cuts, sizeof(Cut), count, g_cut_file) != count) {
         std::fprintf(stderr, "[movie] movies.cut is not usable\n");
         std::fclose(g_cut_file);
         g_cut_file = nullptr;
         return false;
     }
+    g_marker_row_only = magic[5] == '2';
     g_cut_count = static_cast<int>(count);
     int copies = 0;
     for (int m = 0; m < g_cut_count; ++m) {
@@ -409,7 +411,10 @@ bool watch(const std::uint8_t *raw, unsigned index, unsigned count) {
     const unsigned at = base + index;
     if (at < kKept) {
         if (raw[8 * 16 + 8] > 128) white[at >> 3] |= static_cast<std::uint8_t>(1u << (at & 7u));
-        for (const unsigned rows : {23u, 28u}) {
+        // New timing streams carry just the marker row. Older ones also carry the other 22 or 27 rows.
+        for (const unsigned rows : {1u, 23u, 28u}) {
+            if ((rows == 1) != g_marker_row_only) continue;
+            if (rows == 1 && (base || (count != 32u && count != 40u))) continue;  // 512 or 640 pixels wide
             if (at != (kMarkBits - 1) * rows) continue;
             std::uint32_t bits = 0;
             for (unsigned k = 0; k < kMarkBits; ++k) bits = (bits << 1) | ((white[(k * rows) >> 3] >> ((k * rows) & 7u)) & 1u);

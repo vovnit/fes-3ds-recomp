@@ -10,7 +10,7 @@ The console cannot decode a 640-wide MPEG movie through the translated game code
 of each picture, made here at the top screen's size, and the game underneath gets a movie that costs it almost nothing:
 
   FOLDER/movies.cut     for every video sector of every movie on the disc, what the 3DS build hands the game instead: a black
-                        picture of the same size whose macroblocks are nearly all "skipped". Sound sectors, sector positions and
+                        picture only one macroblock row high. Sound sectors, sector positions and
                         time stamps stay as they are, so the game's own player keeps its timing, its sound and its skip button.
                         The top row of each black picture carries a marker (which movie, which picture) as black and white blocks.
                         The build reads the marker when the game converts the picture for display and shows that picture of its own.
@@ -32,7 +32,8 @@ SECTOR = 2048
 FRAME = 3003                 # 90 kHz ticks a picture at 29.97 a second
 MAGIC = 0xB2                 # first eight marker blocks
 MARK_BITS = 32               # magic 8, movie 6, picture 16, parity 2
-CUT_MAGIC = b"P3CUT1\0\0"
+CUT_MAGIC = b"P3CUT2\0\0"
+OLD_CUT_MAGIC = b"P3CUT1\0\0"
 P3V_MAGIC = b"P3V1"
 
 
@@ -180,7 +181,7 @@ def cut_movie(data, movie):
     for gop in (300, 3000, 0):
         if not gop:
             return None, len(sectors), len(pics), (w, h)       # a movie smaller than its cheap copy stays as it is
-        new = units(cheap_stream(w, h, rate_byte, mpeg2, movie, len(pics), gop))
+        new = units(cheap_stream(w, 16, rate_byte, mpeg2, movie, len(pics), gop))
         if len(new) != len(pics):
             raise SystemExit("made %d pictures for %d" % (len(new), len(pics)))
         entries = lay_out(sectors, starts, pics, new, low)
@@ -226,7 +227,7 @@ def lay_out(sectors, starts, pics, new, low):
 
 
 def write_cut(path, table):
-    """table: [(name, first sector, sector count, entries, pictures, w, h, number)]. The file: "P3CUT1", the movie count, then per
+    """table: [(name, first sector, sector count, entries, pictures, w, h, number)]. The file: "P3CUT2", the movie count, then per
     movie 48 bytes (first sector, sector count, where its entries are, how many, pictures, width, height, name in 20 bytes, the
     number its markers and its .p3v carry), then 16 bytes per kept sector (sector within the movie, where its bytes are, how many,
     1 if a time stamp goes with it, the time stamp), then the bytes."""
@@ -249,7 +250,7 @@ class Cut:
 
     def __init__(self, path):
         self.data = open(path, "rb").read()
-        if self.data[:8] != CUT_MAGIC:
+        if self.data[:8] not in (CUT_MAGIC, OLD_CUT_MAGIC):
             raise SystemExit("%s is not a movies.cut" % path)
         n = struct.unpack_from("<I", self.data, 8)[0]
         self.movies = []

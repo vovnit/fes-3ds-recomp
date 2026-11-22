@@ -9,6 +9,7 @@
 #include "g3model.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -226,8 +227,7 @@ void clip_vs_strip(const Record &r, ClipStrip &cs) {
     in.mem = mem.data();
     in.top = r.top;
     in.itop = r.itop;
-    std::memcpy(in.vf, r.regs.data(), 512);
-    std::memcpy(in.vi, r.regs.data() + 528, 32);
+    in.vf = r.regs.data();
     std::vector<std::uint8_t> out;
     std::vector<std::uint32_t> ends;
     g3::End end;
@@ -286,8 +286,7 @@ void list_vs_strip(const Record &r, ListStrip &ls) {
     in.mem = mem.data();
     in.top = r.top;
     in.itop = r.itop;
-    std::memcpy(in.vf, r.regs.data(), 512);
-    std::memcpy(in.vi, r.regs.data() + 528, 32);
+    in.vf = r.regs.data();
     std::vector<std::uint8_t> out;
     std::vector<std::uint32_t> ends;
     g3::End end;
@@ -324,6 +323,7 @@ int main(int argc, char **argv) {
     }
     int verbose = 0;
     bool gpu = false, clipstrip = false, liststrip = false;
+    int bench = 0;
     ClipStrip cs;
     ListStrip ls;
     for (int i = 2; i < argc; ++i) {
@@ -331,6 +331,7 @@ int main(int argc, char **argv) {
         if (!std::strcmp(argv[i], "-gpu")) gpu = true;
         if (!std::strcmp(argv[i], "-clipstrip")) clipstrip = true;
         if (!std::strcmp(argv[i], "-liststrip")) liststrip = true;
+        if (!std::strcmp(argv[i], "-bench") && i + 1 < argc) bench = std::atoi(argv[i + 1]);
     }
     GpuCheck gc;
     std::FILE *f = std::fopen(argv[1], "rb");
@@ -349,8 +350,7 @@ int main(int argc, char **argv) {
         in.mem = r.mem.data();
         in.top = r.top;
         in.itop = r.itop;
-        std::memcpy(in.vf, r.regs.data(), 512);
-        std::memcpy(in.vi, r.regs.data() + 528, 32);
+        in.vf = r.regs.data();
         std::vector<std::uint8_t> out;
         std::vector<std::uint32_t> ends;
         g3::End end;
@@ -398,6 +398,35 @@ int main(int argc, char **argv) {
                         r.packets.size(), out.size());
             describe(r, out, 24);
         }
+    }
+    if (bench) {
+        // Test aid (-bench N): gpu_batch's time per batch and per vertex, by program, over every record N times.
+        std::rewind(f);
+        std::vector<Record> all;
+        Record b;
+        while (read_record(f, b)) all.push_back(b);
+        static g3::Gpu g;
+        double ns[2] = {}, verts[2] = {}, count[2] = {};
+        for (int pass = 0; pass < bench; ++pass)
+            for (const Record &rec : all) {
+                g3::Input in{};
+                in.program = static_cast<int>(rec.program);
+                in.mem = rec.mem.data();
+                in.top = rec.top;
+                in.itop = rec.itop;
+                in.vf = rec.regs.data();
+                g3::End e;
+                const auto t0 = std::chrono::steady_clock::now();
+                const int got = g3::gpu_batch(in, g, e);
+                const auto t1 = std::chrono::steady_clock::now();
+                if (got != 0) continue;
+                const int k = rec.program == 64;
+                ns[k] += std::chrono::duration<double, std::nano>(t1 - t0).count();
+                verts[k] += g.n;
+                ++count[k];
+            }
+        for (int k = 0; k < 2; ++k)
+            if (count[k]) std::printf("bench %s: %.0f ns per batch, %.1f ns per vertex (%.0f vertices a batch)\n", k ? "skin" : "generic", ns[k] / count[k], ns[k] / verts[k], verts[k] / count[k]);
     }
     std::printf("%u batches\n", n);
     for (const auto &[k, c] : counts)

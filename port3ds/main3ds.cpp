@@ -23,6 +23,7 @@
 //   sdmc:/p3fes/next.txt        settings for the next start only: the bottom screen's Load writes "load slotN.state" here
 //   sdmc:/p3fes/log.txt         everything the runtime prints
 //   sdmc:/p3fes/perf.txt        one line of timing every 30 game frames
+#include "audio3ds.hpp"
 #include "movie3ds.hpp"
 #include "pica.hpp"
 #include "remote3ds.hpp"
@@ -54,7 +55,7 @@ namespace gen { extern bool g_lossy; }   // native3ds.cpp
 namespace g3native {   // g3native.cpp
 extern int g_mode;
 extern std::uint32_t g_capture_left, g_capture_every, g_gpu_mask;
-void start();
+void start(bool gpu_available);
 }
 
 extern "C" {
@@ -145,6 +146,7 @@ std::atomic<WorkerState> g_worker_start{WorkerState::Waiting};
 std::atomic<WorkerState> g_vu_ready{WorkerState::Waiting}, g_gs_ready{WorkerState::Waiting};
 Thread g_vu_handle = nullptr;
 Thread g_gs_handle = nullptr;
+std::atomic<bool> g_vu_stopped{false};
 std::FILE *g_perf = nullptr;
 u64 g_start_ticks = 0;
 u64 g_last_ticks = 0;
@@ -297,7 +299,7 @@ void pmu_line() {
     std::memcpy(g_pmu_last, now, sizeof now);
 #ifdef PS2_PROF_ALL
     static constexpr const char *kNames[] = {"vu", "gif", "upload", "draw", "iop", "spu", "ipu", "vif", "dma", "events", "kernel",
-                                             "present", "wait", "full", "game", "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9"};
+                                             "present", "wait", "full", "game", "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13"};
     constexpr int kBuckets = ps2::prof::Count + 1 + ps2::prof::kExtra;
     static_assert(std::size(kNames) == kBuckets);
     static u64 printed[kBuckets][2];
@@ -342,7 +344,7 @@ void switch_events(int to) {
 // thread is running and its activity. Every 10 seconds it appends what it counted to sdmc:/p3fes/samples.txt and starts again:
 // "period N", then "copy activity count" lines for the game thread (copy 0 is outside every copy) and "vu program activity count"
 // lines for the VU thread (program is a function address in build/3ds/p3fes.map, 1 the interpreter, 0 none). Activities are
-// prof.hpp's counters: 14 is outside every activity, 15 to 24 are PS2_PROF_EXTRA 0 to 9, 31 not known (PROF=1, VU thread).
+// prof.hpp's counters: 14 is outside every activity, 15 to 28 are PS2_PROF_EXTRA 0 to 13, 31 not known (PROF=1, VU thread).
 // tools/p3fes_samples.py reads it.
 namespace gen {
 volatile std::uint16_t g_hot_now;
@@ -558,6 +560,7 @@ void mvd_probe() {
 }
 
 bool g_movies = true;
+bool g_sound = true;
 
 void read_settings(const char *path) {
     std::FILE *f = std::fopen(path, "r");
@@ -606,6 +609,7 @@ void read_settings(const char *path) {
         else if (!std::strcmp(key, "vulag")) ps2::gs::g_max_vu_lag = std::strtoul(value, nullptr, 10);
         else if (!std::strcmp(key, "stereo")) ps2::gs::pica::set_stereo(std::strtoul(value, nullptr, 10));
         else if (!std::strcmp(key, "movies")) g_movies = std::strtoul(value, nullptr, 10) != 0;
+        else if (!std::strcmp(key, "sound")) g_sound = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "saveat")) g_save_at = std::strtoull(value, nullptr, 10);
         else if (!std::strcmp(key, "draw")) g_draw_every = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         else if (!std::strcmp(key, "shots")) {
@@ -735,6 +739,7 @@ void emulate_on_game_stack() {
             return;
         }
     }
+    g3native::start(!g_software && !g_split_gs && ps2::gs::pica::g3_ready());
     if (!g_state_path.empty()) {   // a setting left over from a test must not end the game, which would take the wireless link with it
         if (std::FILE *state = std::fopen(g_state_path.c_str(), "rb")) {
             std::fclose(state);
@@ -757,8 +762,10 @@ void emulate_on_game_stack() {
         std::fprintf(stderr, "[3ds] booting, entry 0x%08lX\n", static_cast<unsigned long>(entry));
         pmu_start();
         g_start_ticks = g_last_ticks = svcGetSystemTick();
-        ps2::boot(entry, {"SLUS_216.21"});
-        if (g_state_path.empty() || ps2::load_state(g_state_path)) ps2::run();
+        if (!g_quit) {
+            ps2::boot(entry, {"SLUS_216.21"});
+            if (!g_quit && (g_state_path.empty() || ps2::load_state(g_state_path))) ps2::run();
+        }
         ps2::stop_iop_thread();
         if (ps2_dump_ee_seen("sdmc:/p3fes/eeseen.bin")) std::fprintf(stderr, "[3ds] wrote sdmc:/p3fes/eeseen.bin\n");
     }
@@ -770,10 +777,13 @@ void emulate_on_game_stack() {
         ps2::stop_vu_thread();
         threadJoin(vu_thread, U64_MAX);
         threadFree(vu_thread);
+        g_vu_handle = nullptr;
         if (g_gs_handle) {
             threadJoin(g_gs_handle, U64_MAX);
             threadFree(g_gs_handle);
+            g_gs_handle = nullptr;
         }
+        g_vu_stopped.store(true);
     } else {
         ps2::gs::pica::shutdown();
     }
@@ -962,11 +972,11 @@ int main() {
         read_settings("sdmc:/p3fes/next.txt");
         std::remove("sdmc:/p3fes/next.txt");
         if (g_link) remote::start();
+        if (g_sound) audio3ds::start();
         ps2::g_options.on_vblank = on_vblank;
         ps2::g_options.memcard_path = "sdmc:/p3fes/card.ps2";
         register_generated_code();
         register_generated_vu();
-        g3native::start();
 
         svcGetThreadPriority(&g_priority, CUR_THREAD_HANDLE);
         // The movie decoder shares core 2 with the vector programs and drawing, below them: a movie leaves that core idle.
@@ -981,9 +991,11 @@ int main() {
         while (thread && !g_finished) {
             if (!aptMainLoop() || remote::wants_exit()) {
                 g_quit = true;
+                ps2::abort_vu_thread();
                 break;
             }
             gspWaitForVBlank();
+            audio3ds::poll();
             remote::poll(ps2::frame_count());
             panel_step();
             if (++beats % 60 == 0) std::fflush(stderr);
@@ -992,10 +1004,30 @@ int main() {
                              static_cast<unsigned long long>(svcGetSystemTick() / static_cast<u64>(CPU_TICKS_PER_MSEC)),
                              static_cast<unsigned long long>(ps2::frame_count()));
         }
+        bool joined = true;
         if (thread) {
             // A stuck game must not block a restart from the Mac: ending the process stops its threads too.
-            if (R_SUCCEEDED(threadJoin(thread, 5000000000ull))) threadFree(thread);
+            if (R_SUCCEEDED(threadJoin(thread, 8000000000ull))) threadFree(thread);
+            else {
+                joined = false;
+                // Stop heap-stacked worker threads before __appExit unmaps the heap, or they will data-abort on wake.
+                if (!g_vu_stopped.load()) {
+                    ps2::stop_vu_thread();
+                    if (g_vu_handle) threadJoin(g_vu_handle, 2000000000ull);
+                    if (g_gs_handle) threadJoin(g_gs_handle, 2000000000ull);
+                }
+                ps2::stop_iop_thread();
+            }
         }
+        audio3ds::stop(joined);
+        movie::stop();
+        remote::stop();
+        std::fflush(stderr);
+        remote::chain_restart();
+        if (g_perf) std::fclose(g_perf);
+        std::fflush(stderr);
+        if (joined) gfxExit();
+        return 0;
     }
 
     movie::stop();

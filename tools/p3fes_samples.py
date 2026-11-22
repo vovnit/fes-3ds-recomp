@@ -4,13 +4,13 @@
 
 Each sample says which copy from tools/p3fes_eehot.py the game thread was in (the innermost one; code without a copy counts for
 the copy that called it) and which activity of port3ds/prof.hpp was running: "game" is the translated code itself, the others
-are the runtime working for it (vif, dma, kernel and so on, and x0 to x9 for PS2_PROF_EXTRA blocks) while that copy waits. Periods are 10 seconds each; --from and
+are the runtime working for it (vif, dma, kernel and so on, and x0 to x13 for PS2_PROF_EXTRA blocks) while that copy waits. Periods are 10 seconds each; --from and
 --to pick some, to leave out the loading at the start. --names takes a function list from a related project to name addresses:
 a CSV with Name,Start,End columns, or lines like "name = 0x00100008; // type:func".
 """
 import argparse, bisect, collections, csv, glob, os, re
 
-ACTS = ['vu', 'gif', 'upload', 'draw', 'iop', 'spu', 'ipu', 'vif', 'dma', 'events', 'kernel', 'present', 'wait', 'full', 'game'] + ['x%d' % k for k in range(10)]
+ACTS = ['vu', 'gif', 'upload', 'draw', 'iop', 'spu', 'ipu', 'vif', 'dma', 'events', 'kernel', 'present', 'wait', 'full', 'game'] + ['x%d' % k for k in range(14)]
 GAME = 14
 
 

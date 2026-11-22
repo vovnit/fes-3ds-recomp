@@ -42,7 +42,7 @@ GAME      += $(IOP)
 CXXFLAGS  += -DPS2_IOP_BLOCKS
 endif
 endif
-HOST      := /p/port3ds/main3ds.cpp /p/port3ds/pica.cpp /p/port3ds/native3ds.cpp /p/port3ds/memcpy3ds.cpp /p/port3ds/remote3ds.cpp /p/port3ds/iop3ds.cpp \
+HOST      := /p/port3ds/main3ds.cpp /p/port3ds/audio3ds.cpp /p/port3ds/pica.cpp /p/port3ds/native3ds.cpp /p/port3ds/memcpy3ds.cpp /p/port3ds/remote3ds.cpp /p/port3ds/iop3ds.cpp \
              /p/port3ds/movie3ds.cpp /p/port3ds/mpeg1.cpp /p/port3ds/gpuoverlap.cpp /p/port3ds/g3native.cpp /p/port3ds/g3model.cpp
 OBJS      := $(patsubst /%.cpp,$(OUT)/obj/%.o,$(RUNTIME) $(GAME) $(HOST)) $(OUT)/shader/gs_v_shbin.o
 comma     := ,
@@ -69,7 +69,14 @@ $(OUT)/p3fes.elf: $(OBJS) $(CONFIG)
 	$(PREFIX)size $@
 
 # The g3 model must round as the VU programs do: every multiply and add on its own (tools/g3check builds it the same way).
-$(OUT)/obj/p/port3ds/g3model.o: CXXFLAGS += -ffp-contract=off
+$(OUT)/obj/p/port3ds/g3model.o: CXXFLAGS += -O3 -ffp-contract=off
+$(OUT)/obj/p/port3ds/native3ds.o: CXXFLAGS += -O3 -ffp-contract=off
+$(OUT)/obj/p/port3ds/pica.o: CXXFLAGS += -O3
+$(OUT)/obj/w/runtime/src/vif.o: CXXFLAGS += -O3
+$(OUT)/obj/w/runtime/src/dmac.o: CXXFLAGS += -O3
+$(OUT)/obj/w/runtime/src/gs/gif.o: CXXFLAGS += -O3
+$(OUT)/obj/w/runtime/src/gs/gs.o: CXXFLAGS += -O3
+$(OUT)/obj/w/runtime/src/gs/queue.o: CXXFLAGS += -O3
 
 # The wireless link unpacks uploads with zlib from the portlibs.
 $(OUT)/obj/p/port3ds/remote3ds.o: CXXFLAGS += -I$(PORTLIBS)/include

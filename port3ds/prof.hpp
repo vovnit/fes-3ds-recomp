@@ -20,7 +20,7 @@ extern std::atomic<std::uint32_t> g_ticks[Count];
 // With "pmu A B", the two hardware events on the game thread by activity, each nested activity apart from the one around it.
 // g_events[Count] is whatever ran outside every activity: the translated game code. The kExtra buckets after it are for a
 // throwaway split of something: PS2_PROF_EXTRA(k) at the top of a block counts that block in bucket k, printed as x<k>.
-inline constexpr int kExtra = 10;
+inline constexpr int kExtra = 14;
 extern std::uint64_t g_events[Count + 1 + kExtra][2];
 extern int g_events_at;
 extern void *g_game_thread;
@@ -46,7 +46,7 @@ struct Extra {
 // SAMPLE=1 without PROF=1: the activity now on the game thread and on the VU thread (Count is outside every activity: the game code,
 // or on the VU thread its queue loop; Count + 1 + k is PS2_PROF_EXTRA(k)), read by the sampler in main3ds.cpp. Only a store, so
 // these cost almost nothing.
-inline constexpr int kExtra = 10;
+inline constexpr int kExtra = 14;
 extern volatile std::uint8_t g_where, g_where_vu;
 extern void *g_game_thread, *g_vu_thread;
 inline volatile std::uint8_t *where_slot() {
@@ -119,10 +119,13 @@ struct Scope {
 }
 
 #define PS2_PROF(counter) ps2::prof::Scope<counter> ps2_prof_scope
+// Each marker's variable is named by its line, so that a block may hold a second one (which then counts from there on).
+#define PS2_PROF_CAT2(a, b) a##b
+#define PS2_PROF_CAT(a, b) PS2_PROF_CAT2(a, b)
 #ifdef PS2_PROF_ALL
-#define PS2_PROF_EXTRA(k) ps2::prof::Extra ps2_prof_extra(k)
+#define PS2_PROF_EXTRA(k) ps2::prof::Extra PS2_PROF_CAT(ps2_prof_extra_, __LINE__)(k)
 #elif defined(PS2_HOT_SAMPLE)
-#define PS2_PROF_EXTRA(k) ps2::prof::Where ps2_prof_extra(ps2::prof::Count + 1 + (k))
+#define PS2_PROF_EXTRA(k) ps2::prof::Where PS2_PROF_CAT(ps2_prof_extra_, __LINE__)(ps2::prof::Count + 1 + (k))
 #else
 #define PS2_PROF_EXTRA(k)
 #endif

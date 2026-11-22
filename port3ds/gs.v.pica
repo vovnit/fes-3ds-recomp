@@ -30,6 +30,7 @@
 .fvec bones[72]
 .bool isg3
 .bool isskin
+.bool isortho
 
 .constf ones(1.0, 1.0, 1.0, 1.0)
 ; Byte attributes arrive as 0 to 255, not 0 to 1.
@@ -87,17 +88,41 @@
             mov r9, r8
             add r10, amb, g3clr
         .end
-        ; clip space through vf28-vf31
+        ; clip space through vf28-vf31 -> r1 = (cx, cy, cz, cw)
         mov r1, proj[3]
         mad r1, r0.xxxx, proj[0], r1
         mad r1, r0.yyyy, proj[1], r1
         mad r1, r0.zzzz, proj[2], r1
-        ; GS screen position: x and y in pixels from the offset, z as the GS path's depth
-        rcp r2, r1.wwww
-        mul r3.xyz, r1.xyz, r2.xyz
-        add r3.xyz, post.xyz, r3.xyz
-        mul r3.z, post.wwww, r3.zzzz
-        mov r3.w, r1.wwww
+        ifu isortho
+            ; orthographic skinning (g3_skin_ortho): r1.xyz is already screen-space (no w divide), r1.w is linear fog distance
+            add r3.xyz, post.xyz, r1.xyz
+            mul r3.z, post.wwww, r3.zzzz
+            mul r0.xyz, scale.xyz, r3.xyz
+            add r0.xyz, offset.xyz, r0.xyz
+            max r0.z, -ones.zzzz, r0.zzzz
+            max r2.z, eye.zzzz, r0.zzzz
+            mul r2.x, eye.xxxx, r2.zzzz
+            add r2.x, eye.yyyy, r2.xxxx
+            add r0.x, r0.xxxx, r2.xxxx
+            mov r0.w, ones.wwww
+        .else
+            ; homogeneous clip space directly (no rcp, so PICA200 clips w <= 0 and near/far in hardware)
+            mad r3.xyz, r1.wwww, post.xyz, r1.xyz
+            mul r3.z, post.wwww, r3.zzzz
+            mul r0.xyz, scale.xyz, r3.xyz
+            mad r0.xyz, r1.wwww, offset.xyz, r0.xyz
+            ; non-clipper batches clamp z >= -w (GS never near-clips); clipper batches leave z unclamped (fogp.zw = 0, -1e15)
+            mul r2.w, fogp.zzzz, r1.wwww
+            add r2.w, fogp.wwww, r2.wwww
+            max r0.z, r2.wwww, r0.zzzz
+            mul r2.z, eye.zzzz, r1.wwww
+            max r2.z, r2.zzzz, r0.zzzz
+            mul r2.x, eye.xxxx, r2.zzzz
+            mad r2.x, r1.wwww, eye.yyyy, r2.xxxx
+            add r0.x, r0.xxxx, r2.xxxx
+            mov r0.w, r1.wwww
+        .end
+        mov outpos, r0
         ; colour
         dp3 r11.x, ldir[0], r9
         dp3 r11.y, ldir[1], r9
@@ -122,18 +147,18 @@
         mul outclr, bytes_to_unit, inclr
         mov outtc0, intc0
         mul outtc1, bytes_to_unit, infog
+        ; depth no nearer than the top of the buffer
+        max r3.z, -ones.zzzz, r3.zzzz
+        mul r0.xyz, scale.xyz, r3.xyz
+        add r0.xyz, offset.xyz, r0.xyz
+        max r2, eye.zzzz, r0.zzzz
+        mul r2, eye.xxxx, r2
+        add r2, eye.yyyy, r2
+        add r0.x, r0.xxxx, r2.xxxx
+        mov r0.w, r3.w
+        mul r1, ones, r3.wwww
+        mul outpos.xyz, r1.xyz, r0.xyz
+        mov outpos.w, r0.w
     .end
-    ; depth no nearer than the top of the buffer
-    max r3.z, -ones.zzzz, r3.zzzz
-    mul r0.xyz, scale.xyz, r3.xyz
-    add r0.xyz, offset.xyz, r0.xyz
-    max r2, eye.zzzz, r0.zzzz
-    mul r2, eye.xxxx, r2
-    add r2, eye.yyyy, r2
-    add r0.x, r0.xxxx, r2.xxxx
-    mov r0.w, r3.w
-    mul r1, ones, r3.wwww
-    mul outpos.xyz, r1.xyz, r0.xyz
-    mov outpos.w, r0.w
     end
 .end
