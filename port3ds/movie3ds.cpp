@@ -43,6 +43,7 @@ static_assert(sizeof(Entry) == 16);
 
 Cut g_cuts[kMovies];
 bool g_has_copy[kMovies];
+bool g_told[kMovies];   // its first read is in the log
 bool g_marker_row_only = false;
 int g_cut_count = 0;
 std::FILE *g_cut_file = nullptr;
@@ -383,7 +384,22 @@ void disc_read(std::uint64_t offset, std::uint8_t *data, std::size_t size) {
             int found = -1;
             for (int m = 0; m < g_cut_count; ++m)
                 if (sector >= g_cuts[m].first && sector - g_cuts[m].first < g_cuts[m].count) found = m;
-            if (found < 0) return;   // a read lies in one file, so the rest is not a movie either
+            if (found < 0) {   // a read lies in one file, so the rest is not a movie either
+                // MPEG program stream data (a pack header) that movies.cut does not cover: the game decodes it itself, slowly.
+                static std::uint32_t told_at = kNothing;
+                const std::uint8_t *d = data + done;
+                if (d[0] == 0 && d[1] == 0 && d[2] == 1 && d[3] == 0xBA && (told_at == kNothing || sector < told_at || sector - told_at > 4096u)) {
+                    told_at = sector;
+                    std::fprintf(stderr, "[movie] MPEG data at sector %lu is not in movies.cut\n", static_cast<unsigned long>(sector));
+                }
+                return;
+            }
+            if (found != last || !g_told[found]) {
+                if (!g_told[found]) std::fprintf(stderr, "[movie] movie %d (%.20s, sectors %lu+%lu) %s\n", found, g_cuts[found].name,
+                                                 static_cast<unsigned long>(g_cuts[found].first), static_cast<unsigned long>(g_cuts[found].count),
+                                                 g_has_copy[found] ? "from its 3DS copy" : "has no 3DS copy");
+                g_told[found] = true;
+            }
             last = found;
         }
         if (g_has_copy[last]) change_sector(last, sector - g_cuts[last].first, data + done);

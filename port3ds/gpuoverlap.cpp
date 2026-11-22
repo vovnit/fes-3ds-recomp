@@ -4,7 +4,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+
+extern "C" {
+volatile int g_fes_trace = 0;   // where the drawing thread is, for the stall report in main3ds.cpp
+}
+#define FES_AT(n) (g_fes_trace = (n))
 
 namespace {
 
@@ -51,9 +57,13 @@ extern "C" void __real_GPUCMD_Split(u32 **, u32 *);
 extern "C" bool __wrap_gxCmdQueueWait(gxCmdQueue_s *queue, s64 timeout) {
     if (queue == display_queue) {
         if (bypass_begin_wait) return true;
-        if (awaiting_display && timeout < 0) LightEvent_Wait(&display_finished);
+        if (awaiting_display && timeout < 0) { FES_AT(60); LightEvent_Wait(&display_finished); }
     }
-    return __real_gxCmdQueueWait(queue, timeout);
+    const int was = g_fes_trace;
+    FES_AT(61);
+    const bool done = __real_gxCmdQueueWait(queue, timeout);
+    FES_AT(was);
+    return done;
 }
 
 extern "C" void __wrap_gxCmdQueueStop(gxCmdQueue_s *queue) {
@@ -85,8 +95,12 @@ extern "C" bool FesOverlapInit(std::size_t bytes) {
 extern "C" void FesOverlapWait() {
     if (!awaiting_display) return;
     const u64 start = svcGetSystemTick();
+    const int was = g_fes_trace;
+    FES_AT(40);
     LightEvent_Wait(&display_finished);
+    FES_AT(41);
     __real_gxCmdQueueWait(display_queue, -1);
+    FES_AT(was);
     __real_gxCmdQueueStop(display_queue);
     __real_gxCmdQueueClear(display_queue);
     awaiting_display = false;
@@ -95,12 +109,30 @@ extern "C" void FesOverlapWait() {
 
 extern "C" u64 FesOverlapWaitTicks() { return wait_ticks; }
 
+// For the stall report in main3ds.cpp: the display queue's state and the GX commands it holds (type, first three arguments).
+extern "C" void FesOverlapDescribe(char *out, std::size_t size) {
+    if (!display_queue) {
+        std::snprintf(out, size, "no display queue");
+        return;
+    }
+    const gxCmdQueue_s &q = *display_queue;
+    int at = std::snprintf(out, size, "queue %u entries, %u sent, %u done, awaiting %d, halves %u:", q.numEntries, q.curEntry, q.lastEntry,
+                           awaiting_display.load() ? 1 : 0, submitted_halves);
+    for (unsigned i = 0; i < q.numEntries && at > 0 && static_cast<std::size_t>(at) < size; ++i) {
+        const gxCmdEntry_s &e = q.entries[i];
+        at += std::snprintf(out + at, size - at, " [%u %08lX %08lX %08lX]", e.type, static_cast<unsigned long>(e.args[0]),
+                            static_cast<unsigned long>(e.args[1]), static_cast<unsigned long>(e.args[2]));
+    }
+}
+
 extern "C" bool FesOverlapBegin(bool wait_for_geometry, bool force_small) {
     if (!display_queue || display_queue->callback != frame_finished) return false;
     if (wait_for_geometry || submitted_halves == 3) FesOverlapWait();
     // Citro3D opens its CPU state while the previous display queue keeps running.
     bypass_begin_wait = true;
+    FES_AT(16);
     const bool opened = C3D_FrameBegin(0);
+    FES_AT(17);
     bypass_begin_wait = false;
     if (!opened) return false;
 
@@ -157,7 +189,9 @@ extern "C" void __wrap_GPUCMD_Split(u32 **buffer, u32 *words) {
 extern "C" void FesOverlapEnd(u8 flags) {
     if (!recording_begin) {
         submitted_halves = 3;
+        FES_AT(53);
         C3D_FrameEnd(flags);
+        FES_AT(54);
         return;
     }
     C3D_FrameSplit(flags);
@@ -182,7 +216,9 @@ extern "C" void FesOverlapEnd(u8 flags) {
         gxCmdQueueAdd(display_queue, &entry);
     }
     recording_begin = nullptr;
+    FES_AT(51);
     C3D_FrameEnd(flags);
+    FES_AT(52);
 }
 
 // Command words still free this frame, counting the growth expand_recording can still give the recording.

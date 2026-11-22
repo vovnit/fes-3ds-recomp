@@ -483,14 +483,14 @@ struct BoneCache {
     std::uint32_t gen = 0;
     std::uint16_t seen_gen = 0;
     std::uint8_t by_hash[64]{};   // slot + 1 for a hash's bucket, 0 for none
+    BoneUse uses[kMaxBoneUses];   // the current batch's bone addresses in the order first met, with their slots
+    int use_count = 0;            // -1: more than kMaxBoneUses
 };
 
 static BoneCache g_bones;
 
-[[gnu::noinline]] static int resolve_bone_slot(const std::uint8_t *mem, u32 address, u32 batch, std::uint16_t seen_gen, Gpu &g) {
-    G3_PROF_EXTRA(9);   // SAMPLE=1: the bone lookup, apart from the rest of gpu_batch (x8)
-    // The program's rows 0-2 (rotation) and 3 (translation), x, y and z of each.
-    std::uint32_t rows[12];
+// The program's rows 0-2 (rotation) and 3 (translation), x, y and z of each, for the bone at address.
+static inline void bone_rows(const std::uint8_t *mem, u32 address, std::uint32_t rows[12]) {
     const u32 base_q = (address + 696u) & 1023u;
     if (base_q <= 1020u) {
         const auto *q = reinterpret_cast<const u32 *>(mem + base_q * 16u);
@@ -501,13 +501,39 @@ static BoneCache g_bones;
     } else {
         for (u32 r = 0; r < 4; ++r) std::memcpy(rows + 3 * r, mem + ((address + 696u + r) & 1023u) * 16u, 12);
     }
+}
+
+static inline std::uint32_t rows_hash(const std::uint32_t rows[12]) {
     std::uint32_t h0 = 0x811C9DC5u, h1 = 0x01000193u;
     for (int j = 0; j < 12; j += 2) {
         h0 = (h0 ^ rows[j]) * 0x01000193u;
         h1 = (h1 ^ rows[j + 1]) * 0x9E3779B1u;
     }
-    const std::uint32_t h = h0 ^ (h1 >> 1);
-    const unsigned bucket = (h ^ (h >> 11) ^ (h >> 22)) & 63u;
+    return h0 ^ (h1 >> 1);
+}
+
+static inline unsigned hash_bucket(std::uint32_t h) { return (h ^ (h >> 11) ^ (h >> 22)) & 63u; }
+
+// Puts the bone into the slot, for the shader too (a new generation, so the uniforms are sent).
+static void set_bone_slot(int slot, const std::uint32_t rows[12], std::uint32_t h, Gpu &g) {
+    const unsigned old = hash_bucket(g_bones.slot_hash[slot]);
+    if (g_bones.by_hash[old] == slot + 1) g_bones.by_hash[old] = 0;
+    g_bones.by_hash[hash_bucket(h)] = static_cast<std::uint8_t>(slot + 1);
+    g_bones.slot_hash[slot] = h;
+    std::memcpy(g_bones.slot_rows[slot], rows, 12 * sizeof(std::uint32_t));
+    // turned for the shader: vector c is (row0.c, row1.c, row2.c, row3.c)
+    float m[12];
+    std::memcpy(m, rows, sizeof m);
+    for (int c = 0; c < 3; ++c) set4(g.bone[3 * slot + c], m[c], m[3 + c], m[6 + c], m[9 + c]);
+    g.bone_gen[slot] = ++g_bones.gen;
+}
+
+[[gnu::noinline]] static int resolve_bone_slot(const std::uint8_t *mem, u32 address, u32 batch, std::uint16_t seen_gen, Gpu &g) {
+    G3_PROF_EXTRA(9);   // SAMPLE=1: the bone lookup, apart from the rest of gpu_batch (x8)
+    std::uint32_t rows[12];
+    bone_rows(mem, address, rows);
+    const std::uint32_t h = rows_hash(rows);
+    const unsigned bucket = hash_bucket(h);
     int slot = g_bones.by_hash[bucket] - 1;
     bool hit = slot >= 0 && g_bones.slot_hash[slot] == h;
     if (hit) {
@@ -520,21 +546,45 @@ static BoneCache g_bones;
         for (unsigned j = 1; j < kGpuBones; ++j)
             if (g_bones.used_in[j] < g_bones.used_in[slot]) slot = static_cast<int>(j);
         if (g_bones.used_in[slot] == batch) return -1;
-        const unsigned old = (g_bones.slot_hash[slot] ^ (g_bones.slot_hash[slot] >> 11) ^ (g_bones.slot_hash[slot] >> 22)) & 63u;
-        if (g_bones.by_hash[old] == slot + 1) g_bones.by_hash[old] = 0;
-        g_bones.by_hash[bucket] = static_cast<std::uint8_t>(slot + 1);
-        g_bones.slot_hash[slot] = h;
-        std::memcpy(g_bones.slot_rows[slot], rows, sizeof rows);
-        // turned for the shader: vector c is (row0.c, row1.c, row2.c, row3.c)
-        float m[12];
-        std::memcpy(m, rows, sizeof m);
-        for (int c = 0; c < 3; ++c) set4(g.bone[3 * slot + c], m[c], m[3 + c], m[6 + c], m[9 + c]);
-        g.bone_gen[slot] = ++g_bones.gen;
+        set_bone_slot(slot, rows, h, g);
     }
     g_bones.used_in[slot] = batch;
     g_bones.address_seen[address] = seen_gen;
     g_bones.address_slot[address] = static_cast<std::uint8_t>(slot);
+    if (g_bones.use_count >= 0) {
+        if (g_bones.use_count < static_cast<int>(kMaxBoneUses))
+            g_bones.uses[g_bones.use_count++] = BoneUse{static_cast<std::uint16_t>(address), static_cast<std::uint8_t>(slot)};
+        else
+            g_bones.use_count = -1;
+    }
     return slot;
+}
+
+int last_bones(const BoneUse *&uses) {
+    uses = g_bones.uses;
+    return g_bones.use_count;
+}
+
+bool restore_bones(const std::uint8_t *mem, const BoneUse *uses, int count, Gpu &g) {
+    if (count < 0 || count > static_cast<int>(kMaxBoneUses)) return false;
+    std::uint32_t rows[kMaxBoneUses][12];
+    std::uint32_t mask = 0;
+    for (int i = 0; i < count; ++i) {
+        bone_rows(mem, uses[i].address, rows[i]);
+        // Two of its bones were one matrix when its vertices were made, and they share a slot: they must still be one.
+        for (int j = 0; j < i; ++j)
+            if (uses[j].slot == uses[i].slot && std::memcmp(rows[j], rows[i], sizeof rows[i]) != 0) return false;
+        mask |= 1u << uses[i].slot;
+    }
+    const u32 batch = ++g_bones.batch;
+    for (int i = 0; i < count; ++i) {
+        const int slot = uses[i].slot;
+        if (g_bones.used_in[slot] != batch && std::memcmp(g_bones.slot_rows[slot], rows[i], sizeof rows[i]) != 0)
+            set_bone_slot(slot, rows[i], rows_hash(rows[i]), g);
+        g_bones.used_in[slot] = batch;
+    }
+    g.slots = mask;
+    return true;
 }
 
 template <bool Lights>
@@ -1012,6 +1062,7 @@ int gpu_batch_fill(const Input &in, Gpu &g, const BatchPlan &plan, GpuVertex *ds
         g_bones.seen_gen = 1u;
     }
     const std::uint16_t seen_gen = g_bones.seen_gen;
+    g_bones.use_count = 0;
     G3_PROF_EXTRA(13);
     if (plan.direct) return fill_skin_direct(mem, plan.top, g, dst, in.streams, plan.n, plan.pos_w, plan.uv_w, plan.nrm_step, plan.lights, batch, seen_gen);
     return fill_skin_indirect(mem, plan.top, g, dst, plan.n, plan.lights, batch, seen_gen);

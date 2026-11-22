@@ -27,6 +27,7 @@ void set_hide(std::uint32_t from, std::uint32_t to);   // test aid: leave out th
 void set_debug(std::uint32_t bits);              // test aid: 1 no depth test, 2 no blending
 void set_stereo(std::uint32_t strength);         // how deep the picture looks with the 3D slider up, 0 (flat) to 10; 5 to begin with
 std::uint32_t stereo();
+std::uint32_t pictures_shown();                  // pictures put on the screen so far (for the speed log)
 
 void draw(const State &s, std::uint32_t serial, std::uint64_t clamp);
 // A batch of the game's model programs, transformed and lit by the vertex shader (port3ds/g3native.cpp, "g3 4"). PRIM must

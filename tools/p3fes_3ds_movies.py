@@ -10,7 +10,8 @@ The console cannot decode a 640-wide MPEG movie through the translated game code
 of each picture, made here at the top screen's size, and the game underneath gets a movie that costs it almost nothing:
 
   FOLDER/movies.cut     for every video sector of every movie on the disc, what the 3DS build hands the game instead: a black
-                        picture only one macroblock row high. Sound sectors, sector positions and
+                        picture only one macroblock row high, followed by zero bytes up to the size of a full-height black
+                        picture, since the game's player waits for that much video data. Sound sectors, sector positions and
                         time stamps stay as they are, so the game's own player keeps its timing, its sound and its skip button.
                         The top row of each black picture carries a marker (which movie, which picture) as black and white blocks.
                         The build reads the marker when the game converts the picture for display and shows that picture of its own.
@@ -182,8 +183,14 @@ def cut_movie(data, movie):
         if not gop:
             return None, len(sectors), len(pics), (w, h)       # a movie smaller than its cheap copy stays as it is
         new = units(cheap_stream(w, 16, rate_byte, mpeg2, movie, len(pics), gop))
-        if len(new) != len(pics):
-            raise SystemExit("made %d pictures for %d" % (len(new), len(pics)))
+        full = units(cheap_stream(w, h, rate_byte, mpeg2, movie, len(pics), gop))
+        if len(new) != len(pics) or len(full) != len(pics):
+            raise SystemExit("made %d and %d pictures for %d" % (len(new), len(full), len(pics)))
+        # The game's player starts a movie, and keeps it going, only while enough video bytes wait in its buffer. One-row pictures
+        # alone, 20 to 40 bytes each, stopped the title movie after 10 pictures: the sound buffer filled first and the disc reads
+        # stopped. So each picture is followed by zero bytes up to the size of the full-height black picture (P3CUT1), which ran
+        # every movie. The game skips the zeros on its way to the next start code; the IPU still decodes one row.
+        new = [u + bytes(len(f) - len(u)) if len(f) > len(u) else u for u, f in zip(new, full)]
         entries = lay_out(sectors, starts, pics, new, low)
         if entries is not None:
             return entries, len(sectors), len(pics), (w, h)

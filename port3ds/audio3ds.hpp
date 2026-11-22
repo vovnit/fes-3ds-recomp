@@ -11,5 +11,6 @@ bool start();
 void stop(bool clear_sink = true);
 void poll();   // called once per vblank on the main thread (only needed for CSND fallback)
 void push(const std::int16_t *samples, std::size_t frames);
+void report(double seconds);   // logs what came in and how often the DSP ran dry since the last call
 
 }

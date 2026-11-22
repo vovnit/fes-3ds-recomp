@@ -19,11 +19,18 @@
 //                               "saveat N" (test aid: save a state to slot 1 at game frame N, as the bottom screen's Save does),
 //                               "g3 N" (the model programs g3_generic and g3_skin: 1 native, 2 compared with the programs, 3 also
 //                               captured, "g3cap N" batches, one in "g3every K"; 4 on the GPU's vertex shader; see g3native.cpp)
+//                               "g3cache N" (converted g3 vertices kept across pictures: 0 off, 1 on, the default, 2 on with counts in the log; g3cache.cpp)
+//                               "g3skin 0" (the vertex cache leaves skinned batches out; they are in by default; g3cache.hpp)
+//                               "g3index N" (test: 1 joins unskinned batches from the cache by index, 2 skinned too; both hang the console; g3cache.hpp)
+//                               "debug 256" (checks every g3 strip before drawing: buffer, indices, values, bone slots, uniforms)
+//                               "debug 512" (test: flush the whole vertex cache arena before every submit)
+//                               "debug 1024" (logs each decision of the automatic picture skipping)
 //   sdmc:/p3fes/slot1.state     states saved from the bottom screen (slot1 to slot3), packed
 //   sdmc:/p3fes/next.txt        settings for the next start only: the bottom screen's Load writes "load slotN.state" here
 //   sdmc:/p3fes/log.txt         everything the runtime prints
 //   sdmc:/p3fes/perf.txt        one line of timing every 30 game frames
 #include "audio3ds.hpp"
+#include "g3cache.hpp"
 #include "movie3ds.hpp"
 #include "pica.hpp"
 #include "remote3ds.hpp"
@@ -61,7 +68,7 @@ void start(bool gpu_available);
 extern "C" {
 // Program + these + the PS2 RAM must fit the 124 MB a New 3DS application gets.
 u32 __ctru_heap_size = 28u << 20;
-u32 __ctru_linear_heap_size = 13u << 20;
+u32 __ctru_linear_heap_size = 15u << 20;   // 2 MB of it is the g3 vertex arena
 }
 
 static_assert(ps2::kRamAddress3ds == OS_HEAP_AREA_BEGIN + (28u << 20), "the PS2 RAM follows the heap with no gap");
@@ -147,6 +154,8 @@ std::atomic<WorkerState> g_vu_ready{WorkerState::Waiting}, g_gs_ready{WorkerStat
 Thread g_vu_handle = nullptr;
 Thread g_gs_handle = nullptr;
 std::atomic<bool> g_vu_stopped{false};
+extern "C" volatile int g_fes_trace;
+extern "C" void FesOverlapDescribe(char *out, std::size_t size);
 std::FILE *g_perf = nullptr;
 u64 g_start_ticks = 0;
 u64 g_last_ticks = 0;
@@ -602,6 +611,9 @@ void read_settings(const char *path) {
         else if (!std::strcmp(key, "uncapped")) g_hold_speed = std::strtoul(value, nullptr, 10) == 0;
         else if (!std::strcmp(key, "mvdprobe")) g_mvd_probe = std::strtoul(value, nullptr, 10) != 0;
         else if (!std::strcmp(key, "g3")) g3native::g_mode = std::atoi(value);
+        else if (!std::strcmp(key, "g3cache")) g3cache::g_mode = std::atoi(value);
+        else if (!std::strcmp(key, "g3skin")) g3cache::g_skin = std::atoi(value);
+        else if (!std::strcmp(key, "g3index")) g3cache::g_index = std::atoi(value);
         else if (!std::strcmp(key, "g3gpu")) g3native::g_gpu_mask = static_cast<std::uint32_t>(std::atoi(value));
         else if (!std::strcmp(key, "g3cap")) g3native::g_capture_left = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         else if (!std::strcmp(key, "g3every")) g3native::g_capture_every = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)));
@@ -999,6 +1011,51 @@ int main() {
             remote::poll(ps2::frame_count());
             panel_step();
             if (++beats % 60 == 0) std::fflush(stderr);
+            if (beats % 600 == 0) {
+                static std::uint64_t stall_frame = 0;
+                const std::uint64_t now_frame = ps2::frame_count();
+                if (now_frame == stall_frame) {
+                    using namespace ps2::prof;
+                    u8 shell = 0xFF;
+                    if (R_SUCCEEDED(ptmuInit())) {
+                        PTMU_GetShellState(&shell);
+                        ptmuExit();
+                    }
+                    std::fprintf(stderr, "[3ds] stalled: drawing at %d, vu thread idle %lu ms, ee blocked %lu ms, lid %s, 3D slider %.2f\n", g_fes_trace,
+                                 static_cast<unsigned long>(g_ticks[Wait].load() / CPU_TICKS_PER_MSEC), static_cast<unsigned long>(g_ticks[Full].load() / CPU_TICKS_PER_MSEC),
+                                 shell == 1 ? "open" : shell == 0 ? "closed" : "not known", static_cast<double>(osGet3DSliderState()));
+                    char queue[512];
+                    FesOverlapDescribe(queue, sizeof queue);
+                    std::fprintf(stderr, "[3ds] stalled: %s\n", queue);
+                }
+                stall_frame = now_frame;
+            }
+            if (beats % 300 == 0) {   // sound and game speed every 5 s
+                static u64 last_tick = 0;
+                static std::uint64_t last_frame = 0;
+                const u64 tick = svcGetSystemTick();
+                const std::uint64_t frame = ps2::frame_count();
+                using namespace ps2::prof;
+                static std::uint64_t last_wait = 0, last_full = 0;
+                static std::uint32_t last_shown = 0;
+                const std::uint32_t shown = ps2::gs::pica::pictures_shown();
+                const std::uint64_t wait = g_ticks[Wait].load(), full = g_ticks[Full].load();
+                if (last_tick) {
+                    const double seconds = static_cast<double>(tick - last_tick) / static_cast<double>(SYSCLOCK_ARM11);
+                    // ee blocked: the game thread waiting for room in the drawing queue; vu idle: the drawing thread with nothing to do
+                    std::fprintf(stderr, "[3ds] game at %.0f%% of full speed (%llu frames in %.1f s), %.1f pictures a second, ee blocked %.0f%%, vu idle %.0f%%\n",
+                                 100.0 * (frame - last_frame) / (seconds * 59.94), static_cast<unsigned long long>(frame - last_frame), seconds,
+                                 (shown - last_shown) / seconds,
+                                 full >= last_full ? 100.0 * static_cast<double>(full - last_full) / (seconds * SYSCLOCK_ARM11) : 0.0,
+                                 wait >= last_wait ? 100.0 * static_cast<double>(wait - last_wait) / (seconds * SYSCLOCK_ARM11) : 0.0);   // the counters restart when a state loads
+                    audio3ds::report(seconds);
+                }
+                last_tick = tick;
+                last_frame = frame;
+                last_wait = wait;
+                last_full = full;
+                last_shown = shown;
+            }
             if (beats % 600 == 0)
                 std::fprintf(stderr, "[3ds] heartbeat %lu, %llu ms, frame %llu\n", static_cast<unsigned long>(beats),
                              static_cast<unsigned long long>(svcGetSystemTick() / static_cast<u64>(CPU_TICKS_PER_MSEC)),

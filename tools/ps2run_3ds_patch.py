@@ -9300,6 +9300,34 @@ void materialize_deferred(int idx) {
     ],
 }
 
+
+# The unchanging() table with two ways per set (2026-11-23): pairs of blocks no longer push each other out.
+UNCHANGING_WAYS_EDITS = {
+    'runtime/src/gs/queue.cpp': [
+        ('''Unchanging g_unchanging[16384];
+Unchanging *g_last_unchanging = nullptr;''',
+         '''// Two ways per set, the one used less recently replaced. With one way, in the lobby a 17.5 KB texture and a 672-byte block took
+// the same entry in turn, so neither ever counted as unchanging and the texture was hashed whole and copied every picture.
+constexpr std::uint32_t kUnchangingSets = 8192;
+Unchanging g_unchanging[kUnchangingSets * 2];
+std::uint8_t g_unchanging_mru[kUnchangingSets / 8];   // per set, the way used last
+Unchanging *g_last_unchanging = nullptr;'''),
+        ('''    Unchanging &e = g_unchanging[(off >> 4) * 2654435761u >> 18];
+    const bool known = e.data == data && e.bytes == bytes;
+''',
+         '''    const std::uint32_t set = (off >> 4) * 2654435761u >> 19;
+    Unchanging *const ways = &g_unchanging[set * 2];
+    std::uint32_t way = ways[1].data == data && ways[1].bytes == bytes ? 1u : 0u;
+    const bool known = ways[way].data == data && ways[way].bytes == bytes;
+    std::uint8_t &mru = g_unchanging_mru[set >> 3];
+    const std::uint8_t bit = static_cast<std::uint8_t>(1u << (set & 7u));
+    if (!known) way = (mru & bit) ? 0u : 1u;
+    mru = way ? static_cast<std::uint8_t>(mru | bit) : static_cast<std::uint8_t>(mru & ~bit);
+    Unchanging &e = ways[way];
+'''),
+    ],
+}
+
 def fail(msg):
     print("PATCH NOT APPLIED:", msg)
     raise SystemExit(1)
@@ -9310,7 +9338,7 @@ originals = {}
 texts = {}
 pending = 0
 
-for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items(), *IOPAHEAD_EDITS.items(), *STALE_EDITS.items(), *MOVIE_EDITS.items(), *SPLIT_SKIP_EDITS.items(), *SAMPLE_EDITS.items(), *G3_EDITS.items(), *RT_OPT_EDITS.items(), *UPLOAD_EDITS.items()):
+for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items(), *IOPAHEAD_EDITS.items(), *STALE_EDITS.items(), *MOVIE_EDITS.items(), *SPLIT_SKIP_EDITS.items(), *SAMPLE_EDITS.items(), *G3_EDITS.items(), *RT_OPT_EDITS.items(), *UPLOAD_EDITS.items(), *UNCHANGING_WAYS_EDITS.items()):
     rel = key.split('#')[0]   # the part after # only keeps two lists for one file apart
     if rel in texts:
         t = texts[rel]
@@ -9321,7 +9349,7 @@ for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(),
         except OSError:
             fail("cannot read " + rel)
         # Unwind the later stages in memory so their inputs can be verified.
-        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()), *IOPAHEAD_EDITS.get(rel, ()), *STALE_EDITS.get(rel, ()), *MOVIE_EDITS.get(rel, ()), *SPLIT_SKIP_EDITS.get(rel, ()), *SAMPLE_EDITS.get(rel, ()), *G3_EDITS.get(rel, ()), *RT_OPT_EDITS.get(rel, ()), *UPLOAD_EDITS.get(rel, ()))):
+        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()), *IOPAHEAD_EDITS.get(rel, ()), *STALE_EDITS.get(rel, ()), *MOVIE_EDITS.get(rel, ()), *SPLIT_SKIP_EDITS.get(rel, ()), *SAMPLE_EDITS.get(rel, ()), *G3_EDITS.get(rel, ()), *RT_OPT_EDITS.get(rel, ()), *UPLOAD_EDITS.get(rel, ()), *UNCHANGING_WAYS_EDITS.get(rel, ()))):
             if t.count(new) == 1:
                 t = t.replace(new, old)
                 pending -= 1

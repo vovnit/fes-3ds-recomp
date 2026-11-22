@@ -5,6 +5,7 @@
 #include <3ds.h>
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -18,14 +19,21 @@ constexpr std::size_t kRingFrames = 16384;       // power of 2 (~341 ms at 48 kH
 constexpr std::size_t kRingMask = kRingFrames - 1;
 constexpr std::size_t kMaxQueued = 9600;         // ~200 ms latency cap (drops excess during FAST/uncapped)
 
-// NDSP streaming parameters: 6 x 1024 stereo frames = 24 KB linear RAM.
-constexpr std::size_t kNumBufs = 6;
-constexpr std::size_t kBufFrames = 1024;         // 21.33 ms per wave buffer
-constexpr std::size_t kTargetQueued = 3;         // ~64 ms kept in DSP hardware queue
-constexpr std::size_t kPrebufferFrames = 1024;   // ~21.3 ms before starting from idle/underrun
-constexpr std::size_t kMinFlushFrames = 128;     // 2.67 ms minimum partial submit before underrunning
-constexpr std::size_t kRampOutFrames = 64;
-constexpr std::size_t kRampInFrames = 16;
+// NDSP streaming: wave buffers of one stretch step each, 12 x 480 stereo frames = 23 KB linear RAM.
+constexpr std::size_t kHop = 480;                // 10 ms: one stretch step, one wave buffer
+constexpr std::size_t kNumBufs = 12;
+constexpr std::size_t kBufFrames = kHop;
+constexpr std::size_t kTargetQueued = 6;         // ~60 ms kept in the DSP's queue
+// Time stretch (WSOLA): when the game makes sound slower than real time (it runs below full speed), the sound is played
+// slower at the same pitch instead of running dry. Each step takes the next 10 ms window from where the tempo says, moved by
+// up to kSeek to where it best continues the last one, and cross-fades the two.
+constexpr std::size_t kSeek = 240;               // +-5 ms
+// The tempo goes from kMinTempo at kFloorAhead frames of sound waiting ahead of the read point to full speed at
+// kTargetAhead. The floor is what a step needs (kSeek + 2 * kHop) plus room for the game's bursts of about 800 frames.
+constexpr std::size_t kFloorAhead = 2000;
+constexpr std::size_t kTargetAhead = 3840;       // 80 ms
+constexpr std::size_t kPrebufferFrames = 3840;   // before starting from idle or after running dry
+constexpr float kMinTempo = 0.35f;
 
 // CSND fallback parameters (only used when sdmc:/3ds/dspfirm.cdc is absent).
 constexpr std::size_t kCsndFrames = 4096;        // ~85.3 ms circular buffer per mono channel
@@ -41,14 +49,20 @@ std::atomic<std::uint64_t> g_write{0};
 std::atomic<std::uint64_t> g_read{0};
 std::atomic<bool> g_stopping{false};
 
+// For report(): what came in, what went out, and how often the DSP ran dry.
+std::atomic<std::uint32_t> g_pushed{0}, g_dropped{0}, g_underruns{0};
+
 // NDSP state (touched only on NDSP callback thread once running).
 std::int16_t *g_ndsp_linear = nullptr;
 ndspWaveBuf g_bufs[kNumBufs];
 std::size_t g_next_buf = 0;
-bool g_playing = false;
-bool g_ramp_in = false;
-bool g_rate_fast = false;
-std::int16_t g_last_l = 0, g_last_r = 0;
+std::int32_t g_fade[kHop];        // rising cross-fade weight, Q15 (sin squared: it and its mirror add up to 1)
+bool g_have_prev = false;         // a window is playing: its second half is faded out by the next step
+std::uint64_t g_prev = 0;         // ring position of that window
+double g_nominal = 0.0;           // where the next window starts before the search
+float g_tempo = 1.0f;
+float g_tempo_sum = 0.0f, g_tempo_min = 1.0f;   // for report()
+std::uint32_t g_steps = 0;
 
 // CSND fallback state (touched only on main thread in poll()).
 std::int16_t *g_csnd_left = nullptr;
@@ -57,11 +71,80 @@ bool g_csnd_started = false;
 u64 g_csnd_start_tick = 0;
 std::uint64_t g_csnd_written = 0;
 
-void copy_from_ring(std::int16_t *dst, std::uint64_t r, std::size_t frames) {
-    const std::size_t start = static_cast<std::size_t>(r & kRingMask);
-    const std::size_t first = std::min(frames, kRingFrames - start);
-    std::memcpy(dst, &g_ring[start * 2], first * 4);
-    if (first < frames) std::memcpy(dst + first * 2, g_ring, (frames - first) * 4);
+inline std::int32_t at(std::uint64_t pos, int ch) { return g_ring[static_cast<std::size_t>(pos & kRingMask) * 2 + ch]; }
+
+inline std::int16_t mix(std::int32_t out, std::int32_t in, std::int32_t f) {
+    return static_cast<std::int16_t>((out * (32768 - f) + in * f) >> 15);
+}
+
+// One step of kHop frames into dst: 1 made, 0 not enough sound yet (wait), 2 ran dry (dst fades the last window out).
+// Moves g_read up to the oldest frame still needed.
+int stretch_step(std::int16_t *dst, std::uint64_t w, std::size_t active) {
+    if (!g_have_prev) {
+        const std::uint64_t p = g_read.load(std::memory_order_relaxed);
+        if (w - p < kPrebufferFrames) return 0;
+        for (std::size_t i = 0; i < kHop; ++i) {   // fade in
+            dst[i * 2] = mix(0, at(p + i, 0), g_fade[i]);
+            dst[i * 2 + 1] = mix(0, at(p + i, 1), g_fade[i]);
+        }
+        g_have_prev = true;
+        g_prev = p;
+        g_tempo = 1.0f;
+        g_nominal = static_cast<double>(p) + kHop;
+        g_read.store(p, std::memory_order_relaxed);
+        return 1;
+    }
+    const std::uint64_t ref = g_prev + kHop;   // the playing window's second half, and what the next should resemble
+    const double ahead = static_cast<double>(w) - g_nominal;
+    if (ahead < static_cast<double>(kSeek + 2 * kHop)) {
+        if (active > 1) return 0;   // the DSP still has sound: wait for more
+        for (std::size_t i = 0; i < kHop; ++i) {
+            dst[i * 2] = mix(at(ref + i, 0), 0, g_fade[i]);
+            dst[i * 2 + 1] = mix(at(ref + i, 1), 0, g_fade[i]);
+        }
+        g_have_prev = false;
+        g_read.store(std::min<std::uint64_t>(ref + kHop, w), std::memory_order_relaxed);
+        g_underruns.fetch_add(1, std::memory_order_relaxed);
+        return 2;
+    }
+    // The tempo follows how much sound waits: full speed above kTargetAhead, slower below, a little faster when far ahead.
+    const double share = (ahead - static_cast<double>(kFloorAhead)) / static_cast<double>(kTargetAhead - kFloorAhead);
+    float want = share >= 1.0 ? 1.0f : std::max(kMinTempo, kMinTempo + (1.0f - kMinTempo) * static_cast<float>(share));
+    if (ahead > 2.0 * kTargetAhead) want = 1.02f;
+    g_tempo += (want - g_tempo) * 0.15f;
+
+    // The window start within +-kSeek of the nominal one that best continues ref (normalised cross-correlation of the
+    // mono sums, every 2nd offset and every 4th frame).
+    const std::int64_t base = static_cast<std::int64_t>(g_nominal);
+    std::int64_t best = base;
+    float best_score = -1e30f;
+    for (std::int64_t d = -static_cast<std::int64_t>(kSeek); d <= static_cast<std::int64_t>(kSeek); d += 2) {
+        const std::uint64_t c = static_cast<std::uint64_t>(base + d);
+        std::int64_t xy = 0, yy = 0;
+        for (std::size_t i = 0; i < kHop; i += 4) {
+            const std::int64_t x = at(ref + i, 0) + at(ref + i, 1), y = at(c + i, 0) + at(c + i, 1);
+            xy += x * y;
+            yy += y * y;
+        }
+        const float score = static_cast<float>(xy) / std::sqrt(static_cast<float>(yy) + 1.0f);
+        if (score > best_score) {
+            best_score = score;
+            best = base + d;
+        }
+    }
+    const std::uint64_t pos = static_cast<std::uint64_t>(best);
+    for (std::size_t i = 0; i < kHop; ++i) {
+        dst[i * 2] = mix(at(ref + i, 0), at(pos + i, 0), g_fade[i]);
+        dst[i * 2 + 1] = mix(at(ref + i, 1), at(pos + i, 1), g_fade[i]);
+    }
+    g_prev = pos;
+    g_nominal += static_cast<double>(g_tempo) * kHop;
+    const double lowest = g_nominal - static_cast<double>(kSeek);
+    g_read.store(std::min<std::uint64_t>(pos + kHop, static_cast<std::uint64_t>(lowest)), std::memory_order_relaxed);
+    g_tempo_sum += g_tempo;
+    g_tempo_min = std::min(g_tempo_min, g_tempo);
+    ++g_steps;
+    return 1;
 }
 
 void submit_ndsp_buf(ndspWaveBuf &buf, std::size_t frames) {
@@ -72,94 +155,22 @@ void submit_ndsp_buf(ndspWaveBuf &buf, std::size_t frames) {
 
 void ndsp_callback(void *) {
     if (g_stopping.load(std::memory_order_acquire)) return;
-
     std::size_t active = 0;
     for (std::size_t i = 0; i < kNumBufs; ++i) {
         const u8 st = g_bufs[i].status;
         if (st == NDSP_WBUF_QUEUED || st == NDSP_WBUF_PLAYING) ++active;
     }
-    if (g_playing && active >= kTargetQueued) return;
-
     const std::uint64_t w = g_write.load(std::memory_order_acquire);
-    std::uint64_t r = g_read.load(std::memory_order_relaxed);
-    std::uint64_t avail = w - r;
-
-    // Gentle clock-drift compensation: nudge DSP rate +0.5% when backlog grows past ~107 ms.
-    if (!g_rate_fast && avail > 5120) {
-        ndspChnSetRate(0, static_cast<float>(kSampleRate) * 1.005f);
-        g_rate_fast = true;
-    } else if (g_rate_fast && avail < 2560) {
-        ndspChnSetRate(0, static_cast<float>(kSampleRate));
-        g_rate_fast = false;
-    }
-
-    if (!g_playing) {
-        if (avail < kPrebufferFrames) return;
-        g_playing = true;
-        g_ramp_in = true;
-    }
-
     while (active < kTargetQueued) {
         ndspWaveBuf &buf = g_bufs[g_next_buf];
         if (buf.status != NDSP_WBUF_FREE && buf.status != NDSP_WBUF_DONE) break;
-
-        avail = w - r;
-        if (avail >= kBufFrames) {
-            copy_from_ring(buf.data_pcm16, r, kBufFrames);
-            r += kBufFrames;
-            if (g_ramp_in) {
-                for (std::size_t i = 0; i < kRampInFrames; ++i) {
-                    const std::int32_t s = static_cast<std::int32_t>(i);
-                    buf.data_pcm16[i * 2] = static_cast<std::int16_t>((buf.data_pcm16[i * 2] * s) / static_cast<std::int32_t>(kRampInFrames));
-                    buf.data_pcm16[i * 2 + 1] = static_cast<std::int16_t>((buf.data_pcm16[i * 2 + 1] * s) / static_cast<std::int32_t>(kRampInFrames));
-                }
-                g_ramp_in = false;
-            }
-            g_last_l = buf.data_pcm16[(kBufFrames - 1) * 2];
-            g_last_r = buf.data_pcm16[(kBufFrames - 1) * 2 + 1];
-            submit_ndsp_buf(buf, kBufFrames);
-            g_next_buf = (g_next_buf + 1) % kNumBufs;
-            ++active;
-        } else if (active == 0) {
-            if (avail >= kMinFlushFrames) {
-                const std::size_t n = static_cast<std::size_t>(avail);
-                copy_from_ring(buf.data_pcm16, r, n);
-                r += n;
-                if (g_ramp_in) {
-                    const std::size_t ramp = std::min(n, kRampInFrames);
-                    for (std::size_t i = 0; i < ramp; ++i) {
-                        const std::int32_t s = static_cast<std::int32_t>(i);
-                        buf.data_pcm16[i * 2] = static_cast<std::int16_t>((buf.data_pcm16[i * 2] * s) / static_cast<std::int32_t>(ramp));
-                        buf.data_pcm16[i * 2 + 1] = static_cast<std::int16_t>((buf.data_pcm16[i * 2 + 1] * s) / static_cast<std::int32_t>(ramp));
-                    }
-                    g_ramp_in = false;
-                }
-                g_last_l = buf.data_pcm16[(n - 1) * 2];
-                g_last_r = buf.data_pcm16[(n - 1) * 2 + 1];
-                submit_ndsp_buf(buf, n);
-                g_next_buf = (g_next_buf + 1) % kNumBufs;
-                ++active;
-                break;
-            }
-            // True underrun: smoothly fade last sample to zero to avoid audible clicks.
-            g_playing = false;
-            if (g_last_l != 0 || g_last_r != 0) {
-                for (std::size_t i = 0; i < kRampOutFrames; ++i) {
-                    const std::int32_t rem = static_cast<std::int32_t>(kRampOutFrames - 1 - i);
-                    buf.data_pcm16[i * 2] = static_cast<std::int16_t>((g_last_l * rem) / static_cast<std::int32_t>(kRampOutFrames));
-                    buf.data_pcm16[i * 2 + 1] = static_cast<std::int16_t>((g_last_r * rem) / static_cast<std::int32_t>(kRampOutFrames));
-                }
-                g_last_l = g_last_r = 0;
-                submit_ndsp_buf(buf, kRampOutFrames);
-                g_next_buf = (g_next_buf + 1) % kNumBufs;
-            }
-            break;
-        } else {
-            break;
-        }
+        const int made = stretch_step(buf.data_pcm16, w, active);
+        if (!made) break;
+        submit_ndsp_buf(buf, kHop);
+        g_next_buf = (g_next_buf + 1) % kNumBufs;
+        ++active;
+        if (made == 2) break;
     }
-
-    g_read.store(r, std::memory_order_release);
 }
 
 void poll_csnd() {
@@ -252,7 +263,11 @@ void push(const std::int16_t *samples, std::size_t frames) {
     if (!frames || g_stopping.load(std::memory_order_relaxed)) return;
     const std::uint64_t w = g_write.load(std::memory_order_relaxed);
     const std::uint64_t r = g_read.load(std::memory_order_acquire);
-    if (w - r + frames > kMaxQueued) return;
+    g_pushed.fetch_add(static_cast<std::uint32_t>(frames), std::memory_order_relaxed);
+    if (w - r + frames > kMaxQueued) {
+        g_dropped.fetch_add(static_cast<std::uint32_t>(frames), std::memory_order_relaxed);
+        return;
+    }
     const std::size_t start = static_cast<std::size_t>(w & kRingMask);
     const std::size_t first = std::min(frames, kRingFrames - start);
     std::memcpy(&g_ring[start * 2], samples, first * 4);
@@ -264,11 +279,13 @@ bool start() {
     g_write.store(0, std::memory_order_relaxed);
     g_read.store(0, std::memory_order_relaxed);
     g_stopping.store(false, std::memory_order_relaxed);
-    g_playing = false;
-    g_ramp_in = false;
-    g_rate_fast = false;
-    g_last_l = g_last_r = 0;
+    g_have_prev = false;
+    g_tempo = 1.0f;
     g_next_buf = 0;
+    for (std::size_t i = 0; i < kHop; ++i) {
+        const double sn = std::sin(3.14159265358979 * (static_cast<double>(i) + 0.5) / (2.0 * kHop));
+        g_fade[i] = static_cast<std::int32_t>(sn * sn * 32768.0 + 0.5);
+    }
 
     int ndsp_core = 0;
     const Result rc = init_ndsp_on_core1(ndsp_core);
@@ -326,6 +343,22 @@ bool start() {
         std::fprintf(stderr, "[audio] csndInit failed (0x%08lX); sound off\n", static_cast<unsigned long>(crc));
     }
     return false;
+}
+
+void report(double seconds) {
+    if (g_backend == Backend::None || seconds <= 0.0) return;
+    const std::uint32_t pushed = g_pushed.exchange(0), dropped = g_dropped.exchange(0), under = g_underruns.exchange(0);
+    // The stretch figures are the callback thread's; read without a lock, they are only a log line.
+    const std::uint32_t steps = g_steps;
+    const float tempo = steps ? g_tempo_sum / static_cast<float>(steps) : 0.0f, low = g_tempo_min;
+    g_steps = 0;
+    g_tempo_sum = 0.0f;
+    g_tempo_min = 1.0f;
+    const std::uint64_t queued = g_write.load() - g_read.load();
+    std::fprintf(stderr, "[audio] %.0f%% of real time made (%lu frames in %.1f s), %lu dropped, %lu underruns, tempo %.0f%% (lowest %.0f%%), "
+                 "%lu queued\n", 100.0 * pushed / (seconds * kSampleRate), static_cast<unsigned long>(pushed), seconds,
+                 static_cast<unsigned long>(dropped), static_cast<unsigned long>(under), 100.0 * tempo, 100.0 * low,
+                 static_cast<unsigned long>(queued));
 }
 
 void poll() {

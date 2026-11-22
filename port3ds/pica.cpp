@@ -12,6 +12,7 @@
 // depth (see the "eye" uniform in gs.v.pica).
 #include "pica.hpp"
 #include "g3model.hpp"
+#include "g3cache.hpp"
 #include "movie3ds.hpp"
 #include "prof.hpp"
 
@@ -48,6 +49,8 @@ extern "C" void FesOverlapWait();
 extern "C" u64 FesOverlapWaitTicks();
 extern "C" u32 FesOverlapWordsLeft();
 extern "C" void FesOverlapEnd(u8);
+extern "C" volatile int g_fes_trace;
+#define FES_AT(n) (g_fes_trace = (n))
 
 namespace movie { bool overlap_needs_wait(); }
 
@@ -143,6 +146,9 @@ GPU_CULLMODE g_g3_cull = GPU_CULL_NONE;
 
 DrawVertex *g_ring = nullptr;
 std::uint16_t *g_indices = nullptr;
+// The converted-vertex cache's arena (g3cache.cpp): g3 vertices kept across pictures, drawn by index.
+constexpr std::uint32_t kArenaVertices = 43008;   // 2 MB
+::g3::GpuVertex *g_arena = nullptr;
 std::uint32_t g_ring_used = 0, g_flushed_to = 0;
 std::uint32_t g_index_used = 0, g_index_first = 0, g_index_flushed = 0;
 std::uint32_t g_index_base = 0, g_bound_base = 0;
@@ -235,7 +241,7 @@ std::uint32_t g_last_triangle_colour = 0;
 constexpr std::uint32_t kSkip = 1, kSkipping = 2, kDrawNothing = 4;
 std::uint32_t g_next_picture = 0, g_game_vblanks = 0;
 std::uint32_t g_draw_every = 0, g_picture = 0, g_skipped_in_row = 0, g_skip_run = 0;
-std::atomic<std::uint32_t> g_stat_skipped{0}, g_stat_forced{0};
+std::atomic<std::uint32_t> g_stat_skipped{0}, g_stat_forced{0}, g_stat_shown{0};
 u64 g_round_start = 0, g_round_blocked = 0, g_round_idle = 0;
 std::uint32_t g_seen_blocked = 0, g_seen_idle = 0;
 std::uint32_t g_frame_number = 0;
@@ -267,6 +273,13 @@ struct Split {
 } g_split{};
 
 void flush_ring() {
+    std::uint32_t lo, hi;
+    g3cache::take_dirty(lo, hi);
+    if (g_debug & 512u) {   // test: the whole arena every time, in case a written range was missed
+        if (g_arena) GSPGPU_FlushDataCache(g_arena, kArenaVertices * sizeof(::g3::GpuVertex));
+    } else if (hi > lo) {
+        GSPGPU_FlushDataCache(g_arena + lo, (hi - lo) * sizeof(::g3::GpuVertex));
+    }
     if (g_ring_used > g_flushed_to) {
         GSPGPU_FlushDataCache(g_ring + g_flushed_to, (g_ring_used - g_flushed_to) * sizeof(DrawVertex));
         g_flushed_to = g_ring_used;
@@ -392,7 +405,7 @@ void flush_batch() {
     ++g_stat_draws;
     if (C3D_GetCmdBufUsage() > 0.75f) {
         flush_ring();
-        C3D_FrameSplit(GX_CMDLIST_FLUSH);
+        FES_AT(34); C3D_FrameSplit(GX_CMDLIST_FLUSH); FES_AT(35);
         ++g_stat_splits;
     }
 }
@@ -580,7 +593,7 @@ void index_texture(Texture &e) {
 }
 
 void free_texture(Texture &e) {
-    if (g_overlap_picture && e.last_used + 1u == g_frame) FesOverlapWait();
+    if (g_overlap_picture && e.last_used + 1u == g_frame) { FES_AT(32); FesOverlapWait(); FES_AT(33); }
     if (e.hash) {
         const auto slot = static_cast<std::uint16_t>(&e - g_textures + 1);
         auto *link = &g_texture_hash_head[texture_hash_bucket(e.hash)];
@@ -1296,7 +1309,7 @@ bool reserve_geometry(std::uint32_t indices) {
     if (!g_overlap_picture || g_slices == 3) return false;
     flush_batch();
     flush_ring();
-    FesOverlapWait();
+    FES_AT(30); FesOverlapWait(); FES_AT(31);
     ++g_overflow_waits;
     g_slices = 3;
     use_geometry_slice(g_slice ^ 1u, kSliceVertices);
@@ -1503,13 +1516,15 @@ void begin_frame() {
     g_eye_shift = stereo ? slider * static_cast<float>(g_stereo_strength) * (0.005f / -kEyeDepth) : 0.0f;
     const u64 start = svcGetSystemTick();
     const unsigned previous = g_slices;
+    FES_AT(12);
     g_overlap_picture = g_frame && g_overlap_ready && !(g_debug & 64u) && FesOverlapBegin(previous == 3, g_debug & 128u);
+    FES_AT(13);
     if (g_overlap_picture) {
         const unsigned slice = previous == 1 ? 1 : 0;
         use_geometry_slice(slice, kSliceVertices);
         g_slices = 1u << slice;
     } else {
-        C3D_FrameBegin(0);
+        FES_AT(14); C3D_FrameBegin(0); FES_AT(15);
         use_geometry_slice(0, kRingVertices);
         g_slices = 3;
     }
@@ -1521,6 +1536,8 @@ void begin_frame() {
     g_hw.invalidate();
     std::memset(g_pica_bone_gen, 0, sizeof g_pica_bone_gen);
     ++g_frame;
+    g3cache::begin_picture();
+    FES_AT(19);
 }
 
 }
@@ -1596,6 +1613,8 @@ bool init() {
         return false;
     }
     g_shot_pixels = static_cast<u8 *>(linearAlloc(240 * 400 * 3));
+    g_arena = static_cast<::g3::GpuVertex *>(linearAlloc(kArenaVertices * sizeof(::g3::GpuVertex)));
+    g3cache::init(g_arena, kArenaVertices);
     BufInfo_Init(&g_buf);
     BufInfo_Add(&g_buf, g_ring, sizeof(DrawVertex), 4, 0x3210);
     C3D_SetBufInfo(&g_buf);
@@ -1641,10 +1660,10 @@ void shutdown() {
     if (g_frame_open) {
         flush_batch();
         flush_ring();
-        FesOverlapEnd(0);
+        FES_AT(70); FesOverlapEnd(0);
         g_frame_open = false;
     }
-    FesOverlapWait();
+    FES_AT(71); FesOverlapWait();
     C3D_Fini();
 }
 
@@ -1678,6 +1697,19 @@ void draw_strip(int first, int count, bool split) {
         C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.fail_writes));
     }
     C3D_DrawArrays(GPU_TRIANGLE_STRIP, first, count);
+}
+
+// The same for a strip from the arena, by index.
+void draw_strip_indexed(int first, int count, bool split) {
+    const std::uint16_t *indices = g_indices + first;
+    if (split) {
+        C3D_AlphaTest(true, g_split.pass, g_split.reference);
+        C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.pass_writes));
+        C3D_DrawElements(GPU_TRIANGLE_STRIP, count, C3D_UNSIGNED_SHORT, indices);
+        C3D_AlphaTest(true, g_split.fail, g_split.reference);
+        C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.fail_writes));
+    }
+    C3D_DrawElements(GPU_TRIANGLE_STRIP, count, C3D_UNSIGNED_SHORT, indices);
 }
 
 int uniform_alpha_pass_g3(bool alpha_uniform, std::uint8_t alpha_val, float mat_alpha) {
@@ -1763,18 +1795,87 @@ namespace {
 // with degenerate triangles, since every draw call costs the command list about 150 words and the GPU a framebuffer flush.
 // Their vertices lie in the ring from vertex `first` (48-byte units from g_ring). A GS shape, a state change, or a later batch
 // that needs different uniforms or a bone slot these vertices use draws them first.
+// From the arena (arena true), first and count are places in g_indices instead, and the strip is drawn by index.
 struct G3Pending {
     bool on = false;
     std::uint32_t first = 0, count = 0, slots = 0;
     float mat_alpha = 1.0f;
     bool alpha_uniform = true;
     std::uint8_t alpha_val = 0;
+    bool arena = false;
+    bool arrays = false;   // one skinned batch from the arena, first and count in vertices, drawn without indices
 } g_g3_pending;
+
+// "debug 256": checks each g3 strip before it is drawn, for what a real GPU hangs on and Azahar does not mind: the wrong
+// buffer bound, indices or vertices outside their buffer, positions that are not finite, bone slots past the palette.
+void check_g3_strip(int first, int count) {
+    static unsigned told = 0;
+    static std::uint64_t checked[2] = {0, 0};
+    if (!(checked[0] | checked[1])) std::fprintf(stderr, "[g3check] checking g3 strips\n");
+    if ((++checked[g_g3_pending.arena] & 0xFFFFu) == 0)
+        std::fprintf(stderr, "[g3check] %llu ring and %llu arena strips checked\n", static_cast<unsigned long long>(checked[0]),
+                     static_cast<unsigned long long>(checked[1]));
+    if (told >= 8) return;
+    const bool arena = g_g3_pending.arena;
+    const void *want = arena ? static_cast<const void *>(g_arena) : static_cast<const void *>(g_ring);
+    const std::uint32_t ring_room = g_slice_capacity * sizeof(DrawVertex) / sizeof(::g3::GpuVertex);
+    const char *what = nullptr;
+    std::uint32_t at = 0, value = 0;
+    if (g_g3_buffer != want) what = "buffer bound is not the strip's";
+    else if (first < 0 || count < 3) what = "strip range";
+    else if (arena ? static_cast<std::uint32_t>(first + count) > g_slice_capacity : static_cast<std::uint32_t>(first + count) > ring_room)
+        what = arena ? "indices past the slice" : "vertices past the ring";
+    for (int k = 0; !what && k < count; ++k) {
+        const std::uint32_t v = arena ? g_indices[first + k] : static_cast<std::uint32_t>(first + k);
+        at = static_cast<std::uint32_t>(first + k);
+        value = v;
+        if (arena && v >= kArenaVertices) { what = "index past the arena"; break; }
+        const ::g3::GpuVertex &gv = arena ? g_arena[v] : reinterpret_cast<const ::g3::GpuVertex *>(g_ring)[v];
+        const float f[9] = {gv.x, gv.y, gv.z, gv.u, gv.v, gv.weight[0], gv.weight[1], gv.weight[2], gv.weight[3]};
+        for (float x : f)
+            if (!(x > -1e9f && x < 1e9f)) { what = "value not finite or huge"; break; }
+        for (std::uint8_t b : gv.bone) {
+            if (b >= ::g3::kGpuBones * 3u) { what = "bone slot past the palette"; value = b; break; }
+            // Every weight's bone is read, a zero weight's too: a slot the strip did not send holds whatever was there last,
+            // on a real GPU garbage from power-on (Azahar starts them at zero), and 0 times NaN is NaN.
+            if (g_g3_skin && (b % 3u || !((g_g3_pending.slots >> (b / 3u)) & 1u))) { what = "bone slot the strip did not send"; value = b; break; }
+        }
+    }
+    // The uniforms it is drawn with: the batch's own 15, and the rows of every bone slot it names.
+    for (int i = 0; !what && i < 15; ++i) {
+        const C3D_FVec &u = C3D_FVUnif[GPU_VERTEX_SHADER][g_uniform_proj + i];
+        if (!(u.x > -1e18f && u.x < 1e18f && u.y > -1e18f && u.y < 1e18f && u.z > -1e18f && u.z < 1e18f && u.w > -1e18f && u.w < 1e18f)) {
+            what = "batch uniform not finite";
+            at = static_cast<std::uint32_t>(i);
+        }
+    }
+    for (std::uint32_t m = g_g3_pending.slots; !what && m; m &= m - 1u) {
+        const unsigned slot = __builtin_ctz(m);
+        if (!g_pica_bone_gen[slot]) {
+            what = "bone slot not sent this picture";
+            at = slot;
+            break;
+        }
+        for (unsigned r = 0; r < 3; ++r) {
+            const C3D_FVec &u = C3D_FVUnif[GPU_VERTEX_SHADER][g_uniform_bones + 3u * slot + r];
+            if (!(u.x > -1e9f && u.x < 1e9f && u.y > -1e9f && u.y < 1e9f && u.z > -1e9f && u.z < 1e9f && u.w > -1e9f && u.w < 1e9f)) {
+                what = "bone row not finite or huge";
+                at = slot;
+                break;
+            }
+        }
+    }
+    if (!what) return;
+    ++told;
+    std::fprintf(stderr, "[g3check] frame %lu: %s strip first %d count %d: %s (at %lu, value %lu)\n", static_cast<unsigned long>(g_frame),
+                 arena ? "arena" : "ring", first, count, what, static_cast<unsigned long>(at), static_cast<unsigned long>(value));
+}
 
 void flush_g3() {
     if (!g_g3_pending.on) return;
-    g_g3_pending.on = false;
     const int first = static_cast<int>(g_g3_pending.first), count = static_cast<int>(g_g3_pending.count);
+    if ((g_debug & 256u) && !g_g3_pending.arrays) check_g3_strip(first, count);
+    g_g3_pending.on = false;
     const std::uint32_t w0 = cmd_words();
     const int pass = g_split.on ? uniform_alpha_pass_g3(g_g3_pending.alpha_uniform, g_g3_pending.alpha_val, g_g3_pending.mat_alpha) : -1;
     const bool split = g_split.on && pass < 0;
@@ -1783,10 +1884,11 @@ void flush_g3() {
         C3D_DepthTest(g_split.depth, g_split.depth_test,
                       static_cast<GPU_WRITEMASK>(pass ? g_split.pass_writes : g_split.fail_writes));
     }
-    draw_strip(first, count, split);
+    const auto draw = g_g3_pending.arena && !g_g3_pending.arrays ? draw_strip_indexed : draw_strip;
+    draw(first, count, split);
     if (g_current && g_current->right_rt) {
         set_eye(true);
-        draw_strip(first, count, split);
+        draw(first, count, split);
         set_eye(false);
     }
     const std::uint32_t w1 = cmd_words();
@@ -1794,7 +1896,7 @@ void flush_g3() {
     ++g_stat_draws;
     if (C3D_GetCmdBufUsage() > 0.75f) {
         flush_ring();
-        C3D_FrameSplit(GX_CMDLIST_FLUSH);
+        FES_AT(36); C3D_FrameSplit(GX_CMDLIST_FLUSH); FES_AT(37);
         ++g_stat_splits;
     }
 }
@@ -1859,6 +1961,15 @@ bool draw_g3(const State &st, std::uint64_t clamp, const ::g3::Gpu &g) {
         for (auto overlap = g_g3_pending.slots & slots; overlap && join; overlap &= overlap - 1u) {
             const unsigned s = __builtin_ctz(overlap);
             join = g.bone_gen[s] == g_pica_bone_gen[s];
+        }
+        // A strip from the arena is drawn by index from another buffer: this batch's ring vertices cannot join it. (Joined,
+        // its indices past the arena part were never written and the ring was bound for the whole strip: a real GPU hangs
+        // on that, waiting for vertex reads, until the console is switched off; Azahar draws on.)
+        if (join && g_g3_pending.arena) {
+            static bool told = false;
+            if (!told) std::fprintf(stderr, "[pica] g3 batch after a strip from the arena: drawn apart\n");
+            told = true;
+            join = false;
         }
         if (!join) flush_g3();
     }
@@ -2002,41 +2113,99 @@ int draw_g3_direct(const State &st, std::uint64_t clamp, const ::g3::Input &in, 
     const bool may_join = g_g3_pending.on && shared_uniforms && g.skin == g_g3_skin && g.ortho == g_g3_ortho && cull == g_g3_cull;
     if (g_g3_pending.on && !may_join) flush_g3();
 
-    const std::uint32_t worst = (g_ring_used + 2u) / 3u * 3u + (g.n + 5u) / 2u * 3u;
-    if (!reserve_geometry(worst > g_index_used ? worst - g_index_used : 1u)) {
+    // Room for the strip's indices first, in case the arena takes the batch (a change of slice draws what waits).
+    if (!reserve_geometry(g.n + 4u)) {
         if (!g_ring_warned) std::fprintf(stderr, "[pica] vertex ring full, dropping shapes\n");
         g_ring_warned = true;
         return 0;
     }
-    auto *ring = reinterpret_cast<::g3::GpuVertex *>(g_ring);
-    const std::uint32_t end = g_g3_pending.on ? (g_g3_pending.first + g_g3_pending.count) : 0u;
-    const std::uint32_t at = g_g3_pending.on ? ((end + 3u) & ~1u) : ((g_ring_used + 2u) / 3u * 2u);
-    const int fill_rc = ::g3::gpu_batch_fill(in, g, plan, ring + at);
+    int fill_rc = 0;
+    const int base = g3cache::place(in, plan, g, fill_rc);
     if (fill_rc != 0) return fill_rc;
+    const bool arena = base >= 0;
+    if (g_g3_pending.on && g_g3_pending.arena != arena) flush_g3();   // the other buffer
 
-    ++g_stat_shapes;
-    ++g_stat_g3;
-    const std::uint32_t slots = g.skin ? (g.slots | 1u) : 0u;
-    bool join = g_g3_pending.on;
-    for (auto overlap = g_g3_pending.slots & slots; overlap && join; overlap &= overlap - 1u) {
-        const unsigned s = __builtin_ctz(overlap);
-        join = g.bone_gen[s] == g_pica_bone_gen[s];
-    }
-    if (g_g3_pending.on && !join) flush_g3();
-    if (g_g3_pending.on) {
-        ring[end] = ring[end - 1u];
-        ring[end + 1u] = ring[at];
-        if (at - end == 3u) ring[end + 2u] = ring[at];
-        g_g3_pending.count = at + g.n - g_g3_pending.first;
-        g_g3_pending.slots |= slots;
-        g_g3_pending.alpha_uniform = g_g3_pending.alpha_uniform && g.alpha_uniform && (g_g3_pending.alpha_val == g.alpha_val);
+    std::uint32_t slots = g.skin ? (g.slots | 1u) : 0u;   // the ring path sets it again after its fill
+    const void *buffer;
+    if (arena) {
+        const auto first_vertex = static_cast<std::uint32_t>(base);
+        ++g_stat_shapes;
+        ++g_stat_g3;
+        // A bone slot the waiting strip uses that now holds another matrix: draw the strip first.
+        bool join = g_g3_pending.on;
+        for (auto overlap = g_g3_pending.slots & slots; overlap && join; overlap &= overlap - 1u) {
+            const unsigned s = __builtin_ctz(overlap);
+            join = g.bone_gen[s] == g_pica_bone_gen[s];
+        }
+        // A batch from the arena is drawn on its own, by vertex range: drawn by index, skinned vertices hang the console's
+        // GPU at once, and a cold boot with only unskinned ones drawn by index hung it once too (g3cache.hpp, g3index).
+        const bool arrays = !(g3cache::g_index >= 2 || (g3cache::g_index == 1 && !g.skin));
+        if (g_g3_pending.on && (!join || arrays || g_g3_pending.arrays)) flush_g3();
+        std::uint16_t *idx = g_indices;
+        std::uint32_t at;
+        if (arrays) {
+            g_g3_pending = G3Pending{true, first_vertex, g.n, slots, g.material[3], g.alpha_uniform, g.alpha_val, true, true};
+        } else if (g_g3_pending.on) {
+            // As below: the last index again and this batch's first, so the triangles between have no area, and once more if
+            // needed so that this batch starts at an even place.
+            std::uint32_t end = g_g3_pending.first + g_g3_pending.count;
+            idx[end] = idx[end - 1u];
+            idx[end + 1u] = static_cast<std::uint16_t>(first_vertex);
+            end += 2u;
+            if ((end - g_g3_pending.first) & 1u) idx[end++] = static_cast<std::uint16_t>(first_vertex);
+            at = end;
+            g_g3_pending.count = at + g.n - g_g3_pending.first;
+            g_g3_pending.slots |= slots;
+            g_g3_pending.alpha_uniform = g_g3_pending.alpha_uniform && g.alpha_uniform && (g_g3_pending.alpha_val == g.alpha_val);
+        } else {
+            at = g_index_used;
+            g_g3_pending = G3Pending{true, at, g.n, slots, g.material[3], g.alpha_uniform, g.alpha_val, true};
+        }
+        if (!arrays) {
+            for (std::uint32_t k = 0; k < g.n; ++k) idx[at + k] = static_cast<std::uint16_t>(first_vertex + k);
+            g_index_used = at + g.n;
+            g_index_first = g_index_used;
+        }
+        g_last_triangle_end = 0;
+        buffer = g_arena;
     } else {
-        g_g3_pending = G3Pending{true, at, g.n, slots, g.material[3], g.alpha_uniform, g.alpha_val};
+        const std::uint32_t worst = (g_ring_used + 2u) / 3u * 3u + (g.n + 5u) / 2u * 3u;
+        if (!reserve_geometry(worst > g_index_used ? worst - g_index_used : 1u)) {
+            if (!g_ring_warned) std::fprintf(stderr, "[pica] vertex ring full, dropping shapes\n");
+            g_ring_warned = true;
+            return 0;
+        }
+        auto *ring = reinterpret_cast<::g3::GpuVertex *>(g_ring);
+        const std::uint32_t end = g_g3_pending.on ? (g_g3_pending.first + g_g3_pending.count) : 0u;
+        const std::uint32_t at = g_g3_pending.on ? ((end + 3u) & ~1u) : ((g_ring_used + 2u) / 3u * 2u);
+        fill_rc = ::g3::gpu_batch_fill(in, g, plan, ring + at);
+        if (fill_rc != 0) return fill_rc;
+
+        ++g_stat_shapes;
+        ++g_stat_g3;
+        slots = g.skin ? (g.slots | 1u) : 0u;
+        bool join = g_g3_pending.on;
+        for (auto overlap = g_g3_pending.slots & slots; overlap && join; overlap &= overlap - 1u) {
+            const unsigned s = __builtin_ctz(overlap);
+            join = g.bone_gen[s] == g_pica_bone_gen[s];
+        }
+        if (g_g3_pending.on && !join) flush_g3();
+        if (g_g3_pending.on) {
+            ring[end] = ring[end - 1u];
+            ring[end + 1u] = ring[at];
+            if (at - end == 3u) ring[end + 2u] = ring[at];
+            g_g3_pending.count = at + g.n - g_g3_pending.first;
+            g_g3_pending.slots |= slots;
+            g_g3_pending.alpha_uniform = g_g3_pending.alpha_uniform && g.alpha_uniform && (g_g3_pending.alpha_val == g.alpha_val);
+        } else {
+            g_g3_pending = G3Pending{true, at, g.n, slots, g.material[3], g.alpha_uniform, g.alpha_val};
+        }
+        g_ring_used = ((at + g.n) * 3u + 1u) / 2u;
+        g_index_used = std::max(g_index_used, g_ring_used);
+        g_index_first = g_index_used;
+        g_last_triangle_end = 0;
+        buffer = g_ring;
     }
-    g_ring_used = ((at + g.n) * 3u + 1u) / 2u;
-    g_index_used = std::max(g_index_used, g_ring_used);
-    g_index_first = g_index_used;
-    g_last_triangle_end = 0;
 
     w0 = cmd_words();
     if (!g_g3_bound) {
@@ -2045,11 +2214,11 @@ int draw_g3_direct(const State &st, std::uint64_t clamp, const ::g3::Input &in, 
         g_g3_bound = true;
         g_bound_base = UINT32_MAX;
     }
-    if (g_g3_buffer != g_ring) {
+    if (g_g3_buffer != buffer) {
         BufInfo_Init(&g_buf);
-        BufInfo_Add(&g_buf, g_ring, sizeof(::g3::GpuVertex), 6, 0x543210);
+        BufInfo_Add(&g_buf, buffer, sizeof(::g3::GpuVertex), 6, 0x543210);
         C3D_SetBufInfo(&g_buf);
-        g_g3_buffer = g_ring;
+        g_g3_buffer = buffer;
     }
     if (g.skin != g_g3_skin) {
         C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_skin, g.skin);
@@ -2333,9 +2502,31 @@ bool skip_fixed_picture(std::uint32_t picture, std::uint32_t interval) {
 
 // Queue pressure measures drawing cost. When building pictures on the game thread is the
 // bottleneck, the drawing queue can be idle even though the game misses its vblank budget.
+// A drawn picture costs the game thread too (its VIF data copied, the engine waiting on its DMA), so a game behind its budget
+// skips more even when no render could be cut: the lockers ran at 70% of full speed with the GPU path, 100% drawing every 4th
+// picture. Where skipping more does not help (the game slow for its own reasons, a movie decoding), the extra skip is taken
+// back and not tried again for a while.
 struct PicturePacing {
+    static constexpr std::uint32_t kPlainMaxSkip = 6, kHoldRounds = 16, kRound = 32, kProbe = 8, kFirstWait = 3, kLongestWait = 48;
     u64 start = 0;
-    std::uint32_t pictures = 0, cut = 0, minimum_skip = 0, on_time = 0;
+    std::uint32_t pictures = 0, cut = 0, minimum_skip = 0, on_time = 0, hold = 0;
+    std::uint32_t round = kRound;       // pictures in this round: kProbe right after the skip was lowered
+    std::uint32_t wait = kFirstWait;    // on-time rounds before the skip is lowered again
+    bool raised = false;       // the last round raised the skip without a render to cut
+    bool probing = false;      // this round tries a lower skip
+    double last_ratio = 0.0;   // that round's time against its budget
+
+    void next_round(u64 now, double ratio, std::uint32_t pictures_next = kRound) {
+        if (g_debug & 1024u)
+            std::fprintf(stderr, "[pace] frame %lu ratio %.3f min %lu run %lu wait %lu hold %lu%s%s\n", static_cast<unsigned long>(g_frame_number), ratio,
+                         static_cast<unsigned long>(minimum_skip), static_cast<unsigned long>(g_skip_run), static_cast<unsigned long>(wait),
+                         static_cast<unsigned long>(hold), pictures_next == kProbe ? " probe" : "", raised ? " raised" : "");
+        last_ratio = ratio;
+        if (hold) --hold;
+        start = now;
+        pictures = cut = 0;
+        round = pictures_next;
+    }
 
     void observe(u64 now, unsigned vblanks, bool could_cut) {
         if (!start) {
@@ -2343,20 +2534,43 @@ struct PicturePacing {
             return;
         }
         cut += could_cut;
-        if (++pictures < 32) return;
+        if (++pictures < round) return;
         constexpr u64 frame_ticks = static_cast<u64>(SYSCLOCK_ARM11) * 1001 / 60000;
         const u64 budget = frame_ticks * vblanks * pictures;
-        if (!cut) {
-            minimum_skip = on_time = 0;
-        } else if (now - start > budget + budget / 40) {
-            minimum_skip = std::min<std::uint32_t>(8u, g_skip_run + 1u);
+        const double ratio = static_cast<double>(now - start) / static_cast<double>(budget);
+        if (probing) {
+            // A lower skip is tried for a short round. If the game falls behind with it, it goes straight back, and the next try
+            // waits twice as long: tried every few seconds, each failed try was a second of slow game and slow sound.
+            probing = false;
+            if (ratio > 1.06) {   // a short round: one vblank late is 6% already
+                ++minimum_skip;
+                wait = std::min(wait * 2, kLongestWait);
+            } else {
+                wait = std::max(wait / 2, kFirstWait);
+            }
+            raised = false;
             on_time = 0;
-        } else if (++on_time >= 3) {
-            if (minimum_skip) --minimum_skip;
-            on_time = 0;
+            return next_round(now, ratio);
         }
-        start = now;
-        pictures = cut = 0;
+        if (raised && !cut && ratio > last_ratio * 0.97) {   // skipping more did not help: take it back, wait before trying again
+            if (minimum_skip) --minimum_skip;
+            hold = kHoldRounds;
+            on_time = 0;
+        } else if (ratio > 1.025 && (cut || !hold)) {
+            const std::uint32_t before = minimum_skip;
+            minimum_skip = std::min<std::uint32_t>(cut ? 8u : std::max(kPlainMaxSkip, minimum_skip), g_skip_run + 1u);
+            raised = !cut && minimum_skip > before;
+            on_time = 0;
+            return next_round(now, ratio);
+        } else if (ratio <= 1.025 && minimum_skip && ++on_time >= wait) {
+            --minimum_skip;
+            on_time = 0;
+            probing = true;
+            raised = false;
+            return next_round(now, ratio, kProbe);
+        }
+        raised = false;
+        next_round(now, ratio);
     }
 };
 
@@ -2408,6 +2622,8 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r);
 
 }
 
+std::uint32_t pictures_shown() { return g_stat_shown.load(std::memory_order_relaxed); }
+
 // The game thread decides, as it starts each picture, so it can leave out what a skipped picture will not use.
 std::uint32_t next_picture() {
     if (!g_present_every || ++g_game_vblanks % g_present_every) return g_next_picture;
@@ -2441,9 +2657,11 @@ namespace {
 
 void show_picture(std::uint32_t frame, const DisplayRegs &r) {
     PS2_PROF(ps2::prof::Present);
+    g_stat_shown.fetch_add(1, std::memory_order_relaxed);
+    FES_AT(20);
     const int circuit = (r.pmode & 2u) ? 1 : (r.pmode & 1u) ? 0 : -1;
     flush_batch();
-    if (g_overlap_picture && movie::overlap_needs_wait()) FesOverlapWait();
+    if (g_overlap_picture && movie::overlap_needs_wait()) { FES_AT(22); FesOverlapWait(); }
     if (const movie::Picture ours = movie::picture(free_oldest); ours.playing) {
         // One of the build's own movie pictures instead of the game's black one. Until the first is ready, what was up stays up.
         if (ours.tex) {
@@ -2524,7 +2742,7 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r) {
     std::memset(g_stat_prim, 0, sizeof g_stat_prim);
     g_stat_upload = 0;
     // GX flushes the finalized command list. Textures and vertex data have already been flushed.
-    FesOverlapEnd(GX_CMDLIST_FLUSH);
+    FES_AT(28); FesOverlapEnd(GX_CMDLIST_FLUSH); FES_AT(29);
     g_frame_open = false;
     if ((g_debug & 32u) && (g_frame % 15) == 0) {
         static u64 previous_wait = 0;

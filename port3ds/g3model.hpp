@@ -112,6 +112,18 @@ enum GpuDecline : int {
 int gpu_batch_setup(const Input &in, Gpu &g, End &end, BatchPlan &plan);
 int gpu_batch_fill(const Input &in, Gpu &g, const BatchPlan &plan, GpuVertex *dst);
 
+// For the converted-vertex cache: a skin batch's vertices name palette slots, so a kept batch needs its bones back in the
+// same slots. last_bones gives the bones the last gpu_batch_fill of a skin batch met (VU address and slot, in the order
+// first met; -1 when there were more than kMaxBoneUses). restore_bones puts each bone's matrix from VU memory into its slot
+// (a new generation where it changed) and sets g.slots; false when two bones that shared a slot now differ.
+constexpr unsigned kMaxBoneUses = 24;
+struct BoneUse {
+    std::uint16_t address;
+    std::uint8_t slot;
+};
+int last_bones(const BoneUse *&uses);
+bool restore_bones(const std::uint8_t *mem, const BoneUse *uses, int count, Gpu &g);
+
 // 0: g filled, draw it. -1: the program draws nothing (end says how it ended, as run()'s). -2: deferred streams did not match, flush unpacks and retry. Otherwise a GpuDecline.
 int gpu_batch(const Input &in, Gpu &g, End &end);
 
