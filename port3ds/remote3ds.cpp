@@ -269,10 +269,13 @@ void run_command(char *line, std::uint64_t frame) {
     if (rest) *rest++ = 0;
     char reply[160];
     if (!std::strcmp(line, "PING")) {
+        const std::size_t heap_total = envGetHeapSize();
+        const std::size_t heap_used = static_cast<std::size_t>(mallinfo().uordblks);
+        const unsigned long heap_free_kb = heap_total > heap_used ? static_cast<unsigned long>((heap_total - heap_used) >> 10) : 0ul;
         std::snprintf(reply, sizeof reply, "OK frame %llu ms %llu heap_kb %lu linear_kb %lu\n",
                       static_cast<unsigned long long>(frame),
                       static_cast<unsigned long long>(svcGetSystemTick() / static_cast<u64>(CPU_TICKS_PER_MSEC)),
-                      static_cast<unsigned long>(mallinfo().fordblks >> 10),
+                      heap_free_kb,
                       static_cast<unsigned long>(linearSpaceFree() >> 10));
         say(reply);
     } else if (!std::strcmp(line, "LS") && rest) {

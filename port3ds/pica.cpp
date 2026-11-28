@@ -49,6 +49,7 @@ extern "C" void FesOverlapWait();
 extern "C" u64 FesOverlapWaitTicks();
 extern "C" u32 FesOverlapWordsLeft();
 extern "C" void FesOverlapEnd(u8);
+extern "C" void FesOverlapFlushMidFrame();
 extern "C" volatile int g_fes_trace;
 #define FES_AT(n) (g_fes_trace = (n))
 
@@ -72,10 +73,12 @@ constexpr int kScreenWidth = 400, kScreenHeight = 240;
 constexpr int kMaxTargets = 8;
 constexpr int kMaxTextures = 512;
 constexpr std::size_t kCommandBuffer = 0x100000;
+constexpr u32 kCmdFlushThreshold = 16384u;
 constexpr std::size_t kLinearReserve = 256u * 1024u;
 
 struct Target {
     bool used = false;
+    bool displayed = false;
     std::uint32_t fbp = 0;   // in pages
     int gs_width = 0, gs_height = 0;
     float sx = 1.0f, sy = 1.0f;
@@ -85,13 +88,17 @@ struct Target {
     C3D_RenderTarget *rt = nullptr;
     C3D_RenderTarget *right_rt = nullptr;
     std::uint32_t last_used = 0;
+    std::uint32_t last_scene = 0;
+    std::uint32_t draw_stamp = 0;   // g_stamp when a shape last drew on it
 };
 
 struct Texture {
     bool used = false;
     std::uint32_t tbp = 0, tbw = 0, psm = 0, tw = 0, th = 0, clut = 0, texa = 0;
     int half = 0;
-    int uniform_alpha = -2;   // -2 not checked, -1 varies
+    std::uint8_t alpha_min = 255, alpha_max = 0;
+    bool alpha_scanned = false;
+    bool rgb565 = false;
     std::uint32_t stamp = 0, hash = 0, sample = 0;
     std::uint32_t sample_stamp = 0, sample_tbp = UINT32_MAX, sample_tbw = 0;
     std::uint32_t last_used = 0;
@@ -105,20 +112,22 @@ shaderProgram_s g_program;
 C3D_AttrInfo g_attr;
 C3D_BufInfo g_buf;
 int g_uniform_scale = -1, g_uniform_offset = -1, g_uniform_eye = -1;
-// The g3 half of the shader: proj to lcol are 15 registers in a row, then bones; isg3 picks the half.
+// The g3 half of the shader: proj to env are 17 registers in a row, then bones; isg3 picks the half.
 int g_uniform_proj = -1, g_uniform_bones = -1, g_bool_g3 = -1, g_bool_skin = -1, g_bool_ortho = -1;
+int g_bool_dir = -1, g_bool_fog = -1, g_bool_eye = -1, g_bool_nrm = -1, g_bool_env = -1;
 C3D_AttrInfo g_g3_attr;
 // What is set for g3 batches: their vertex layout and shader half (until flush_batch puts the GS ones back), the buffer they
 // are bound at, the skin half, and the culling (the GS path draws with none).
-bool g_g3_bound = false, g_g3_skin = false, g_g3_ortho = false;
-bool g_unif_valid = false;
-std::uint32_t g_unif_bits[15][4]{};
+bool g_g3_bound = false, g_g3_skin = false, g_g3_ortho = false, g_g3_dir = false, g_g3_fog = false, g_g3_nrm = false, g_g3_env = false;
+bool g_unif_valid = false, g_unif_dir_valid = false, g_unif_env_valid = false;
+std::uint32_t g_unif_bits[17][4]{};
 std::uint32_t g_pica_bone_gen[::g3::kGpuBones]{};
 
 struct HwCache {
     bool texenv_valid = false, blend_valid = false, tests_valid = false, tests_skip = false;
-    bool scissor_valid = false, offset_valid = false, eye_valid = false, clip_valid = false;
-    bool tex_bind_valid = false;
+    bool scissor_valid = false, offset_valid = false, eye_valid = false, eye_bool_valid = false, clip_valid = false;
+    bool tex_bind_valid = false, fog_ramp_bound = false;
+    bool applied_eye_bool = false;
     C3D_Tex *bound_tex0 = nullptr;
     std::uint8_t bound_tex_flags = 0;
     std::uint64_t texenv_key = 0;
@@ -133,12 +142,17 @@ struct HwCache {
     std::uint64_t clip_scissor_reg = 0;
     int clip_ofx = 0, clip_ofy = 0;
     float clip_eye_now = 0.0f;
+    std::int8_t split_pass = -1;
+    std::int8_t discard_mode = -1;
     void invalidate() {
         texenv_valid = blend_valid = tests_valid = false;
-        scissor_valid = offset_valid = eye_valid = clip_valid = false;
+        scissor_valid = offset_valid = eye_valid = eye_bool_valid = clip_valid = false;
         tex_bind_valid = false;
+        fog_ramp_bound = false;
         bound_tex0 = nullptr;
         drawn_rt = nullptr;
+        split_pass = -1;
+        discard_mode = -1;
     }
 } g_hw;
 const void *g_g3_buffer = nullptr;
@@ -179,6 +193,8 @@ int g_clip_left, g_clip_right, g_clip_top, g_clip_bottom;
 bool g_in_depth = false;
 std::uint32_t g_depth_seen[16];   // test aid ("debug 8"): how many 3D triangle corners fell in each sixteenth of the depth range
 Target g_targets[kMaxTargets];
+std::uint64_t g_target_fbp_bloom = 0;
+bool g_in_show_picture = false;
 Target *g_current = nullptr, *g_source = nullptr;   // drawn on, and read as the texture, by the batch being collected
 float g_bound_sx = 0.0f, g_bound_sy = 0.0f;
 Texture g_textures[kMaxTextures];
@@ -219,6 +235,7 @@ std::uint64_t g_key[13];
 std::uint32_t g_key_clut = 0, g_key_stamp = 0;
 bool g_key_valid = false;
 bool g_textured = false;
+std::uint32_t g_bound_tex_page_lo = 0, g_bound_tex_page_hi = 0;
 Texture *g_alpha_texture = nullptr;
 bool g_alpha_from_texture = false;
 int g_alpha_function = 0;
@@ -229,7 +246,7 @@ int g_ofx = 0, g_ofy = 0;
 bool g_skip_batch = false;
 
 // Counters for tuning.
-std::uint32_t g_stat_reused = 0, g_stat_missing = 0;
+std::uint32_t g_stat_reused = 0, g_stat_missing = 0, g_stat_old_target = 0;
 std::uint32_t g_stat_g3 = 0, g_stat_g3_declined = 0, g_stat_unif = 0;
 std::uint32_t g_words_setup = 0, g_words_flush = 0, g_words_bind = 0, g_words_draw = 0;   // command words by part (test aid)
 inline std::uint32_t cmd_words() { return gpuCmdBufOffset; }   // g3 batches drawn, and handed back for want of command list room
@@ -242,7 +259,7 @@ constexpr std::uint32_t kSkip = 1, kSkipping = 2, kDrawNothing = 4;
 std::uint32_t g_next_picture = 0, g_game_vblanks = 0;
 std::uint32_t g_draw_every = 0, g_picture = 0, g_skipped_in_row = 0, g_skip_run = 0;
 std::atomic<std::uint32_t> g_stat_skipped{0}, g_stat_forced{0}, g_stat_shown{0};
-u64 g_round_start = 0, g_round_blocked = 0, g_round_idle = 0;
+u64 g_round_start = 0, g_round_blocked = 0, g_round_idle = 0, g_idle_total = 0;
 std::uint32_t g_seen_blocked = 0, g_seen_idle = 0;
 std::uint32_t g_frame_number = 0;
 std::uint32_t g_stat_prim[8], g_stat_upload = 0;
@@ -292,46 +309,74 @@ void flush_ring() {
 
 void set_eye(bool right);
 
+void flush_command_buffer() {
+    if (g_in_show_picture || !g_frame_open) return;
+    flush_ring();
+    FesOverlapFlushMidFrame();
+    g_overlap_picture = false;
+    g_slices = 3;
+    ++g_stat_splits;
+    if (g_current) {
+        g_hw.drawn_rt = nullptr;
+        g_hw.scissor_valid = false;
+        set_eye(false);
+    }
+}
+
 // Return 1 if the whole batch passes, 0 if it fails, and -1 if it needs both draws.
-// Only classify constant alpha inputs with an unambiguous combiner result.
+// Uses exact conservative alpha intervals [min, max] across texture and vertex alpha.
+static inline void scan_texture_alpha(Texture &t) {
+    if (t.alpha_scanned || t.rgb565) return;
+    const auto *pixels = static_cast<const std::uint32_t *>(t.tex.data);
+    const std::uint32_t n = static_cast<std::uint32_t>(t.tex.width) * t.tex.height;
+    std::uint32_t amin = 255u, amax = 0u;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const std::uint32_t a = pixels[i] & 255u;
+        if (a < amin) amin = a;
+        if (a > amax) amax = a;
+        if (amin == 0u && amax == 255u) break;
+    }
+    t.alpha_min = static_cast<std::uint8_t>(amin);
+    t.alpha_max = static_cast<std::uint8_t>(amax);
+    t.alpha_scanned = true;
+}
+
 int uniform_alpha_pass(const std::uint16_t *indices, std::uint32_t count) {
-    int texel = 0;
+    int tex_lo = 0, tex_hi = 0;
     if (g_alpha_from_texture) {
         if (!g_alpha_texture) return -1;   // another render target
-        int &alpha = g_alpha_texture->uniform_alpha;
-        if (alpha == -2) {
-            const auto &tex = g_alpha_texture->tex;
-            const auto *pixels = static_cast<const std::uint32_t *>(tex.data);
-            alpha = pixels[0] & 255;
-            const std::uint32_t n = static_cast<std::uint32_t>(tex.width) * tex.height;
-            for (std::uint32_t i = 1; i < n; ++i) {
-                if (static_cast<int>(pixels[i] & 255) == alpha) continue;
-                alpha = -1;
-                break;
-            }
-        }
-        if (alpha < 0) return -1;
-        texel = alpha;
+        scan_texture_alpha(*g_alpha_texture);
+        tex_lo = g_alpha_texture->alpha_min;
+        tex_hi = g_alpha_texture->alpha_max;
     }
-    int vertex = 0;
+    int vlo = 0, vhi = 0;
     if (!g_alpha_from_texture || g_alpha_function == 0 || g_alpha_function == 2) {
         const DrawVertex *base = g_ring + g_index_base;
-        vertex = base[indices[0]].a;
-        for (std::uint32_t i = 1; i < count; ++i)
-            if (base[indices[i]].a != vertex) return -1;
+        vlo = 255;
+        vhi = 0;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const int a = base[indices[i]].a;
+            if (a < vlo) vlo = a;
+            if (a > vhi) vhi = a;
+            if (vlo == 0 && vhi == 255) break;
+        }
     }
-    int low = vertex * 2, high = low;
+    int low = vlo * 2, high = vhi * 2;
     if (g_alpha_from_texture) {
         switch (g_alpha_function) {
-        case 0: {
-            const int product = texel * vertex;
+        case 0:
             // Account for quantization before the two combiner scales.
-            low = (product >> 8) * 4;
-            high = ((product + 254) / 255) * 4;
+            low = ((tex_lo * vlo) >> 8) * 4;
+            high = ((tex_hi * vhi + 254) / 255) * 4;
             break;
-        }
-        case 2: low = high = 2 * (texel + vertex); break;
-        default: low = high = 2 * texel; break;
+        case 2:
+            low = 2 * (tex_lo + vlo);
+            high = 2 * (tex_hi + vhi);
+            break;
+        default:
+            low = 2 * tex_lo;
+            high = 2 * tex_hi;
+            break;
         }
     }
     low = std::min(low, 255);
@@ -377,20 +422,27 @@ void flush_batch() {
     const int pass = g_split.on ? uniform_alpha_pass(indices, count) : -1;
     const bool split = g_split.on && pass < 0;
     if (pass >= 0) {
-        C3D_AlphaTest(false, GPU_ALWAYS, 0);
-        C3D_DepthTest(g_split.depth, g_split.depth_test,
-                      static_cast<GPU_WRITEMASK>(pass ? g_split.pass_writes : g_split.fail_writes));
+        if (g_hw.split_pass != pass) {
+            C3D_AlphaTest(false, GPU_ALWAYS, 0);
+            C3D_DepthTest(g_split.depth, g_split.depth_test,
+                          static_cast<GPU_WRITEMASK>(pass ? g_split.pass_writes : g_split.fail_writes));
+            g_hw.split_pass = static_cast<std::int8_t>(pass);
+        }
+    } else if (split) {
+        g_hw.split_pass = -1;
+    } else if (g_hw.discard_mode >= 0) {
+        const int dp = uniform_alpha_pass(indices, count);
+        if (dp == 0) {
+            g_index_first = g_index_used;
+            return;
+        }
+        const std::int8_t want = dp == 1 ? 0 : 1;
+        if (g_hw.discard_mode != want) {
+            C3D_AlphaTest(want != 0, want != 0 ? g_split.pass : GPU_ALWAYS, want != 0 ? g_split.reference : 0);
+            g_hw.discard_mode = want;
+        }
     }
-    if (split) {
-        C3D_AlphaTest(true, g_split.pass, g_split.reference);
-        C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.pass_writes));
-        C3D_DrawElements(GPU_TRIANGLES, static_cast<int>(count), C3D_UNSIGNED_SHORT, indices);
-        C3D_AlphaTest(true, g_split.fail, g_split.reference);
-        C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.fail_writes));
-    }
-    C3D_DrawElements(GPU_TRIANGLES, static_cast<int>(count), C3D_UNSIGNED_SHORT, indices);
-    if (g_current && g_current->right_rt) {
-        set_eye(true);
+    auto draw_elems = [&]() {
         if (split) {
             C3D_AlphaTest(true, g_split.pass, g_split.reference);
             C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.pass_writes));
@@ -399,15 +451,18 @@ void flush_batch() {
             C3D_DepthTest(g_split.depth, g_split.depth_test, static_cast<GPU_WRITEMASK>(g_split.fail_writes));
         }
         C3D_DrawElements(GPU_TRIANGLES, static_cast<int>(count), C3D_UNSIGNED_SHORT, indices);
-        set_eye(false);
+    };
+    if (g_current && g_current->right_rt) {
+        const bool right_first = g_hw.drawn_rt == g_current->right_rt;
+        draw_elems();
+        set_eye(!right_first);
+        draw_elems();
+    } else {
+        draw_elems();
     }
     g_index_first = g_index_used;
     ++g_stat_draws;
-    if (C3D_GetCmdBufUsage() > 0.75f) {
-        flush_ring();
-        FES_AT(34); C3D_FrameSplit(GX_CMDLIST_FLUSH); FES_AT(35);
-        ++g_stat_splits;
-    }
+    if (!g_in_show_picture && FesOverlapWordsLeft() < kCmdFlushThreshold) flush_command_buffer();
 }
 
 std::uint32_t expand16(std::uint32_t c, std::uint32_t ta0, std::uint32_t ta1, bool aem) {
@@ -416,8 +471,46 @@ std::uint32_t expand16(std::uint32_t c, std::uint32_t ta0, std::uint32_t ta1, bo
     return r | (g << 8) | (b << 16) | (a << 24);
 }
 
-// GS colour 0xAABBGGRR to the GPU's RGBA8, which reads as 0xRRGGBBAA.
+// GS colour 0xAABBGGRR to the GPU's RGBA8 (0xRRGGBBAA) or RGB565 (R5G6B5).
 inline std::uint32_t to_gpu(std::uint32_t c) { return __builtin_bswap32(c); }
+inline std::uint16_t to_gpu565(std::uint32_t c) {
+    return static_cast<std::uint16_t>((((c & 0xFFu) >> 3) << 11) | ((((c >> 8) & 0xFFu) >> 2) << 5) | (((c >> 16) & 0xFFu) >> 3));
+}
+
+int opaque_alpha_hint(const State &st, std::uint32_t psm, std::uint32_t cpsm, std::uint32_t csa, std::uint32_t ta0, std::uint32_t ta1, bool aem) {
+    const bool clut16 = !(cpsm == PSMCT32 || cpsm == PSMCT24);
+    switch (psm) {
+    case PSMCT24: case PSMZ24:
+        return (!aem && (ta0 == 0x80u || ta0 == 0xFFu)) ? static_cast<int>(ta0) : -1;
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S:
+        return (!aem && ta0 == ta1 && (ta0 == 0x80u || ta0 == 0xFFu)) ? static_cast<int>(ta0) : -1;
+    case PSMT8: case PSMT8H: {
+        const std::uint32_t *clut = st.clut;
+        const std::uint32_t c0 = clut16 ? expand16(clut[0], ta0, ta1, aem) : clut[0];
+        const std::uint32_t a0 = c0 >> 24;
+        if (a0 != 0x80u && a0 != 0xFFu) return -1;
+        for (std::uint32_t i = 1; i < 256u; ++i) {
+            const std::uint32_t ci = clut16 ? expand16(clut[i], ta0, ta1, aem) : clut[i];
+            if ((ci >> 24) != a0) return -1;
+        }
+        return static_cast<int>(a0);
+    }
+    case PSMT4: case PSMT4HL: case PSMT4HH: {
+        const std::uint32_t *clut = st.clut;
+        const std::uint32_t base = (csa & 15u) * 16u;
+        const std::uint32_t c0 = clut16 ? expand16(clut[base & 511u], ta0, ta1, aem) : clut[base & 511u];
+        const std::uint32_t a0 = c0 >> 24;
+        if (a0 != 0x80u && a0 != 0xFFu) return -1;
+        for (std::uint32_t i = 1; i < 16u; ++i) {
+            const std::uint32_t ci = clut16 ? expand16(clut[(base + i) & 511u], ta0, ta1, aem) : clut[(base + i) & 511u];
+            if ((ci >> 24) != a0) return -1;
+        }
+        return static_cast<int>(a0);
+    }
+    default:
+        return -1;
+    }
+}
 
 std::uint32_t g_clut8_stamp = 0, g_clut8_hash = 0;
 std::uint32_t g_clut4_stamp[16]{}, g_clut4_hash[16]{};
@@ -462,7 +555,9 @@ void decode(Texture &e, const State &st, std::uint32_t cpsm, std::uint32_t csa, 
     const std::uint32_t psm = e.psm, bp = e.tbp, bw = e.tbw;
     const bool clut16 = !(cpsm == PSMCT32 || cpsm == PSMCT24);
     auto *out = static_cast<std::uint32_t *>(e.tex.data);
+    auto *out16 = static_cast<std::uint16_t *>(e.tex.data);
     const std::uint32_t *clut = st.clut;
+    std::uint32_t amin = 255u, amax = 0u;
     if ((psm == PSMCT32 || psm == PSMCT24) && e.half <= 1 && (w << e.half) == gw && (h << e.half) == gh) {
         // A 32-bit texture whose size (halved or not) fills its GS area: each 8x8 tile reads one GS page, at offsets that depend only
         // on where the tile sits in the page. The per-texel path costs two software divisions and a call per texel, which made a
@@ -490,15 +585,28 @@ void decode(Texture &e, const State &st, std::uint32_t cpsm, std::uint32_t csa, 
             for (int tx = 0; tx < w; tx += 8) {
                 const std::uint32_t sx = static_cast<std::uint32_t>(tx) << sh, page = row_page + (sx / 64u) * 8192u;
                 const std::uint16_t *at = offsets[sh][((sy & 31u) >> sh) + ((sx & 63u) >> (3u + sh))];
-                std::uint32_t *tile = out + (ty * w + tx * 8);
-                for (int i = 0; i < 64; ++i) {
-                    std::uint32_t raw;
-                    std::memcpy(&raw, mem + ((page + at[i]) & mask), 4);
-                    if (psm == PSMCT24) {
-                        raw &= 0xFFFFFFu;
-                        raw |= (aem && !raw) ? 0u : alpha;
+                if (e.rgb565) {
+                    std::uint16_t *tile16 = out16 + (ty * w + tx * 8);
+                    for (int i = 0; i < 64; ++i) {
+                        std::uint32_t raw;
+                        std::memcpy(&raw, mem + ((page + at[i]) & mask), 4);
+                        tile16[i] = to_gpu565(raw);
                     }
-                    tile[i] = to_gpu(raw);
+                    amin = amax = ta0;
+                } else {
+                    std::uint32_t *tile = out + (ty * w + tx * 8);
+                    for (int i = 0; i < 64; ++i) {
+                        std::uint32_t raw;
+                        std::memcpy(&raw, mem + ((page + at[i]) & mask), 4);
+                        if (psm == PSMCT24) {
+                            raw &= 0xFFFFFFu;
+                            raw |= (aem && !raw) ? 0u : alpha;
+                        }
+                        const std::uint32_t a = raw >> 24;
+                        if (a < amin) amin = a;
+                        if (a > amax) amax = a;
+                        tile[i] = to_gpu(raw);
+                    }
                 }
             }
         }
@@ -506,6 +614,7 @@ void decode(Texture &e, const State &st, std::uint32_t cpsm, std::uint32_t csa, 
     for (int ty = 0; ty < h; ty += 8) {
         for (int tx = 0; tx < w; tx += 8) {
             std::uint32_t *tile = out + (ty * w + tx * 8);
+            std::uint16_t *tile16 = out16 + (ty * w + tx * 8);
             for (int i = 0; i < 64; ++i) {
                 const std::uint32_t x = static_cast<std::uint32_t>(((tx + g_morton_x[i]) << e.half) % gw), y = static_cast<std::uint32_t>(((ty + g_morton_y[i]) << e.half) % gh);
                 const std::uint32_t raw = read_pixel(psm, bp, bw, x, y);
@@ -526,23 +635,32 @@ void decode(Texture &e, const State &st, std::uint32_t cpsm, std::uint32_t csa, 
                 }
                 default: c = raw; break;
                 }
-                tile[i] = to_gpu(c);
+                const std::uint32_t a = c >> 24;
+                if (a < amin) amin = a;
+                if (a > amax) amax = a;
+                if (e.rgb565) tile16[i] = to_gpu565(c);
+                else tile[i] = to_gpu(c);
             }
         }
     }
+    e.alpha_min = static_cast<std::uint8_t>(amin);
+    e.alpha_max = static_cast<std::uint8_t>(amax);
+    e.alpha_scanned = true;
     C3D_TexFlush(&e.tex);
     if (w <= 64 && h <= 64) {
         e.sample = sample_texels(bp, bw, psm, e.tw, e.th);
         // A small texture of one solid visible colour: how the black letters look when they are made.
-        bool solid = (out[0] & 0xFFu) != 0;
-        for (int i = 1; solid && i < w * h; ++i) solid = out[i] == out[0];
-        static int reports = 0;
-        if (solid && reports < 40) {
-            ++reports;
-            std::fprintf(stderr, "[solid] f%llu tbp %lu psm %02lX %dx%d texel %08lX raw %08lX clut %08lX csa %lu hash %08lX\n",
-                         static_cast<unsigned long long>(ps2::frame_count()), static_cast<unsigned long>(bp), static_cast<unsigned long>(psm),
-                         w, h, static_cast<unsigned long>(out[0]), static_cast<unsigned long>(read_pixel(psm, bp, bw, 0, 0)),
-                         static_cast<unsigned long>(e.clut), static_cast<unsigned long>(csa), static_cast<unsigned long>(e.hash));
+        if (!e.rgb565) {
+            bool solid = (out[0] & 0xFFu) != 0;
+            for (int i = 1; solid && i < w * h; ++i) solid = out[i] == out[0];
+            static int reports = 0;
+            if (solid && reports < 40) {
+                ++reports;
+                std::fprintf(stderr, "[solid] f%llu tbp %lu psm %02lX %dx%d texel %08lX raw %08lX clut %08lX csa %lu hash %08lX\n",
+                             static_cast<unsigned long long>(ps2::frame_count()), static_cast<unsigned long>(bp), static_cast<unsigned long>(psm),
+                             w, h, static_cast<unsigned long>(out[0]), static_cast<unsigned long>(read_pixel(psm, bp, bw, 0, 0)),
+                             static_cast<unsigned long>(e.clut), static_cast<unsigned long>(csa), static_cast<unsigned long>(e.hash));
+            }
         }
     }
     ++g_stat_decoded;
@@ -656,10 +774,13 @@ Texture *find_texture(const State &st, const Context &c, bool three_d) {
                     std::uint32_t tb0 = tbp, tb1 = tbp + 32u;
                     upload_blocks(psm, tbp, tbw, 0u, 0u, 1u << tw, 1u << th, tb0, tb1);
                     if (tb1 > 16384u) tb1 = 16384u;
-                    std::uint32_t newest = 0, nb = tb0;
-                    for (std::uint32_t b = tb0; b < tb1; ++b)
-                        if (g_block_stamp[b] > newest) newest = g_block_stamp[b], nb = b;
-                    const bool own = g_upload_stamp[tbp] && g_block_upload[nb] == g_upload_stamp[tbp];
+                    const std::uint32_t ustamp = g_upload_stamp[tbp];
+                    std::uint32_t newest = 0;
+                    bool own = ustamp != 0u;
+                    for (std::uint32_t b = tb0; b < tb1; ++b) {
+                        if (g_block_stamp[b] > newest) newest = g_block_stamp[b];
+                        if (g_block_upload[b] != ustamp) own = false;
+                    }
                     if (!own && (e.sample_stamp != newest || e.sample_tbp != tbp || e.sample_tbw != tbw)) {
                         flush_deferred_pages(pages.first, pages.count);
                         if (e.sample != sample_texels(tbp, tbw, psm, tw, th)) {
@@ -713,18 +834,22 @@ Texture *find_texture(const State &st, const Context &c, bool three_d) {
         std::fprintf(stderr, "[miss] f%llu tbp %lu psm %02lX %lux%lu half %d clut %08lX upload %08lX page %08lX\n", static_cast<unsigned long long>(ps2::frame_count()), static_cast<unsigned long>(tbp),
                      static_cast<unsigned long>(psm), 1ul << tw, 1ul << th, half, static_cast<unsigned long>(clut), static_cast<unsigned long>(g_upload_hash[tbp]), static_cast<unsigned long>(pages_hash(pages)));
     const int w = std::max(8, (1 << tw) >> half), h = std::max(8, (1 << th) >> half);
-    const std::size_t bytes = static_cast<std::size_t>(w) * h * 4;
+    const bool use_565 = three_d && (w * h >= 4096) && opaque_alpha_hint(st, psm, cpsm, csa, ta0, ta1, aem) >= 0;
+    const std::size_t bytes = static_cast<std::size_t>(w) * h * (use_565 ? 2u : 4u);
     if (!make_room(bytes)) return nullptr;
     if (!slot) {
-        Texture *oldest = nullptr;
-        for (Texture &e : g_textures)
+        Texture *oldest = nullptr, *prev = nullptr;
+        for (Texture &e : g_textures) {
             if (e.last_used + 1 < g_frame && (!oldest || e.last_used < oldest->last_used)) oldest = &e;
+            else if (e.last_used < g_frame && (!prev || e.last_used < prev->last_used)) prev = &e;
+        }
+        if (!oldest) oldest = prev;
         if (!oldest) return nullptr;
         free_texture(*oldest);
         slot = oldest;
     }
     // After the menus the free memory can be in pieces too small for a big texture, however much of it there is.
-    while (!C3D_TexInit(&slot->tex, static_cast<u16>(w), static_cast<u16>(h), GPU_RGBA8))
+    while (!C3D_TexInit(&slot->tex, static_cast<u16>(w), static_cast<u16>(h), use_565 ? GPU_RGB565 : GPU_RGBA8))
         if (!free_oldest()) return nullptr;
     slot->used = true;
     slot->tbp = tbp;
@@ -733,7 +858,8 @@ Texture *find_texture(const State &st, const Context &c, bool three_d) {
     slot->tw = tw;
     slot->th = th;
     slot->half = half;
-    slot->uniform_alpha = -2;
+    slot->alpha_scanned = false;
+    slot->rgb565 = use_565;
     slot->clut = clut;
     slot->texa = texa;
     slot->stamp = g_stamp;
@@ -772,6 +898,13 @@ void delete_retired() {
     g_retired_count = 0;
 }
 
+void rebuild_target_bloom() {
+    std::uint64_t mask = 0;
+    for (const Target &o : g_targets)
+        if (o.used) mask |= 1ull << (o.fbp & 63u);
+    g_target_fbp_bloom = mask;
+}
+
 bool release_target(Target &t) {
     if (g_hw.bound_tex0 == &t.tex || g_hw.bound_tex0 == &t.right_tex) {
         g_hw.tex_bind_valid = false;
@@ -792,6 +925,10 @@ bool release_target(Target &t) {
     t.rt = nullptr;
     t.right_rt = nullptr;
     t.used = false;
+    t.displayed = false;
+    t.last_scene = 0;
+    t.draw_stamp = 0;
+    rebuild_target_bloom();
     return true;
 }
 
@@ -827,10 +964,14 @@ bool create_target(Target &t, std::uint32_t fbp, int gs_width, int gs_height) {
         }
     }
     t.used = true;
+    t.displayed = false;
     t.fbp = fbp;
     t.width = width;
     set_scale(t, gs_width, gs_height);
     t.last_used = g_frame;
+    t.last_scene = 0;
+    t.draw_stamp = 0;
+    rebuild_target_bloom();
     return true;
 }
 
@@ -870,8 +1011,10 @@ void set_eye(bool right) {
     }
     if (t.right_rt && g_source && g_source->right_rt) {
         C3D_Tex *et = right ? &g_source->right_tex : &g_source->tex;
-        C3D_TexBind(0, et);
-        g_hw.bound_tex0 = et;
+        if (g_hw.bound_tex0 != et) {
+            C3D_TexBind(0, et);
+            g_hw.bound_tex0 = et;
+        }
         g_hw.tex_bind_valid = false;
     }
     if (!g_hw.scissor_valid || std::memcmp(g_hw.applied_scissor, g_scissor, sizeof g_scissor) != 0) {
@@ -884,9 +1027,19 @@ void set_eye(bool right) {
         g_hw.offset_valid = true;
     }
     const float shift = t.right_rt ? (right ? g_eye_now : -g_eye_now) : 0.0f;
-    if (!g_hw.eye_valid || g_hw.applied_shift != shift) {
+    const bool eye_on = shift != 0.0f;
+    if (!g_hw.eye_bool_valid || g_hw.applied_eye_bool != eye_on) {
+        if (g_bool_eye >= 0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_eye, eye_on);
+        g_hw.applied_eye_bool = eye_on;
+        g_hw.eye_bool_valid = true;
+    }
+    if (eye_on && (!g_hw.eye_valid || g_hw.applied_shift != shift)) {
         C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_eye, shift, -shift * kEyeDepth, kEyeDepth, 0.0f);
         g_hw.applied_shift = shift;
+        g_hw.eye_valid = true;
+    } else if (!eye_on && g_bool_eye < 0 && (!g_hw.eye_valid || g_hw.applied_shift != 0.0f)) {
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_eye, 0.0f, 0.0f, kEyeDepth, 0.0f);
+        g_hw.applied_shift = 0.0f;
         g_hw.eye_valid = true;
     }
 }
@@ -909,34 +1062,37 @@ void bind_target(Target *t) {
 
 // GS fog mixes each pixel towards a colour by a value that comes with each vertex. The GPU has only one colour to carry per vertex,
 // so that value travels as a texture coordinate into a ramp on the second texture unit, whose alpha is the coordinate again.
+// Runs in Stage 1 (Stage 0 folds the GS 2x alpha doubling directly into its alpha scale, keeping Stage 2 unused).
 void set_fog(bool on, std::uint32_t colour) {
-    C3D_TexEnv *env = C3D_GetTexEnv(2);
+    C3D_TexEnv *env = C3D_GetTexEnv(1);
     C3D_TexEnvInit(env);
     if (on) {
-        C3D_TexBind(1, &g_fog_ramp);
+        if (!g_hw.fog_ramp_bound) {
+            C3D_TexBind(1, &g_fog_ramp);
+            g_hw.fog_ramp_bound = true;
+        }
         C3D_TexEnvSrc(env, C3D_RGB, GPU_PREVIOUS, GPU_CONSTANT, GPU_TEXTURE1);
         C3D_TexEnvOpRgb(env, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_ALPHA);
         C3D_TexEnvFunc(env, C3D_RGB, GPU_INTERPOLATE);
         C3D_TexEnvColor(env, colour);
         C3D_TexEnvSrc(env, C3D_Alpha, GPU_PREVIOUS, GPU_PREVIOUS, GPU_PREVIOUS);
         C3D_TexEnvFunc(env, C3D_Alpha, GPU_REPLACE);
-    } else {   // the ramp stays bound: nothing reads it, and citro3d cannot unbind this unit
-        C3D_TexEnvSrc(env, C3D_Both, GPU_PREVIOUS, GPU_PREVIOUS, GPU_PREVIOUS);
-        C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
     }
 }
 
 void set_texenv(bool textured, int tfx, bool tcc) {
-    const std::uint64_t key = (static_cast<std::uint64_t>(g_fog_colour) << 8) | (g_fog_on ? 16u : 0u) |
+    const std::uint64_t key = (static_cast<std::uint64_t>(g_fog_on ? g_fog_colour : 0u) << 8) | (g_fog_on ? 16u : 0u) |
                               (textured ? (1u | (static_cast<std::uint64_t>(tfx & 3) << 1) | (tcc ? 8u : 0u)) : 0u);
     if (g_hw.texenv_valid && g_hw.texenv_key == key) return;
     g_hw.texenv_valid = true;
     g_hw.texenv_key = key;
     C3D_TexEnv *env = C3D_GetTexEnv(0);
     C3D_TexEnvInit(env);
+    // The GS treats alpha 0x80 as 1.0, so alpha doubles here (4x for Modulate+TCC), saturating at 1.0 in Stage 0.
     if (!textured) {
         C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
         C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+        C3D_TexEnvScale(env, C3D_Alpha, GPU_TEVSCALE_2);
     } else {
         C3D_TexEnvSrc(env, C3D_RGB, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
         if (tfx == 1) {
@@ -948,24 +1104,21 @@ void set_texenv(bool textured, int tfx, bool tcc) {
         if (!tcc) {
             C3D_TexEnvSrc(env, C3D_Alpha, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
             C3D_TexEnvFunc(env, C3D_Alpha, GPU_REPLACE);
+            C3D_TexEnvScale(env, C3D_Alpha, GPU_TEVSCALE_2);
         } else if (tfx == 0) {
             C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
             C3D_TexEnvFunc(env, C3D_Alpha, GPU_MODULATE);
-            C3D_TexEnvScale(env, C3D_Alpha, GPU_TEVSCALE_2);
+            C3D_TexEnvScale(env, C3D_Alpha, GPU_TEVSCALE_4);
         } else if (tfx == 2) {
             C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
             C3D_TexEnvFunc(env, C3D_Alpha, GPU_ADD);
+            C3D_TexEnvScale(env, C3D_Alpha, GPU_TEVSCALE_2);
         } else {
             C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
             C3D_TexEnvFunc(env, C3D_Alpha, GPU_REPLACE);
+            C3D_TexEnvScale(env, C3D_Alpha, GPU_TEVSCALE_2);
         }
     }
-    // The GS treats alpha 0x80 as 1.0, so alpha doubles here, with values above 0x80 saturating.
-    C3D_TexEnv *second = C3D_GetTexEnv(1);
-    C3D_TexEnvInit(second);
-    C3D_TexEnvSrc(second, C3D_Both, GPU_PREVIOUS, GPU_PREVIOUS, GPU_PREVIOUS);
-    C3D_TexEnvFunc(second, C3D_Both, GPU_REPLACE);
-    C3D_TexEnvScale(second, C3D_Alpha, GPU_TEVSCALE_2);
     set_fog(g_fog_on, g_fog_colour);
 }
 
@@ -1021,6 +1174,8 @@ void set_tests(const Context &c, bool abe) {
     g_hw.tests_test = c.test;
     g_hw.tests_zbuf = c.zbuf;
     g_hw.tests_fbmsk = fbmsk;
+    g_hw.split_pass = -1;
+    g_hw.discard_mode = -1;
     const bool ate = c.test & 1u;
     const int atst = static_cast<int>(c.test >> 1) & 7;
     const std::uint32_t aref = static_cast<std::uint32_t>(c.test >> 4) & 0xFFu;
@@ -1067,6 +1222,10 @@ void set_tests(const Context &c, bool abe) {
         }
     }
     if (!g_split.on) {
+        if (test && atst >= 2 && afail == 0) {
+            g_split = {false, depth_on, kAlphaTest[atst], GPU_ALWAYS, depth_fn, static_cast<int>(std::min<std::uint32_t>(aref * 2u, 255u)), writes, 0};
+            g_hw.discard_mode = 1;
+        }
         C3D_AlphaTest(test, kAlphaTest[atst], static_cast<int>(std::min<std::uint32_t>(aref * 2u, 255u)));
         C3D_DepthTest(depth_on, depth_fn, static_cast<GPU_WRITEMASK>(writes));
     }
@@ -1130,6 +1289,13 @@ float z_scale_of(std::uint64_t zbuf) {
 
 float g_z_scale = 1.0f;
 
+// A shape was drawn on the current target.
+inline void note_drawn() {
+    if (!g_current) return;
+    g_current->draw_stamp = g_stamp;
+    if (g_in_depth) g_current->last_scene = g_frame;
+}
+
 void apply_state(const State &st, const Context &c, std::uint64_t attr) {
     if (g_dump_frame && ps2::frame_count() >= g_dump_frame && ps2::frame_count() < g_dump_frame + 2) dump_batch(st, c, attr, g_index_used - g_index_first);
     flush_batch();
@@ -1188,6 +1354,7 @@ void apply_state(const State &st, const Context &c, std::uint64_t attr) {
     g_source = nullptr;
 
     g_textured = false;
+    g_bound_tex_page_lo = g_bound_tex_page_hi = 0;
     g_alpha_from_texture = false;
     g_alpha_texture = nullptr;
     if (tme) {
@@ -1198,9 +1365,14 @@ void apply_state(const State &st, const Context &c, std::uint64_t attr) {
         const bool tcc = (c.tex0 >> 34) & 1u;
         C3D_Tex *tex = nullptr;
         Target *source = nullptr;
-        if (!(tbp & 31u))
+        // A target counts only while it is the newest thing at that address. The game uploads textures over a scratch picture it
+        // no longer draws, and drawing those from the old picture made the faculty office's floor and letters blink.
+        if (!(tbp & 31u) && (g_target_fbp_bloom & (1ull << ((tbp >> 5) & 63u))))
             for (Target &o : g_targets)
-                if (o.used && o.fbp == tbp / 32u && &o != t) source = &o;
+                if (o.used && o.fbp == (tbp >> 5) && &o != t) {
+                    if (o.draw_stamp >= g_block_stamp[tbp]) source = &o;
+                    else ++g_stat_old_target;
+                }
         if (source) {
             // Drawing with a picture that was rendered earlier.
             tex = &source->tex;
@@ -1213,6 +1385,9 @@ void apply_state(const State &st, const Context &c, std::uint64_t attr) {
         } else if (Texture *e = find_texture(st, c, !g_fst)) {
             g_alpha_texture = e;
             tex = &e->tex;
+            const PageRange pr = pages_of(e->tbp, e->tbw, e->psm, e->th);
+            g_bound_tex_page_lo = pr.first;
+            g_bound_tex_page_hi = pr.first + pr.count;
             const float full_width = static_cast<float>(e->tex.width << e->half), full_height = static_cast<float>(e->tex.height << e->half);
             g_u_scale = 1.0f / full_width;
             g_v_scale = -1.0f / full_height;
@@ -1240,10 +1415,23 @@ void apply_state(const State &st, const Context &c, std::uint64_t attr) {
             g_textured = true;
             g_alpha_from_texture = tcc;
             g_alpha_function = tfx;
-            set_texenv(true, tfx, tcc);
+            const bool tcc_texenv = tcc && !(g_alpha_texture && g_alpha_texture->rgb565 && g_alpha_texture->alpha_min == 0x80u && tfx == 0);
+            set_texenv(true, tfx, tcc_texenv);
         } else {
             g_skip_batch = true;
             ++g_stat_missing;
+            static int missing_logged = 0;
+            if (missing_logged < 10) {
+                ++missing_logged;
+                std::fprintf(stderr, "[pica] missing texture f%llu tbp %lu tbw %lu psm %02lX %lux%lu linear_kb %lu\n",
+                             static_cast<unsigned long long>(ps2::frame_count()),
+                             static_cast<unsigned long>(tbp),
+                             static_cast<unsigned long>((c.tex0 >> 14) & 0x3Fu),
+                             static_cast<unsigned long>((c.tex0 >> 20) & 0x3Fu),
+                             static_cast<unsigned long>(1u << tw),
+                             static_cast<unsigned long>(1u << th),
+                             static_cast<unsigned long>(linearSpaceFree() >> 10));
+            }
         }
     } else {
         if (!g_hw.tex_bind_valid || g_hw.bound_tex0 != nullptr) {
@@ -1253,7 +1441,7 @@ void apply_state(const State &st, const Context &c, std::uint64_t attr) {
         }
         set_texenv(false, 0, false);
     }
-    set_eye(false);
+    set_eye(g_current && g_current->right_rt && g_hw.drawn_rt == g_current->right_rt);
 }
 
 bool ensure_state(const State &st, const Context &c, std::uint64_t attr) {
@@ -1390,14 +1578,19 @@ void add_triangle(const Vertex *v, unsigned type, std::uint32_t serial) {
 void add_quad(float x0, float y0, float x1, float y1, const Vertex &a, const Vertex &b) {
     reserve_indices(4);
     DrawVertex *o = g_ring + g_ring_used;
-    write_vertex<false>(o + 0, x0, y0, b, b, a, b.q);
-    write_vertex<false>(o + 2, x1, y1, b, b, b, b.q);
-    std::memcpy(o + 1, o + 0, sizeof(DrawVertex));
-    o[1].y = y1;
-    o[1].t = o[2].t;
-    std::memcpy(o + 3, o + 2, sizeof(DrawVertex));
-    o[3].y = y0;
-    o[3].t = o[0].t;
+    DrawVertex v0, v2;
+    write_vertex<false>(&v0, x0, y0, b, b, a, b.q);
+    write_vertex<false>(&v2, x1, y1, b, b, b, b.q);
+    DrawVertex v1 = v0;
+    v1.y = y1;
+    v1.t = v2.t;
+    DrawVertex v3 = v2;
+    v3.y = y0;
+    v3.t = v0.t;
+    o[0] = v0;
+    o[1] = v1;
+    o[2] = v2;
+    o[3] = v3;
     constexpr unsigned order[] = {0, 1, 2, 0, 2, 3};
     for (unsigned corner : order)
         g_indices[g_index_used++] = vertex_index(g_ring_used + corner);
@@ -1414,6 +1607,7 @@ void show_texture(C3D_RenderTarget *screen, C3D_Tex *tex, float u0, float u1, fl
     C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_scale, 1.0f, 1.0f, 1.0f, 0.0f);
     C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_offset, 0.0f, 0.0f, 0.0f, 0.0f);
     C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uniform_eye, 0.0f, 0.0f, -1.0f, 0.0f);
+    if (g_bool_eye >= 0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_eye, false);
     C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
     C3D_AlphaTest(false, GPU_ALWAYS, 0);
     C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
@@ -1464,6 +1658,10 @@ void show_target(Target *t, const DisplayRegs &r, int circuit) {
 u8 *g_shot_pixels = nullptr;
 
 void save_shot(C3D_RenderTarget *screen, const char *ending) {
+    if (!g_shot_pixels) {
+        make_room(240u * 400u * 3u);
+        g_shot_pixels = static_cast<u8 *>(linearAlloc(240 * 400 * 3));
+    }
     u8 *pixels = g_shot_pixels;
     if (!pixels) return;
     const u32 dims = GX_BUFFER_DIM(240, 400);
@@ -1512,6 +1710,7 @@ void begin_frame() {
             if (t.used) release_target(t);
         g_stereo = stereo;
     }
+    ::g3::g_behind_on_gpu = !stereo;
     // At the slider's top and strength 5 the farthest things sit 10 screen pixels apart between the eyes: 5 each way.
     g_eye_shift = stereo ? slider * static_cast<float>(g_stereo_strength) * (0.005f / -kEyeDepth) : 0.0f;
     const u64 start = svcGetSystemTick();
@@ -1533,6 +1732,8 @@ void begin_frame() {
     g_current = nullptr;
     g_key_valid = false;
     g_unif_valid = false;
+    g_unif_dir_valid = false;
+    g_unif_env_valid = false;
     g_hw.invalidate();
     std::memset(g_pica_bone_gen, 0, sizeof g_pica_bone_gen);
     ++g_frame;
@@ -1575,19 +1776,37 @@ bool init() {
         const int b = shaderInstanceGetUniformLocation(g_program.vertexShader, "isg3");
         const int skin = shaderInstanceGetUniformLocation(g_program.vertexShader, "isskin");
         const int ortho = shaderInstanceGetUniformLocation(g_program.vertexShader, "isortho");
-        if (g_uniform_proj >= 0 && lcol == g_uniform_proj + 12 && g_uniform_bones == g_uniform_proj + 15 && b >= 0x68 && b < 0x78 &&
+        const int dir = shaderInstanceGetUniformLocation(g_program.vertexShader, "isdir");
+        const int fog = shaderInstanceGetUniformLocation(g_program.vertexShader, "isfog");
+        const int eye = shaderInstanceGetUniformLocation(g_program.vertexShader, "iseye");
+        const int nrm = shaderInstanceGetUniformLocation(g_program.vertexShader, "isnrm");
+        const int env = shaderInstanceGetUniformLocation(g_program.vertexShader, "isenv");
+        if (g_uniform_proj >= 0 && lcol == g_uniform_proj + 12 && g_uniform_bones == g_uniform_proj + 17 && b >= 0x68 && b < 0x78 &&
             skin >= 0x68 && skin < 0x78 && ortho >= 0x68 && ortho < 0x78) {
             g_bool_g3 = b;
             g_bool_skin = skin;
             g_bool_ortho = ortho;
+            if (dir >= 0x68 && dir < 0x78) g_bool_dir = dir;
+            if (fog >= 0x68 && fog < 0x78) g_bool_fog = fog;
+            if (eye >= 0x68 && eye < 0x78) g_bool_eye = eye;
+            if (nrm >= 0x68 && nrm < 0x78) g_bool_nrm = nrm;
+            if (env >= 0x68 && env < 0x78) g_bool_env = env;
         }
-        std::fprintf(stderr, "[pica] g3 shader: proj %d lcol %d bones %d isg3 %d isortho %d%s\n", g_uniform_proj, lcol, g_uniform_bones, b, ortho,
-                     g_bool_g3 >= 0 ? "" : " (not usable)");
+        std::fprintf(stderr, "[pica] g3 shader: proj %d lcol %d bones %d isg3 %d isortho %d isdir %d isfog %d iseye %d isnrm %d isenv %d%s\n", g_uniform_proj, lcol, g_uniform_bones, b, ortho,
+                     g_bool_dir, g_bool_fog, g_bool_eye, g_bool_nrm, g_bool_env, g_bool_g3 >= 0 ? "" : " (not usable)");
     }
     if (g_bool_g3 >= 0) {
         // Every bone slot starts at zero: a weight of zero may point at a slot no batch has filled yet.
         C3D_FVec *b = C3D_FVUnifWritePtr(GPU_VERTEX_SHADER, g_uniform_bones, 3 * static_cast<int>(::g3::kGpuBones));
         std::memset(b, 0, 3 * ::g3::kGpuBones * sizeof *b);
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_g3, false);
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_skin, false);
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_ortho, false);
+        if (g_bool_dir >= 0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_dir, false);
+        if (g_bool_fog >= 0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_fog, false);
+        if (g_bool_eye >= 0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_eye, false);
+        if (g_bool_nrm >= 0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_nrm, false);
+        if (g_bool_env >= 0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_env, false);
     }
     AttrInfo_Init(&g_g3_attr);
     AttrInfo_AddLoader(&g_g3_attr, 0, GPU_FLOAT, 3);           // position
@@ -1612,7 +1831,6 @@ bool init() {
         std::fprintf(stderr, "[pica] no memory for vertex or index data\n");
         return false;
     }
-    g_shot_pixels = static_cast<u8 *>(linearAlloc(240 * 400 * 3));
     g_arena = static_cast<::g3::GpuVertex *>(linearAlloc(kArenaVertices * sizeof(::g3::GpuVertex)));
     g3cache::init(g_arena, kArenaVertices);
     BufInfo_Init(&g_buf);
@@ -1664,6 +1882,7 @@ void shutdown() {
         g_frame_open = false;
     }
     FES_AT(71); FesOverlapWait();
+    if (g_shot_pixels) { linearFree(g_shot_pixels); g_shot_pixels = nullptr; }
     C3D_Fini();
 }
 
@@ -1712,45 +1931,36 @@ void draw_strip_indexed(int first, int count, bool split) {
     C3D_DrawElements(GPU_TRIANGLE_STRIP, count, C3D_UNSIGNED_SHORT, indices);
 }
 
-int uniform_alpha_pass_g3(bool alpha_uniform, std::uint8_t alpha_val, float mat_alpha) {
-    int texel = 0;
+int uniform_alpha_pass_g3(std::uint8_t alpha_min, std::uint8_t alpha_max, float mat_alpha) {
+    int tex_lo = 0, tex_hi = 0;
     if (g_alpha_from_texture) {
         if (!g_alpha_texture) return -1;
-        int &alpha = g_alpha_texture->uniform_alpha;
-        if (alpha == -2) {
-            const auto &tex = g_alpha_texture->tex;
-            const auto *pixels = static_cast<const std::uint32_t *>(tex.data);
-            alpha = pixels[0] & 255;
-            const std::uint32_t n = static_cast<std::uint32_t>(tex.width) * tex.height;
-            for (std::uint32_t i = 1; i < n; ++i) {
-                if (static_cast<int>(pixels[i] & 255) == alpha) continue;
-                alpha = -1;
-                break;
-            }
-        }
-        if (alpha < 0) return -1;
-        texel = alpha;
+        scan_texture_alpha(*g_alpha_texture);
+        tex_lo = g_alpha_texture->alpha_min;
+        tex_hi = g_alpha_texture->alpha_max;
     }
     int vlo = 0, vhi = 0;
     if (!g_alpha_from_texture || g_alpha_function == 0 || g_alpha_function == 2) {
-        if (!alpha_uniform) return -1;
-        const float vf = static_cast<float>(alpha_val) * mat_alpha;
-        vlo = std::clamp(static_cast<int>(std::floor(vf)), 0, 255);
-        vhi = std::clamp(static_cast<int>(std::ceil(vf)), 0, 255);
+        if (alpha_min > alpha_max) return -1;
+        if (mat_alpha > 0.0f) {
+            vlo = std::clamp(static_cast<int>(std::floor(static_cast<float>(alpha_min) * mat_alpha)), 0, 255);
+            vhi = std::clamp(static_cast<int>(std::ceil(static_cast<float>(alpha_max) * mat_alpha)), 0, 255);
+        }
     }
     int low = vlo * 2, high = vhi * 2;
     if (g_alpha_from_texture) {
         switch (g_alpha_function) {
         case 0:
-            low = ((texel * vlo) >> 8) * 4;
-            high = ((texel * vhi + 254) / 255) * 4;
+            low = ((tex_lo * vlo) >> 8) * 4;
+            high = ((tex_hi * vhi + 254) / 255) * 4;
             break;
         case 2:
-            low = 2 * (texel + vlo);
-            high = 2 * (texel + vhi);
+            low = 2 * (tex_lo + vlo);
+            high = 2 * (tex_hi + vhi);
             break;
         default:
-            low = high = 2 * texel;
+            low = 2 * tex_lo;
+            high = 2 * tex_hi;
             break;
         }
     }
@@ -1800,8 +2010,7 @@ struct G3Pending {
     bool on = false;
     std::uint32_t first = 0, count = 0, slots = 0;
     float mat_alpha = 1.0f;
-    bool alpha_uniform = true;
-    std::uint8_t alpha_val = 0;
+    std::uint8_t alpha_min = 255, alpha_max = 0;
     bool arena = false;
     bool arrays = false;   // one skinned batch from the arena, first and count in vertices, drawn without indices
 } g_g3_pending;
@@ -1877,28 +2086,40 @@ void flush_g3() {
     if ((g_debug & 256u) && !g_g3_pending.arrays) check_g3_strip(first, count);
     g_g3_pending.on = false;
     const std::uint32_t w0 = cmd_words();
-    const int pass = g_split.on ? uniform_alpha_pass_g3(g_g3_pending.alpha_uniform, g_g3_pending.alpha_val, g_g3_pending.mat_alpha) : -1;
+    const int pass = g_split.on ? uniform_alpha_pass_g3(g_g3_pending.alpha_min, g_g3_pending.alpha_max, g_g3_pending.mat_alpha) : -1;
     const bool split = g_split.on && pass < 0;
     if (pass >= 0) {
-        C3D_AlphaTest(false, GPU_ALWAYS, 0);
-        C3D_DepthTest(g_split.depth, g_split.depth_test,
-                      static_cast<GPU_WRITEMASK>(pass ? g_split.pass_writes : g_split.fail_writes));
+        if (g_hw.split_pass != pass) {
+            C3D_AlphaTest(false, GPU_ALWAYS, 0);
+            C3D_DepthTest(g_split.depth, g_split.depth_test,
+                          static_cast<GPU_WRITEMASK>(pass ? g_split.pass_writes : g_split.fail_writes));
+            g_hw.split_pass = static_cast<std::int8_t>(pass);
+        }
+    } else if (split) {
+        g_hw.split_pass = -1;
+    } else if (g_hw.discard_mode >= 0) {
+        // ATE=1, AFAIL=0 discard: if the conservative alpha interval always passes, disable AlphaTest so PICA200 Early-Z stays active.
+        const int dp = uniform_alpha_pass_g3(g_g3_pending.alpha_min, g_g3_pending.alpha_max, g_g3_pending.mat_alpha);
+        if (dp == 0) return;
+        const std::int8_t want = dp == 1 ? 0 : 1;
+        if (g_hw.discard_mode != want) {
+            C3D_AlphaTest(want != 0, want != 0 ? g_split.pass : GPU_ALWAYS, want != 0 ? g_split.reference : 0);
+            g_hw.discard_mode = want;
+        }
     }
     const auto draw = g_g3_pending.arena && !g_g3_pending.arrays ? draw_strip_indexed : draw_strip;
-    draw(first, count, split);
     if (g_current && g_current->right_rt) {
-        set_eye(true);
+        const bool right_first = g_hw.drawn_rt == g_current->right_rt;
         draw(first, count, split);
-        set_eye(false);
+        set_eye(!right_first);
+        draw(first, count, split);
+    } else {
+        draw(first, count, split);
     }
     const std::uint32_t w1 = cmd_words();
     if (w1 >= w0) g_words_draw += w1 - w0;
     ++g_stat_draws;
-    if (C3D_GetCmdBufUsage() > 0.75f) {
-        flush_ring();
-        FES_AT(36); C3D_FrameSplit(GX_CMDLIST_FLUSH); FES_AT(37);
-        ++g_stat_splits;
-    }
+    if (!g_in_show_picture && FesOverlapWordsLeft() < kCmdFlushThreshold) flush_command_buffer();
 }
 
 inline bool same_unif(int id, const float *v) {
@@ -1908,10 +2129,76 @@ inline bool same_unif(int id, const float *v) {
 
 }
 
+template <bool CheckEnv>
+static inline bool diff_and_check_uniforms(const float *const uptr[17], bool check_dir, bool check_env, std::uint32_t &diff_mask) {
+    constexpr std::uint32_t kExp = 0x7F800000u;
+    std::uint32_t mask = 0u;
+    auto check_slot = [&](int i, bool diff_only) -> bool {
+        std::uint32_t w[4];
+        std::memcpy(w, uptr[i], 16);
+        if (diff_only) {
+            if (((g_unif_bits[i][0] ^ w[0]) | (g_unif_bits[i][1] ^ w[1]) | (g_unif_bits[i][2] ^ w[2]) | (g_unif_bits[i][3] ^ w[3])) == 0u)
+                return true;
+            mask |= 1u << i;
+        }
+        return !(((w[0] & kExp) == kExp) | ((w[1] & kExp) == kExp) | ((w[2] & kExp) == kExp) | ((w[3] & kExp) == kExp));
+    };
+    if (g_unif_valid) {
+        for (int i = 0; i < 9; ++i)
+            if (!check_slot(i, true)) return false;
+    } else {
+        for (int i = 0; i < 9; ++i)
+            if (!check_slot(i, false)) return false;
+        mask = 0x01FFu;
+    }
+    if (check_dir) {
+        if (g_unif_dir_valid) {
+            for (int i = 9; i < 15; ++i)
+                if (!check_slot(i, true)) return false;
+        } else {
+            for (int i = 9; i < 15; ++i)
+                if (!check_slot(i, false)) return false;
+            mask |= 0x7E00u;
+        }
+    }
+    if constexpr (CheckEnv) {
+        if (check_env) {
+            if (g_unif_env_valid) {
+                for (int i = 15; i < 17; ++i)
+                    if (!check_slot(i, true)) return false;
+            } else {
+                for (int i = 15; i < 17; ++i)
+                    if (!check_slot(i, false)) return false;
+                mask |= 0x18000u;
+            }
+        }
+    } else {
+        (void)check_env;
+    }
+    diff_mask = mask;
+    return true;
+}
+
+static inline bool bones_finite(const ::g3::Gpu &g, std::uint32_t slots) {
+    return (g.bone_nonfinite & slots) == 0u;
+}
+
+static void note_nonfinite_g3() {
+    static bool told = false;
+    if (!told) {
+        std::fprintf(stderr, "[pica] skipped g3 batch with non-finite uniform or bone matrix\n");
+        told = true;
+    }
+}
+
 bool draw_g3(const State &st, std::uint64_t clamp, const ::g3::Gpu &g) {
     PS2_PROF_EXTRA(0);
     if (g_draw_nothing || (!queue::g_split_pica && queue::g_quiet) || g.n < 3) return true;
     if (!g_frame_open) begin_frame();
+    if (FesOverlapWordsLeft() < kG3Words + kFrameReserveWords) {
+        flush_batch();
+        if (FesOverlapWordsLeft() < kG3Words + kFrameReserveWords) flush_command_buffer();
+    }
     if (FesOverlapWordsLeft() < kG3Words + kFrameReserveWords) {
         ++g_stat_g3_declined;
         return false;   // the GS path's shapes need far less of the command list
@@ -1923,41 +2210,37 @@ bool draw_g3(const State &st, std::uint64_t clamp, const ::g3::Gpu &g) {
     if (g_skip_batch) return true;
     ++g_stat_shapes;
     ++g_stat_g3;
+    ++g_shapes_since_present;
+    note_drawn();
     if (g_index_used > g_index_first) flush_batch();   // the GS path's triangles (no g3 batch waits while they do)
 
     // The uniforms: proj, post, texs, fogp, mat, amb, ldir[3], lcol[3].
-    float unif[15][4];
-    for (int i = 0; i < 4; ++i) std::memcpy(unif[i], g.proj[i], sizeof unif[i]);
     const float post[4] = {g.offset[0] - static_cast<float>(g_ofx) * (1.0f / 16.0f), g.offset[1] - static_cast<float>(g_ofy) * (1.0f / 16.0f), g.offset[2],
                            -g_z_scale * (g.xyzf ? 1.0f : 16.0f)};
-    std::memcpy(unif[4], post, sizeof post);
     const float texs[4] = {g_s_scale, -g_t_scale, g_v_offset, 0.0f};
-    std::memcpy(unif[5], texs, sizeof texs);
     const float fogp[4] = {g.fog ? g.fog_scale * (1.0f / 255.0f) : 0.0f,
                            g.fog ? -g.fog_near * g.fog_scale * (1.0f / 255.0f) : static_cast<float>((st.fog >> 56) & 0xFFu) * (1.0f / 255.0f),
                            g.clipper ? 0.0f : -1.0f, g.clipper ? -1e15f : 0.0f};
-    std::memcpy(unif[6], fogp, sizeof fogp);
-    for (int i = 0; i < 4; ++i) unif[7][i] = g.material[i] * (1.0f / 255.0f);
-    std::memcpy(unif[8], g.ambient, sizeof unif[8]);
-    for (int i = 0; i < 3; ++i) std::memcpy(unif[9 + i], g.light_dir[i], sizeof unif[9 + i]);
-    for (int i = 0; i < 3; ++i) std::memcpy(unif[12 + i], g.light_colour[i], sizeof unif[12 + i]);
+    const float mat[4] = {g.material[0] * (1.0f / 255.0f), g.material[1] * (1.0f / 255.0f), g.material[2] * (1.0f / 255.0f), g.material[3] * (1.0f / 255.0f)};
+    const float *const uptr[17] = {
+        g.proj[0], g.proj[1], g.proj[2], g.proj[3], post, texs, fogp, mat, g.ambient,
+        g.light_dir[0], g.light_dir[1], g.light_dir[2], g.light_colour[0], g.light_colour[1], g.light_colour[2],
+        g.env_u, g.env_v
+    };
     const GPU_CULLMODE cull = g.keep_negative && g.keep_positive ? GPU_CULL_NONE : g.keep_negative ? GPU_CULL_FRONT_CCW : GPU_CULL_BACK_CCW;
 
     // Can it join the batches waiting? Same culling, shader half and uniforms, and no bone slot they use about to change.
-    std::uint32_t unif_u32[15][4];
-    std::memcpy(unif_u32, unif, sizeof unif_u32);
-    std::uint32_t diff_mask = g_unif_valid ? 0u : 0x7FFFu;
-    if (g_unif_valid) {
-        for (int i = 0; i < 15; ++i) {
-            const std::uint32_t d = (g_unif_bits[i][0] ^ unif_u32[i][0]) | (g_unif_bits[i][1] ^ unif_u32[i][1]) |
-                                    (g_unif_bits[i][2] ^ unif_u32[i][2]) | (g_unif_bits[i][3] ^ unif_u32[i][3]);
-            if (d) diff_mask |= 1u << i;
-        }
+    std::uint32_t diff_mask = 0u;
+    const bool check_dir = g.has_dir_lights || g_bool_dir < 0;
+    const bool check_env = g.env;
+    const std::uint32_t slots = g.skin ? (g.slots | 1u) : 0u;  // zero-weight lanes read slot zero
+    if (!diff_and_check_uniforms<true>(uptr, check_dir, check_env, diff_mask) || !bones_finite(g, slots)) {
+        note_nonfinite_g3();
+        return true;
     }
     const bool shared_uniforms = diff_mask == 0u;
-    const std::uint32_t slots = g.skin ? (g.slots | 1u) : 0u;  // zero-weight lanes read slot zero
     if (g_g3_pending.on) {
-        bool join = shared_uniforms && g.skin == g_g3_skin && g.ortho == g_g3_ortho && cull == g_g3_cull;
+        bool join = shared_uniforms && g.skin == g_g3_skin && g.ortho == g_g3_ortho && g.has_dir_lights == g_g3_dir && g.env == g_g3_env && cull == g_g3_cull;
         for (auto overlap = g_g3_pending.slots & slots; overlap && join; overlap &= overlap - 1u) {
             const unsigned s = __builtin_ctz(overlap);
             join = g.bone_gen[s] == g_pica_bone_gen[s];
@@ -1995,12 +2278,13 @@ bool draw_g3(const State &st, std::uint64_t clamp, const ::g3::Gpu &g) {
         at = end;
         g_g3_pending.count = at + g.n - g_g3_pending.first;
         g_g3_pending.slots |= slots;
-        g_g3_pending.alpha_uniform = g_g3_pending.alpha_uniform && g.alpha_uniform && (g_g3_pending.alpha_val == g.alpha_val);
+        g_g3_pending.alpha_min = std::min(g_g3_pending.alpha_min, g.alpha_min);
+        g_g3_pending.alpha_max = std::max(g_g3_pending.alpha_max, g.alpha_max);
     } else {
         // A new strip at a multiple of 96 bytes (3 slots, 2 vertices) from the ring's start, so that one buffer bound at the
         // start with a 48-byte stride serves every g3 batch of the slice.
         at = (g_ring_used + 2u) / 3u * 2u;
-        g_g3_pending = G3Pending{true, at, g.n, slots, g.material[3], g.alpha_uniform, g.alpha_val};
+        g_g3_pending = G3Pending{true, at, g.n, slots, g.material[3], g.alpha_min, g.alpha_max};
     }
     std::memcpy(ring + at, g.v, g.n * sizeof(::g3::GpuVertex));
     g_ring_used = ((at + g.n) * 3u + 1u) / 2u;
@@ -2030,6 +2314,23 @@ bool draw_g3(const State &st, std::uint64_t clamp, const ::g3::Gpu &g) {
         C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_ortho, g.ortho);
         g_g3_ortho = g.ortho;
     }
+    if (g_bool_dir >= 0 && g.has_dir_lights != g_g3_dir) {
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_dir, g.has_dir_lights);
+        g_g3_dir = g.has_dir_lights;
+    }
+    const bool need_nrm = g.has_dir_lights || g.env;
+    if (g_bool_nrm >= 0 && need_nrm != g_g3_nrm) {
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_nrm, need_nrm);
+        g_g3_nrm = need_nrm;
+    }
+    if (g_bool_env >= 0 && g.env != g_g3_env) {
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_env, g.env);
+        g_g3_env = g.env;
+    }
+    if (g_bool_fog >= 0 && g_fog_on != g_g3_fog) {
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_fog, g_fog_on);
+        g_g3_fog = g_fog_on;
+    }
     // The GS leaves out the triangles whose ADC bit the program set: here the GPU's culling does it. With every other
     // triangle turned round as (k-1, k-2, k), the program's negative facing is an area above zero with y down; the y axis
     // flips on the way to clip space, so it is clockwise there.
@@ -2041,14 +2342,16 @@ bool draw_g3(const State &st, std::uint64_t clamp, const ::g3::Gpu &g) {
     if (diff_mask) {
         for (std::uint32_t m = diff_mask; m; m &= m - 1u) {
             const int i = __builtin_ctz(m);
+            const float *src = uptr[i];
             C3D_FVec &u = C3D_FVUnif[GPU_VERTEX_SHADER][g_uniform_proj + i];
-            u.x = unif[i][0]; u.y = unif[i][1]; u.z = unif[i][2]; u.w = unif[i][3];
+            u.x = src[0]; u.y = src[1]; u.z = src[2]; u.w = src[3];
             C3D_FVUnifDirty[GPU_VERTEX_SHADER][g_uniform_proj + i] = true;
             ++g_stat_unif;
-            g_unif_bits[i][0] = unif_u32[i][0]; g_unif_bits[i][1] = unif_u32[i][1];
-            g_unif_bits[i][2] = unif_u32[i][2]; g_unif_bits[i][3] = unif_u32[i][3];
+            std::memcpy(g_unif_bits[i], src, 16);
         }
         g_unif_valid = true;
+        if (check_dir) g_unif_dir_valid = true;
+        if (check_env) g_unif_env_valid = true;
     }
     for (auto remaining = slots; remaining; remaining &= remaining - 1u) {
         const unsigned s = __builtin_ctz(remaining);
@@ -2072,6 +2375,10 @@ int draw_g3_direct(const State &st, std::uint64_t clamp, const ::g3::Input &in, 
     if (g_draw_nothing || (!queue::g_split_pica && queue::g_quiet) || g.n < 3) return 0;
     if (!g_frame_open) begin_frame();
     if (FesOverlapWordsLeft() < kG3Words + kFrameReserveWords) {
+        flush_batch();
+        if (FesOverlapWordsLeft() < kG3Words + kFrameReserveWords) flush_command_buffer();
+    }
+    if (FesOverlapWordsLeft() < kG3Words + kFrameReserveWords) {
         ++g_stat_g3_declined;
         return -1;
     }
@@ -2082,39 +2389,35 @@ int draw_g3_direct(const State &st, std::uint64_t clamp, const ::g3::Input &in, 
     if (g_skip_batch) return 0;
     if (g_index_used > g_index_first) flush_batch();
 
-    float unif[15][4];
-    for (int i = 0; i < 4; ++i) std::memcpy(unif[i], g.proj[i], sizeof unif[i]);
-    unif[4][0] = g.offset[0] - static_cast<float>(g_ofx) * (1.0f / 16.0f);
-    unif[4][1] = g.offset[1] - static_cast<float>(g_ofy) * (1.0f / 16.0f);
-    unif[4][2] = g.offset[2];
-    unif[4][3] = -g_z_scale * (g.xyzf ? 1.0f : 16.0f);
-    unif[5][0] = g_s_scale; unif[5][1] = -g_t_scale; unif[5][2] = g_v_offset; unif[5][3] = 0.0f;
-    unif[6][0] = g.fog ? g.fog_scale * (1.0f / 255.0f) : 0.0f;
-    unif[6][1] = g.fog ? -g.fog_near * g.fog_scale * (1.0f / 255.0f) : static_cast<float>((st.fog >> 56) & 0xFFu) * (1.0f / 255.0f);
-    unif[6][2] = g.clipper ? 0.0f : -1.0f;
-    unif[6][3] = g.clipper ? -1e15f : 0.0f;
-    for (int i = 0; i < 4; ++i) unif[7][i] = g.material[i] * (1.0f / 255.0f);
-    std::memcpy(unif[8], g.ambient, sizeof unif[8]);
-    for (int i = 0; i < 3; ++i) std::memcpy(unif[9 + i], g.light_dir[i], sizeof unif[9 + i]);
-    for (int i = 0; i < 3; ++i) std::memcpy(unif[12 + i], g.light_colour[i], sizeof unif[12 + i]);
+    // Zero-copy uniform diffing: only compute the 4 dynamic vectors and compare all 15 directly against g_unif_bits.
+    const float post[4] = {g.offset[0] - static_cast<float>(g_ofx) * (1.0f / 16.0f), g.offset[1] - static_cast<float>(g_ofy) * (1.0f / 16.0f), g.offset[2],
+                           -g_z_scale * (g.xyzf ? 1.0f : 16.0f)};
+    const float texs[4] = {g_s_scale, -g_t_scale, g_v_offset, 0.0f};
+    const float fogp[4] = {g.fog ? g.fog_scale * (1.0f / 255.0f) : 0.0f,
+                           g.fog ? -g.fog_near * g.fog_scale * (1.0f / 255.0f) : static_cast<float>((st.fog >> 56) & 0xFFu) * (1.0f / 255.0f),
+                           g.clipper ? 0.0f : -1.0f, g.clipper ? -1e15f : 0.0f};
+    const float mat[4] = {g.material[0] * (1.0f / 255.0f), g.material[1] * (1.0f / 255.0f), g.material[2] * (1.0f / 255.0f), g.material[3] * (1.0f / 255.0f)};
+    const float *const uptr[17] = {
+        g.proj[0], g.proj[1], g.proj[2], g.proj[3], post, texs, fogp, mat, g.ambient,
+        g.light_dir[0], g.light_dir[1], g.light_dir[2], g.light_colour[0], g.light_colour[1], g.light_colour[2],
+        g.env_u, g.env_v
+    };
     const GPU_CULLMODE cull = g.keep_negative && g.keep_positive ? GPU_CULL_NONE : g.keep_negative ? GPU_CULL_FRONT_CCW : GPU_CULL_BACK_CCW;
 
-    std::uint32_t unif_u32[15][4];
-    std::memcpy(unif_u32, unif, sizeof unif_u32);
-    std::uint32_t diff_mask = g_unif_valid ? 0u : 0x7FFFu;
-    if (g_unif_valid) {
-        for (int i = 0; i < 15; ++i) {
-            const std::uint32_t d = (g_unif_bits[i][0] ^ unif_u32[i][0]) | (g_unif_bits[i][1] ^ unif_u32[i][1]) |
-                                    (g_unif_bits[i][2] ^ unif_u32[i][2]) | (g_unif_bits[i][3] ^ unif_u32[i][3]);
-            if (d) diff_mask |= 1u << i;
-        }
+    std::uint32_t diff_mask = 0u;
+    const bool check_dir = g.has_dir_lights || g_bool_dir < 0;
+    const bool check_env = g.env;
+    if (!diff_and_check_uniforms<false>(uptr, check_dir, false, diff_mask)) {
+        note_nonfinite_g3();
+        return 0;
     }
     const bool shared_uniforms = diff_mask == 0u;
-    const bool may_join = g_g3_pending.on && shared_uniforms && g.skin == g_g3_skin && g.ortho == g_g3_ortho && cull == g_g3_cull;
+    const bool may_join = g_g3_pending.on && shared_uniforms && g.skin == g_g3_skin && g.ortho == g_g3_ortho && g.has_dir_lights == g_g3_dir && g.env == g_g3_env && cull == g_g3_cull;
     if (g_g3_pending.on && !may_join) flush_g3();
 
-    // Room for the strip's indices first, in case the arena takes the batch (a change of slice draws what waits).
-    if (!reserve_geometry(g.n + 4u)) {
+    // Room for the strip's indices first only when the indexed arena path is active (arrays mode uses zero ring/index room).
+    const bool want_arrays = !(g3cache::g_index >= 2 || (g3cache::g_index == 1 && !g.skin));
+    if (!want_arrays && !reserve_geometry(g.n + 4u)) {
         if (!g_ring_warned) std::fprintf(stderr, "[pica] vertex ring full, dropping shapes\n");
         g_ring_warned = true;
         return 0;
@@ -2128,9 +2431,15 @@ int draw_g3_direct(const State &st, std::uint64_t clamp, const ::g3::Input &in, 
     std::uint32_t slots = g.skin ? (g.slots | 1u) : 0u;   // the ring path sets it again after its fill
     const void *buffer;
     if (arena) {
+        if (!bones_finite(g, slots)) {
+            note_nonfinite_g3();
+            return 0;
+        }
         const auto first_vertex = static_cast<std::uint32_t>(base);
         ++g_stat_shapes;
         ++g_stat_g3;
+        ++g_shapes_since_present;
+        note_drawn();
         // A bone slot the waiting strip uses that now holds another matrix: draw the strip first.
         bool join = g_g3_pending.on;
         for (auto overlap = g_g3_pending.slots & slots; overlap && join; overlap &= overlap - 1u) {
@@ -2139,12 +2448,20 @@ int draw_g3_direct(const State &st, std::uint64_t clamp, const ::g3::Input &in, 
         }
         // A batch from the arena is drawn on its own, by vertex range: drawn by index, skinned vertices hang the console's
         // GPU at once, and a cold boot with only unskinned ones drawn by index hung it once too (g3cache.hpp, g3index).
-        const bool arrays = !(g3cache::g_index >= 2 || (g3cache::g_index == 1 && !g.skin));
-        if (g_g3_pending.on && (!join || arrays || g_g3_pending.arrays)) flush_g3();
+        const bool arrays = want_arrays;
+        // If it follows the waiting strip in the arena, the copies between them (g3cache.cpp) make the two one strip.
+        const bool next = join && arrays && g_g3_pending.arrays &&
+                          first_vertex == g_g3_pending.first + g_g3_pending.count + 2u + (g_g3_pending.count & 1u);
+        if (g_g3_pending.on && !next && (!join || arrays || g_g3_pending.arrays)) flush_g3();
         std::uint16_t *idx = g_indices;
         std::uint32_t at;
-        if (arrays) {
-            g_g3_pending = G3Pending{true, first_vertex, g.n, slots, g.material[3], g.alpha_uniform, g.alpha_val, true, true};
+        if (next) {
+            g_g3_pending.count = first_vertex + g.n - g_g3_pending.first;
+            g_g3_pending.slots |= slots;
+            g_g3_pending.alpha_min = std::min(g_g3_pending.alpha_min, g.alpha_min);
+            g_g3_pending.alpha_max = std::max(g_g3_pending.alpha_max, g.alpha_max);
+        } else if (arrays) {
+            g_g3_pending = G3Pending{true, first_vertex, g.n, slots, g.material[3], g.alpha_min, g.alpha_max, true, true};
         } else if (g_g3_pending.on) {
             // As below: the last index again and this batch's first, so the triangles between have no area, and once more if
             // needed so that this batch starts at an even place.
@@ -2156,10 +2473,11 @@ int draw_g3_direct(const State &st, std::uint64_t clamp, const ::g3::Input &in, 
             at = end;
             g_g3_pending.count = at + g.n - g_g3_pending.first;
             g_g3_pending.slots |= slots;
-            g_g3_pending.alpha_uniform = g_g3_pending.alpha_uniform && g.alpha_uniform && (g_g3_pending.alpha_val == g.alpha_val);
+            g_g3_pending.alpha_min = std::min(g_g3_pending.alpha_min, g.alpha_min);
+            g_g3_pending.alpha_max = std::max(g_g3_pending.alpha_max, g.alpha_max);
         } else {
             at = g_index_used;
-            g_g3_pending = G3Pending{true, at, g.n, slots, g.material[3], g.alpha_uniform, g.alpha_val, true};
+            g_g3_pending = G3Pending{true, at, g.n, slots, g.material[3], g.alpha_min, g.alpha_max, true};
         }
         if (!arrays) {
             for (std::uint32_t k = 0; k < g.n; ++k) idx[at + k] = static_cast<std::uint16_t>(first_vertex + k);
@@ -2181,9 +2499,15 @@ int draw_g3_direct(const State &st, std::uint64_t clamp, const ::g3::Input &in, 
         fill_rc = ::g3::gpu_batch_fill(in, g, plan, ring + at);
         if (fill_rc != 0) return fill_rc;
 
+        slots = g.skin ? (g.slots | 1u) : 0u;
+        if (!bones_finite(g, slots)) {
+            note_nonfinite_g3();
+            return 0;
+        }
         ++g_stat_shapes;
         ++g_stat_g3;
-        slots = g.skin ? (g.slots | 1u) : 0u;
+        ++g_shapes_since_present;
+        note_drawn();
         bool join = g_g3_pending.on;
         for (auto overlap = g_g3_pending.slots & slots; overlap && join; overlap &= overlap - 1u) {
             const unsigned s = __builtin_ctz(overlap);
@@ -2196,9 +2520,10 @@ int draw_g3_direct(const State &st, std::uint64_t clamp, const ::g3::Input &in, 
             if (at - end == 3u) ring[end + 2u] = ring[at];
             g_g3_pending.count = at + g.n - g_g3_pending.first;
             g_g3_pending.slots |= slots;
-            g_g3_pending.alpha_uniform = g_g3_pending.alpha_uniform && g.alpha_uniform && (g_g3_pending.alpha_val == g.alpha_val);
+            g_g3_pending.alpha_min = std::min(g_g3_pending.alpha_min, g.alpha_min);
+            g_g3_pending.alpha_max = std::max(g_g3_pending.alpha_max, g.alpha_max);
         } else {
-            g_g3_pending = G3Pending{true, at, g.n, slots, g.material[3], g.alpha_uniform, g.alpha_val};
+            g_g3_pending = G3Pending{true, at, g.n, slots, g.material[3], g.alpha_min, g.alpha_max};
         }
         g_ring_used = ((at + g.n) * 3u + 1u) / 2u;
         g_index_used = std::max(g_index_used, g_ring_used);
@@ -2228,6 +2553,23 @@ int draw_g3_direct(const State &st, std::uint64_t clamp, const ::g3::Input &in, 
         C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_ortho, g.ortho);
         g_g3_ortho = g.ortho;
     }
+    if (g_bool_dir >= 0 && g.has_dir_lights != g_g3_dir) {
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_dir, g.has_dir_lights);
+        g_g3_dir = g.has_dir_lights;
+    }
+    const bool need_nrm = g.has_dir_lights || g.env;
+    if (g_bool_nrm >= 0 && need_nrm != g_g3_nrm) {
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_nrm, need_nrm);
+        g_g3_nrm = need_nrm;
+    }
+    if (g_bool_env >= 0 && g.env != g_g3_env) {
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_env, g.env);
+        g_g3_env = g.env;
+    }
+    if (g_bool_fog >= 0 && g_fog_on != g_g3_fog) {
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_bool_fog, g_fog_on);
+        g_g3_fog = g_fog_on;
+    }
     if (cull != g_g3_cull) {
         C3D_CullFace(cull);
         g_g3_cull = cull;
@@ -2235,14 +2577,16 @@ int draw_g3_direct(const State &st, std::uint64_t clamp, const ::g3::Input &in, 
     if (diff_mask) {
         for (std::uint32_t m = diff_mask; m; m &= m - 1u) {
             const int i = __builtin_ctz(m);
+            const float *src = uptr[i];
             C3D_FVec &u = C3D_FVUnif[GPU_VERTEX_SHADER][g_uniform_proj + i];
-            u.x = unif[i][0]; u.y = unif[i][1]; u.z = unif[i][2]; u.w = unif[i][3];
+            u.x = src[0]; u.y = src[1]; u.z = src[2]; u.w = src[3];
             C3D_FVUnifDirty[GPU_VERTEX_SHADER][g_uniform_proj + i] = true;
             ++g_stat_unif;
-            g_unif_bits[i][0] = unif_u32[i][0]; g_unif_bits[i][1] = unif_u32[i][1];
-            g_unif_bits[i][2] = unif_u32[i][2]; g_unif_bits[i][3] = unif_u32[i][3];
+            std::memcpy(g_unif_bits[i], src, 16);
         }
         g_unif_valid = true;
+        if (check_dir) g_unif_dir_valid = true;
+        if (check_env) g_unif_env_valid = true;
     }
     for (auto remaining = slots; remaining; remaining &= remaining - 1u) {
         const unsigned s = __builtin_ctz(remaining);
@@ -2265,6 +2609,10 @@ bool draw_im2d_tris(const State &st, std::uint64_t clamp, const std::uint8_t *vu
     PS2_PROF_EXTRA(0);
     if (g_draw_nothing || (!queue::g_split_pica && queue::g_quiet) || count == 0) return true;
     if (!g_frame_open) begin_frame();
+    if (FesOverlapWordsLeft() < kCmdFlushThreshold) {
+        flush_batch();
+        if (FesOverlapWordsLeft() < kCmdFlushThreshold) flush_command_buffer();
+    }
     setup_batch(st, clamp);
     if (g_skip_batch) return true;
     if (g_fst) return false;
@@ -2302,6 +2650,7 @@ bool draw_im2d_tris(const State &st, std::uint64_t clamp, const std::uint8_t *vu
 #endif
     };
 
+    note_drawn();
     const std::uint32_t need = count * 3u;
     if (!reserve_geometry(need)) {
         if (!g_ring_warned) std::fprintf(stderr, "[pica] vertex ring full, dropping shapes\n");
@@ -2395,12 +2744,17 @@ void draw(const State &st, std::uint32_t serial, std::uint64_t clamp) {
     PS2_PROF_EXTRA(0);   // for SAMPLE=1: shapes in, x1 to x3 below are apart
     if (g_draw_nothing || (!queue::g_split_pica && queue::g_quiet)) return;
     if (!g_frame_open) begin_frame();
+    if (FesOverlapWordsLeft() < kCmdFlushThreshold) {
+        flush_batch();
+        if (FesOverlapWordsLeft() < kCmdFlushThreshold) flush_command_buffer();
+    }
     setup_batch(st, clamp);
     if (g_skip_batch) return;
     flush_g3();   // g3 batches waiting are older than this shape
     ++g_stat_shapes;
     ++g_stat_prim[st.prim & 7u];
     ++g_shapes_since_present;
+    note_drawn();
     if (!reserve_geometry(8)) {
         if (!g_ring_warned) std::fprintf(stderr, "[pica] vertex ring full, dropping shapes\n");
         g_ring_warned = true;
@@ -2461,6 +2815,11 @@ void note_transfer(const State &s, std::uint64_t dir) {
     const std::uint32_t pages = (((dy + rrh) >> ph_shift) + 1u) * wide;
     const std::uint32_t first = dbp >> 5;
     ++g_stamp;
+    if (g_key_valid && !g_skip_batch && g_key_stamp == g_stamp - 1u) {
+        if (!g_textured || (g_bound_tex_page_lo < g_bound_tex_page_hi && first + pages <= 512u &&
+                            (first >= g_bound_tex_page_hi || first + pages <= g_bound_tex_page_lo)))
+            g_key_stamp = g_stamp;
+    }
     if ((dir & 3u) == 0u) {
         // A transfer to the corner starts a new picture; later ones add to it.
         const std::uint32_t pos = static_cast<std::uint32_t>(s.trxpos >> 32);
@@ -2506,8 +2865,13 @@ bool skip_fixed_picture(std::uint32_t picture, std::uint32_t interval) {
 // skips more even when no render could be cut: the lockers ran at 70% of full speed with the GPU path, 100% drawing every 4th
 // picture. Where skipping more does not help (the game slow for its own reasons, a movie decoding), the extra skip is taken
 // back and not tried again for a while.
+//
+// The skip level is twice the pictures skipped after each one drawn, on average: 0 draws every picture (30 a second), 1 two of three
+// (20), 2 one of two (15), 3 two of five (12), 4 one of three (10), 5 two of seven (8.6) and so on.
 struct PicturePacing {
-    static constexpr std::uint32_t kPlainMaxSkip = 6, kHoldRounds = 16, kRound = 32, kProbe = 8, kFirstWait = 3, kLongestWait = 48;
+    static constexpr std::uint32_t kPlainMaxSkip = 12, kHoldRounds = 16, kRound = 32, kProbe = 8, kFirstWait = 3, kLongestWait = 48;
+    static constexpr double kPause = 5.0;
+    static constexpr std::uint32_t kSettled = 12;   // rounds a lower skip must last to count as good
     u64 start = 0;
     std::uint32_t pictures = 0, cut = 0, minimum_skip = 0, on_time = 0, hold = 0;
     std::uint32_t round = kRound;       // pictures in this round: kProbe right after the skip was lowered
@@ -2515,6 +2879,37 @@ struct PicturePacing {
     bool raised = false;       // the last round raised the skip without a render to cut
     bool probing = false;      // this round tries a lower skip
     double last_ratio = 0.0;   // that round's time against its budget
+    std::uint32_t since_lowered = kSettled;   // rounds since a lower skip was taken, up to kSettled
+    u64 half_time = 0, half_idle = 0;         // in the middle of a probe
+
+    void back_up() {   // the step down was too much
+        bad = static_cast<std::int32_t>(minimum_skip);
+        minimum_skip += lowered;
+        if (lowered < 2u) wait = std::min(wait * 2, kLongestWait);   // after two levels, the one between is worth trying soon
+        on_time = 0;
+    }
+    std::uint32_t lowered = 0;   // levels of the last step down
+    std::int32_t bad = -1;       // the level that failed last: the long wait is for trying that one again, not for those above it
+    // Two levels at a time, but not to or past the one that failed.
+    std::uint32_t step() const {
+        const auto level = static_cast<std::int32_t>(minimum_skip);
+        return level < 2 || (bad >= 0 && level > bad && level - 2 <= bad) ? 1u : 2u;
+    }
+    bool above_bad() const { return static_cast<std::int32_t>(minimum_skip) - static_cast<std::int32_t>(step()) > bad; }
+
+    // The lower skip taken a moment ago turned out to be too low: back to the one before it, and a longer wait before it is tried
+    // again. The drawing queue holds several pictures, so a skip that is too low can look right for a second. Without this the
+    // skip then ran up by one for each picture that found the queue still full, and took 10 to 15 s to come back down.
+    bool too_low() {
+        if (since_lowered >= kSettled) return false;
+        since_lowered = kSettled;
+        back_up();
+        raised = probing = false;
+        start = 0;   // a new round: the time just lost says nothing about the skip gone back to
+        pictures = cut = 0;
+        round = kRound;
+        return true;
+    }
 
     void next_round(u64 now, double ratio, std::uint32_t pictures_next = kRound) {
         if (g_debug & 1024u)
@@ -2534,7 +2929,13 @@ struct PicturePacing {
             return;
         }
         cut += could_cut;
-        if (++pictures < round) return;
+        if (++pictures < round) {
+            if (probing && pictures == round / 2u) {
+                half_time = now;
+                half_idle = g_idle_total;
+            }
+            return;
+        }
         constexpr u64 frame_ticks = static_cast<u64>(SYSCLOCK_ARM11) * 1001 / 60000;
         const u64 budget = frame_ticks * vblanks * pictures;
         const double ratio = static_cast<double>(now - start) / static_cast<double>(budget);
@@ -2542,28 +2943,45 @@ struct PicturePacing {
             // A lower skip is tried for a short round. If the game falls behind with it, it goes straight back, and the next try
             // waits twice as long: tried every few seconds, each failed try was a second of slow game and slow sound.
             probing = false;
-            if (ratio > 1.06) {   // a short round: one vblank late is 6% already
-                ++minimum_skip;
-                wait = std::min(wait * 2, kLongestWait);
+            // A drawing thread with nothing left over is only on time because the queue still has room.
+            const bool full = (g_idle_total - half_idle) * 32u < now - half_time;
+            if (ratio > 1.06 || full) {   // a short round: one vblank late is 6% already
+                back_up();
             } else {
-                wait = std::max(wait / 2, kFirstWait);
+                since_lowered = 0;
             }
             raised = false;
             on_time = 0;
             return next_round(now, ratio);
         }
-        if (raised && !cut && ratio > last_ratio * 0.97) {   // skipping more did not help: take it back, wait before trying again
-            if (minimum_skip) --minimum_skip;
+        if (ratio > kPause) {   // the console was asleep or at the HOME Menu, or the game loaded: says nothing about pictures
+            raised = false;
+            return next_round(now, 1.0);
+        }
+        if (since_lowered < kSettled && ++since_lowered == kSettled) {
+            wait = std::max(wait / 2, kFirstWait);
+            if (static_cast<std::int32_t>(minimum_skip) <= bad) bad = -1;
+        }
+        if (ratio > 1.025 && too_low()) {
+            next_round(now, ratio);
+            start = 0;
+            return;
+        }
+        if (raised && !cut && ratio > last_ratio * 0.985) {   // skipping more did not help: take it back, wait before trying again
+            minimum_skip -= std::min<std::uint32_t>(minimum_skip, 2u);
             hold = kHoldRounds;
             on_time = 0;
         } else if (ratio > 1.025 && (cut || !hold)) {
             const std::uint32_t before = minimum_skip;
-            minimum_skip = std::min<std::uint32_t>(cut ? 8u : std::max(kPlainMaxSkip, minimum_skip), g_skip_run + 1u);
+            // A little late: one more than before. The run itself may stand higher for a moment, while the queue empties.
+            const std::uint32_t more = ratio > 1.25 ? 4u : 2u;
+            minimum_skip = std::min<std::uint32_t>(cut ? 16u : std::max(kPlainMaxSkip, minimum_skip), ratio > 1.06 ? g_skip_run + more : minimum_skip + (cut ? 1u : 2u));
             raised = !cut && minimum_skip > before;
             on_time = 0;
             return next_round(now, ratio);
-        } else if (ratio <= 1.025 && minimum_skip && ++on_time >= wait) {
-            --minimum_skip;
+        } else if (ratio <= 1.025 && minimum_skip && ++on_time >= (above_bad() ? 1u : wait)) {
+            lowered = step();
+            minimum_skip -= lowered;
             on_time = 0;
             probing = true;
             raised = false;
@@ -2576,6 +2994,7 @@ struct PicturePacing {
 
 void choose_next_picture() {
     static PicturePacing pacing;
+    static std::uint32_t raised_at = 0;
     ++g_picture;
     bool skip = false;
     if (g_draw_every) pacing = {};
@@ -2586,9 +3005,16 @@ void choose_next_picture() {
         pacing.observe(now, g_present_every, g_render_left_out);
         if (g_skipped_in_row >= g_skip_now) {
             const u64 round = now - g_round_start, tick_share = round / 16;
-            if (g_round_blocked > tick_share && g_skip_run < 5) ++g_skip_run;
-            else if (g_skip_run && (g_round_idle > tick_share * 8 || g_skip_run > 5)) --g_skip_run;
+            // A full queue takes a few pictures to empty once more of them are skipped, so after a raise the next waits for that,
+            // unless the game does little but wait.
+            if (g_round_blocked > tick_share && g_skip_run < 10) {
+                if (g_picture - raised_at >= 12u || g_round_blocked > round / 2) {
+                    if (!pacing.too_low()) g_skip_run += g_round_blocked > round / 4 ? 2u : 1u;
+                    raised_at = g_picture;
+                }
+            } else if (g_skip_run && (g_round_idle > tick_share * 8 || g_skip_run > 10)) --g_skip_run;
             g_skip_run = std::max(g_skip_run, pacing.minimum_skip);
+            if (pacing.probing && g_skip_run <= pacing.minimum_skip + pacing.lowered) g_skip_run = pacing.minimum_skip;   // or nothing is tried
             g_round_start = now;
             g_round_blocked = g_round_idle = 0;
             g_skipped_in_row = 0;
@@ -2596,7 +3022,10 @@ void choose_next_picture() {
             // pictures every time would draw only into one buffer, and the other's old contents would show through as noise. So
             // an odd run alternates one less and one more, which averages the same and draws into each buffer in turn.
             g_skip_longer = !g_skip_longer;
-            g_skip_now = g_skip_run & 1u ? g_skip_run + (g_skip_longer ? 1u : 0u) - (g_skip_longer ? 0u : 1u) : g_skip_run;
+            // Between two runs the level alternates them: 0 and 1 (draw, draw, skip), 1 and 2, 2 and 3, which come round to both too.
+            const std::uint32_t run = g_skip_run / 2u;
+            if (g_skip_run & 1u) g_skip_now = run + (g_skip_longer ? 1u : 0u);
+            else g_skip_now = run & 1u ? run + (g_skip_longer ? 1u : 0u) - (g_skip_longer ? 0u : 1u) : run;
         } else {
             skip = true;
         }
@@ -2632,6 +3061,7 @@ std::uint32_t next_picture() {
     const auto idle = g_ticks[Wait].load(std::memory_order_relaxed);
     g_round_blocked += blocked - g_seen_blocked;
     g_round_idle += idle - g_seen_idle;
+    g_idle_total += idle - g_seen_idle;
     g_seen_blocked = blocked;
     g_seen_idle = idle;
     choose_next_picture();
@@ -2661,6 +3091,8 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r) {
     FES_AT(20);
     const int circuit = (r.pmode & 2u) ? 1 : (r.pmode & 1u) ? 0 : -1;
     flush_batch();
+    if (FesOverlapWordsLeft() < 4096u) flush_command_buffer();
+    g_in_show_picture = true;
     if (g_overlap_picture && movie::overlap_needs_wait()) { FES_AT(22); FesOverlapWait(); }
     if (const movie::Picture ours = movie::picture(free_oldest); ours.playing) {
         // One of the build's own movie pictures instead of the game's black one. Until the first is ready, what was up stays up.
@@ -2672,13 +3104,31 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r) {
         const std::uint32_t fbp = static_cast<std::uint32_t>(r.dispfb[circuit]) & 0x1FFu;
         for (Target &t : g_targets)
             if (t.used && t.fbp == fbp) {
+                t.displayed = true;
                 // Many scenes swap between two frame buffers, drawing into the one not on show. Drawing one picture in two or four
                 // would then always land on the same buffer, and the one on show would never change. So when pictures are
                 // being skipped, a buffer of the same size that was just drawn goes on show instead.
                 Target *show = &t;
-                if (g_skipping && t.last_used != g_frame)
-                    for (Target &o : g_targets)
-                        if (o.used && o.last_used == g_frame && o.width == t.width && o.tex.height == t.tex.height) show = &o;
+                if (g_skipping && t.last_used != g_frame) {
+                    Target *best_scene = nullptr, *best_disp = nullptr, *best_any = nullptr;
+                    for (Target &o : g_targets) {
+                        if (!o.used || o.last_used != g_frame || o.width != t.width || o.tex.height != t.tex.height) continue;
+                        if (o.displayed && o.last_scene == g_frame) best_scene = &o;
+                        else if (o.displayed && !best_disp) best_disp = &o;
+                        else if (!best_any && o.last_scene == g_frame) best_any = &o;
+                    }
+                    if (best_scene) show = best_scene;
+                    else if (best_disp) show = best_disp;
+                    else if (best_any) show = best_any;
+                }
+                if (g_skipping && show->last_scene != g_frame) {
+                    for (Target &o : g_targets) {
+                        if (o.used && o.displayed && o.last_scene == g_frame && o.width == t.width && o.tex.height == t.tex.height) {
+                            show = &o;
+                            break;
+                        }
+                    }
+                }
                 show_target(show, r, circuit);
                 break;
             }
@@ -2717,11 +3167,11 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r) {
         std::fprintf(stderr, "[pica] vif %lu (with vu) dma %lu events %lu (with iop, present) kernel %lu present %lu | vu thread idle %lu, ee thread blocked %lu\n", ms(ticks[Vif]), ms(ticks[Dma]), ms(ticks[Events]), ms(ticks[Kernel]), ms(ticks[Present]), ms(ticks[Wait]), ms(ticks[Full]));
         last_clock = clock;
         last_idle = idled;
-        std::fprintf(stderr, "[pica] frame %llu: %lu ms: game %lu vu %lu (gif %lu of it, interpreted calls %lu) upload %lu draw %lu iop %lu (spu %lu) ipu %lu | %lu shapes %lu draws %lu changes %lu splits %lu decoded %lu texels %lu reused %lu missing %lu verts, %lu KB free\n",
+        std::fprintf(stderr, "[pica] frame %llu: %lu ms: game %lu vu %lu (gif %lu of it, interpreted calls %lu) upload %lu draw %lu iop %lu (spu %lu) ipu %lu | %lu shapes %lu draws %lu changes %lu splits %lu decoded %lu texels %lu reused %lu missing %lu verts, %lu KB free, %lu old targets passed over\n",
                      static_cast<unsigned long long>(frame), ms(total), ms(total > known ? total - known : 0), ms(ticks[Vu]), ms(ticks[Gif]), static_cast<unsigned long>(interpreted - last_interpreted), ms(ticks[Upload]), ms(ticks[Draw]), ms(ticks[Iop]),
                      ms(ticks[Spu]), ms(ticks[Ipu]), static_cast<unsigned long>(g_stat_shapes), static_cast<unsigned long>(g_stat_draws), static_cast<unsigned long>(g_stat_state),
                      static_cast<unsigned long>(g_stat_splits), static_cast<unsigned long>(g_stat_decoded), static_cast<unsigned long>(g_stat_decode_texels), static_cast<unsigned long>(g_stat_reused), static_cast<unsigned long>(g_stat_missing),
-                     static_cast<unsigned long>(g_ring_used), static_cast<unsigned long>(linearSpaceFree() >> 10));
+                     static_cast<unsigned long>(g_ring_used), static_cast<unsigned long>(linearSpaceFree() >> 10), static_cast<unsigned long>(g_stat_old_target));
         if (g_stat_g3 || g_stat_g3_declined)
             std::fprintf(stderr, "[pica] g3 on the GPU %lu, handed back %lu, uniform vectors sent %lu; command words left %lu\n",
                          static_cast<unsigned long>(g_stat_g3), static_cast<unsigned long>(g_stat_g3_declined), static_cast<unsigned long>(g_stat_unif),
@@ -2735,13 +3185,14 @@ void show_picture(std::uint32_t frame, const DisplayRegs &r) {
     g_stat_g3 = g_stat_g3_declined = g_stat_unif = 0;
     g_words_setup = g_words_flush = g_words_bind = g_words_draw = 0;
     g_batch_number = 0;
-    g_stat_reused = g_stat_missing = 0;
+    g_stat_reused = g_stat_missing = g_stat_old_target = 0;
     g_stat_shapes = g_stat_draws = g_stat_state = g_stat_splits = g_stat_decoded = g_stat_decode_texels = 0;
     g_stat_decode_ticks = 0;
     g_shapes_since_present = 0;
     std::memset(g_stat_prim, 0, sizeof g_stat_prim);
     g_stat_upload = 0;
     // GX flushes the finalized command list. Textures and vertex data have already been flushed.
+    g_in_show_picture = false;
     FES_AT(28); FesOverlapEnd(GX_CMDLIST_FLUSH); FES_AT(29);
     g_frame_open = false;
     if ((g_debug & 32u) && (g_frame % 15) == 0) {

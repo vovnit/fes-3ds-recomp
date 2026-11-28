@@ -124,7 +124,9 @@ How it works (`wide.cpp`, and `ios_main.mm` for the field of view):
 MENU > Resolution draws the game at 1x to 4x the PS2's 640x448 (the default is 2x, 1280x896). The list marks the scale
 that matches the screen: 3x on an iPhone (1206 lines), 4x on an iPad Pro 11" (1668 lines). It takes effect the next time
 the app starts, because the GPU renderer sets up its memory for one scale when the game starts. MENU > Show speed puts the
-frames a second and the scale in the top left corner.
+frames a second and the scale in the top left corner. On a device it also shows how busy the GPU was over that second
+("GPU 85%": near 100% the GPU is the limit), and "warm", "hot" or "too hot" when iOS reports the phone heating up (it then
+slows the GPU). The Simulator has no GPU timing, so there it shows only the frame rate. `log.txt` gets the same every 5 s.
 
 The renderer imitates the PS2's GPU exactly, and its work grows with the square of the scale. In the Simulator on an M1 Pro
 (14 GPU cores), lockers scene: 60 fps at 1x and 2x, 47 at 3x, 29 at 4x (42 and 26 before `flip.cpp`), limited by the GPU

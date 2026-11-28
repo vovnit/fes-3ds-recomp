@@ -112,33 +112,75 @@ int stretch_step(std::int16_t *dst, std::uint64_t w, std::size_t active) {
     float want = share >= 1.0 ? 1.0f : std::max(kMinTempo, kMinTempo + (1.0f - kMinTempo) * static_cast<float>(share));
     if (ahead > 2.0 * kTargetAhead) want = 1.02f;
     g_tempo += (want - g_tempo) * 0.15f;
+    const bool at_full_speed = (want == 1.0f && std::fabs(g_tempo - 1.0f) < 0.005f);
+    if (at_full_speed) g_tempo = 1.0f;
+
+    // Fast path at 100% speed once aligned: copy straight through without WSOLA search or cross-fade.
+    const std::int64_t base = static_cast<std::int64_t>(g_nominal);
+    if (at_full_speed && base == static_cast<std::int64_t>(ref)) {
+        const std::size_t start = static_cast<std::size_t>(ref & kRingMask);
+        const std::size_t first = std::min(kHop, kRingFrames - start);
+        std::memcpy(dst, &g_ring[start * 2], first * 4);
+        if (first < kHop) std::memcpy(dst + first * 2, g_ring, (kHop - first) * 4);
+        g_prev = ref;
+        g_nominal = static_cast<double>(ref + kHop);
+        const std::uint64_t lowest = (ref + kHop > kSeek) ? (ref + kHop - kSeek) : 0;
+        g_read.store(lowest, std::memory_order_relaxed);
+        g_tempo_sum += g_tempo;
+        g_tempo_min = std::min(g_tempo_min, g_tempo);
+        ++g_steps;
+        return 1;
+    }
 
     // The window start within +-kSeek of the nominal one that best continues ref (normalised cross-correlation of the
-    // mono sums, every 2nd offset and every 4th frame).
-    const std::int64_t base = static_cast<std::int64_t>(g_nominal);
-    std::int64_t best = base;
-    float best_score = -1e30f;
-    for (std::int64_t d = -static_cast<std::int64_t>(kSeek); d <= static_cast<std::int64_t>(kSeek); d += 2) {
-        const std::uint64_t c = static_cast<std::uint64_t>(base + d);
-        std::int64_t xy = 0, yy = 0;
-        for (std::size_t i = 0; i < kHop; i += 4) {
-            const std::int64_t x = at(ref + i, 0) + at(ref + i, 1), y = at(c + i, 0) + at(c + i, 1);
+    // mono sums, pre-extracted into contiguous buffers with coarse-to-fine search).
+    constexpr std::size_t kRefLen = kHop / 4;
+    constexpr std::size_t kCandLen = kHop + 2 * kSeek;
+    static std::int16_t ref_m[kRefLen];
+    static std::int16_t cand_m[kCandLen];
+    for (std::size_t k = 0; k < kRefLen; ++k)
+        ref_m[k] = static_cast<std::int16_t>((at(ref + k * 4, 0) + at(ref + k * 4, 1)) >> 5);
+    const std::uint64_t cand_base = static_cast<std::uint64_t>(base - static_cast<std::int64_t>(kSeek));
+    for (std::size_t j = 0; j < kCandLen; ++j)
+        cand_m[j] = static_cast<std::int16_t>((at(cand_base + j, 0) + at(cand_base + j, 1)) >> 5);
+
+    auto score_at = [&](std::size_t idx) -> float {
+        const std::int16_t *cp = cand_m + idx;
+        std::int32_t xy = 0, yy = 0;
+        for (std::size_t k = 0; k < kRefLen; ++k) {
+            const std::int32_t x = ref_m[k], y = cp[k * 4];
             xy += x * y;
             yy += y * y;
         }
-        const float score = static_cast<float>(xy) / std::sqrt(static_cast<float>(yy) + 1.0f);
+        return static_cast<float>(xy) / std::sqrt(static_cast<float>(yy) + 1.0f);
+    };
+
+    std::size_t best_idx = kSeek;
+    float best_score = -1e30f;
+    for (std::size_t idx = 0; idx <= 2 * kSeek; idx += 8) {
+        const float score = score_at(idx);
         if (score > best_score) {
             best_score = score;
-            best = base + d;
+            best_idx = idx;
         }
     }
-    const std::uint64_t pos = static_cast<std::uint64_t>(best);
+    const std::size_t lo = best_idx > 6 ? best_idx - 6 : 0;
+    const std::size_t hi = std::min<std::size_t>(2 * kSeek, best_idx + 6);
+    for (std::size_t idx = lo; idx <= hi; idx += 2) {
+        if ((idx & 7u) == 0u) continue;
+        const float score = score_at(idx);
+        if (score > best_score) {
+            best_score = score;
+            best_idx = idx;
+        }
+    }
+    const std::uint64_t pos = cand_base + best_idx;
     for (std::size_t i = 0; i < kHop; ++i) {
         dst[i * 2] = mix(at(ref + i, 0), at(pos + i, 0), g_fade[i]);
         dst[i * 2 + 1] = mix(at(ref + i, 1), at(pos + i, 1), g_fade[i]);
     }
     g_prev = pos;
-    g_nominal += static_cast<double>(g_tempo) * kHop;
+    g_nominal = at_full_speed ? static_cast<double>(pos + kHop) : (g_nominal + static_cast<double>(g_tempo) * kHop);
     const double lowest = g_nominal - static_cast<double>(kSeek);
     g_read.store(std::min<std::uint64_t>(pos + kHop, static_cast<std::uint64_t>(lowest)), std::memory_order_relaxed);
     g_tempo_sum += g_tempo;

@@ -115,7 +115,7 @@ How it runs: the game runs on one core and the I/O processor on core 1, which th
 
 On a New 3DS, `splitgs 1` runs the renderer on core 0 at a lower priority than the game. `splitgs 2` shares core 1 with the I/O processor. This lets core 2 run the next vector program while the renderer consumes the previous one's graphics packets. Both modes support automatic and fixed picture skipping. The VU and renderer apply the skip decision when each reaches the picture boundary in its queue. The split worker uses a 1.5 MiB queue and a 512 KiB stack. The renderer stays on the VU core by default, with software rendering, or when the VU cannot run on core 2. Change `splitgs` and restart to switch modes.
 
-Automatic picture skipping uses queue waits and the game clock. It checks elapsed time every 32 pictures. When skipped pictures save game-thread work and the game is still behind, it can draw as little as one picture in nine. It tries drawing more again when timing recovers. Their register changes and absolute uploads still happen, and only vector programs that have run before are left out, so the next picture finds the same state. Uploads to the double buffer are left out too, because only those left-out programs would read them, and the game thread filters them before they reach the queue. That rests on that data being used once: lobby pictures still match with it on, but the first battle has only been checked by a few shots, and other scenes not at all. A program not seen before still runs in a skipped picture, with drawing turned off. Many scenes swap between two frame buffers, and a fixed skip would always draw into the same one, leaving the one on show frozen, so while skipping, the buffer just drawn is shown instead. Some scenes also blend the last picture into the next, so an odd run of skipped pictures alternates one fewer and one more: that averages the same and draws into each buffer in turn. Without it the stale buffer showed through as noise. `draw N` in `args.txt` sets a fixed rate, and `draw 1` draws everything.
+Automatic picture skipping uses queue waits and the game clock. It checks elapsed time every 32 pictures. The first step draws two of three pictures, the next one of two, then one of three and so on. When skipped pictures save game-thread work and the game is still behind, it can draw as little as one picture in nine. It tries drawing more again when timing recovers. Their register changes and absolute uploads still happen, and only vector programs that have run before are left out, so the next picture finds the same state. Uploads to the double buffer are left out too, because only those left-out programs would read them, and the game thread filters them before they reach the queue. That rests on that data being used once: lobby pictures still match with it on, but the first battle has only been checked by a few shots, and other scenes not at all. A program not seen before still runs in a skipped picture, with drawing turned off. Many scenes swap between two frame buffers, and a fixed skip would always draw into the same one, leaving the one on show frozen, so while skipping, the buffer just drawn is shown instead. Some scenes also blend the last picture into the next, so an odd run of skipped pictures alternates one fewer and one more: that averages the same and draws into each buffer in turn. Without it the stale buffer showed through as noise. `draw N` in `args.txt` sets a fixed rate, and `draw 1` draws everything.
 
 The skip also goes up when the game falls behind its vblank budget for reasons other than drawing (up to one picture in seven). If drawing fewer pictures did not bring the time per round down by 3%, the skip goes back and stays for 16 rounds. A lower skip is tried in a short round of 8 pictures and taken back at once if those ran more than 6% late; each failed try doubles the on-time rounds before the next one (3 up to 48), each good one halves them. Before this the skip was lowered after every 3 rounds on time, and in the lobby walk the game then fell behind for a whole round about every 4.5 seconds (30-frame windows of 535 to 690 ms, sound tempo down to 66%); now the same walk holds 500 ms with the highest window 540, and shows 13 to 15 pictures a second instead of 7 to 11. `debug 1024` logs each decision as a `[pace]` line. On the console (2026-11-22) this took the lockers from 70% of full speed at about 13 pictures a second to 99 to 100% at about 11; the lobby (6.4 pictures a second) and the battle (18 to 20) stayed at full speed.
 
@@ -507,6 +507,290 @@ Drawing each batch on its own costs little: skinned batches joined by index gave
 When the game stops advancing, the heartbeat adds a `[3ds] stalled:` line: where the drawing thread is (`g_fes_trace` markers in `pica.cpp` and `gpuoverlap.cpp`; 40 is `FesOverlapWait`, 60 the display-queue wait in `gxCmdQueueWait`), the lid, the 3D slider, and the display queue's GX commands with how many are sent and done.
 
 Memory: about 660 KB of the 124 MB application region is left uncommitted.
+
+### Remembered DMA chains and native bone loops (2026-11-24)
+Found with the sampling profile of 2026-11-18 and checked on the console with the same saved states, stereo off. Every run had 0 sound underruns and no stalls.
+
+| Scene | ms per 30 vblanks before | after | change |
+| --- | --- | --- | --- |
+| Lobby, every picture drawn (`draw 1`) | 934 (16.1 pictures/s) | 832 (18.0) | -11% |
+| Lockers, every picture drawn | 640 (23.4) | 605 (24.8) | -5% |
+| Battle, `uncapped 1` | 489 (30.6) | 469 (31.9) | -4% |
+| Lobby, `draw 3;uncapped 1` | 527 | 474 | -10% |
+| Lockers, `draw 3;uncapped 1` | 421 | 395 | -6% |
+
+Default settings (automatic skipping), pictures a second, with the share of full speed and the mean ms per 30 vblanks:
+
+| Scene | Before | After |
+| --- | --- | --- |
+| Lobby | 7.85 (99.5%, 504.6) | 10.46 (98.7%, 505.7) |
+| Lobby walk | 14.5 (99.6%, 505.9) | 16.97 (98.7%, 508.4) |
+| Lockers | 16.8 (96.2%, 517.5) | 15.87 (99.0%, 506.4) |
+| Battle | 30.0 (100%) | 30.0 (100%) |
+| Cold boot, 60 s | 25.5 (96.2%, 545.4) | 25.5 (96.0%, 546.2) |
+
+What was kept:
+- **Remembered DMA chains** (`memo_play`, `memo_begin` and so on in `vif.cpp`, `CHAIN_MEMO_EDITS` in the patch tool). A chain that calls only unchanging data is walked once, and its blocks and the registers it leaves are kept (2048 entries, 4 ways). Later uses send the kept blocks. It works for skipped pictures too.
+- **Larger record store** (`kRecordWords` 131072, was 65536). The lobby filled the old one about once a second, and each time every replay was dropped and the VU thread flushed.
+- **Native bone loops.** `loop_look_bones` (0x00311A54) is a new native. The matrix native also takes the game's scaling keyframe callback (0x00312C70), which the lockers use and which used to make it decline.
+
+What was tried and dropped, as ms per 30 vblanks:
+- Prefetch in the mesh loop: lobby 879, battle 477. No gain.
+- Starting the VU queue again in warm cache when the VU thread had caught up: lobby 862 at `draw 1` and 484 at `draw 3`. No gain.
+- The game side's `memcpy` with more `pld`: much worse (lobby `draw 3` 500, battle 496). With none: 481 and 472. With `pld` 160 bytes ahead: 477 and 471. The original stays.
+
+Checks: in Azahar, lobby, battle, lockers, walk, level-up, movie and two cutscene states gave the same pictures as the build before at `draw 3`, and a cold boot matched in 76 of 76. On the console, 6.7 minutes of scripted running and talking in the school lobby and hallway ran at 99.5% with 0 underruns, and the screenshots looked right. The first try of that run had pauses of about 6 s, always at a screenshot (`shots 1200` with about 260 pictures already on the card); without `shots` there were none.
+
+Not checked: Tartarus, shops, menus and play of an hour or more. If a chain changes only in one of its middle blocks, that is noticed only after several uses (at worst 96 to 223). The bone natives are not cycle-exact, like the other natives.
+
+What limits it now: at `draw 1` in the lobby the VU thread is 0-1% idle, so both cores are busy. With skipping, the game thread is the limit. Its largest parts are copying about 500 KB per picture of per-mesh data into the VU queue (5.9%), SPR to RAM copies (3.2%), the mesh loop at 0049F5D0 (about 10%, memory-bound) and the scripts under 00194024 (8%).
+
+### Crash and visual fixes, upload shifts, and new natives (2026-11-25)
+
+Fixes landed and checked in Azahar (bit-exact EE cycle counts across `lobby`, `battle2`, `lockers`, `c21`, plus 360-frame cold boot) and on the New 3DS (`slot2.state` faculty office plus standard saved states, 0 crashes, 0 missing/stale textures, 0 audio underruns):
+
+- **Start-of-year speech crash (`crash_dump_00000021.dmp` and `13..15`):** Decoded as ARM11 Core 2 `svcBreak` inside `GPUCMD_Add` (`pica::draw_im2d_tris -> flush_batch`) overflowing the 1 MiB `command_memory` (`0x3FF06 > 0x3FF04`). `C3D_GetCmdBufUsage()` only reported the previous frame's usage, `C3D_FrameSplit` did not reclaim buffer space, and `g3cache` (`g_index = 0`) spent ~150 command words per batch (2× in stereo; even the faculty office uses ~85K words/pic in stereo). Added `FesOverlapFlushMidFrame()` in `gpuoverlap.cpp` and `flush_command_buffer()` in `pica.cpp` to submit, wait, and rewind the command buffer whenever live `FesOverlapWordsLeft() < 16384` (or GX queue ≥ 28 entries), guarding all draw paths.
+- **School corridor black flashes:** `show_picture()` under `g_skipping` previously picked the last same-size `Target` touched in `g_frame` (which could be a dark scratch target or a `RwCameraClear`-only buffer after `lossy_return`), and `draw_g3`/`draw_g3_direct` did not increment `g_shapes_since_present`. Added `Target::displayed` and `Target::last_scene` so `show_picture()` prefers displayed swapchain targets that actually received 3D draws.
+- **Faculty office disappearing floor:** Fixed `CHAIN_MEMO`'s `u.mask ^= 0x5EA5A000u` corruption (replaced with `g_memo_mask_wrote`), fixed non-fog `end.clipper` `cull` fallback in `g3model.cpp` (`kGpuNotModelled` instead of silent `-1` drop), added behind-camera `cw <= 0` decline in `clipper_test_direct`/`indirect` (where `gs.v.pica`'s stereo `max(eye.z * r1.w, r0.z)` flips sign for `r1.w < 0`), and added a throttled `[pica] missing texture` log in `apply_state()`.
+- **Telemetry and heap headroom:** Fixed `remote3ds.cpp` `PING` `heap_kb` to report `(envGetHeapSize() - mallinfo().uordblks) >> 10` instead of fragmented `fordblks` (live console now reports ~6.1 MB free heap instead of 137 KB). Reclaimed ~1.5 MB across `iop3ds.cpp` (`kStack` 1 MiB → 128 KiB), `g3cache.cpp` (`kSets` 4096 → 2048), and `CHAIN_MEMO`.
+- **Upload shifts and Core 0/2 fast paths:** A 137.7 s console `samples.txt` showed `upload` (`gs.cpp:feed_image` / `rect_blocks` ARM11 software divides) was 22.3% of Core 2 busy time. Rewrote `rect_blocks()` with power-of-2 shifts/masks + whole-page fast path (`UPLOAD_FAST_EDITS` in `ps2run_3ds_patch.py`; 0 `__aeabi_uidiv` calls in `objdump`, 20,000/20,000 exact match) and fixed the `0x80000000u` hash-sentinel bug in `gif.cpp:139`. Added `bone_nonfinite` bitmask, lazy `BoneCache::hash_dirty`, fused `diff_and_check_uniforms()`, `g_target_fbp_bloom`, and non-overlapping `note_transfer` skip. Upgraded `0049F7AC` to `rw_mesh_loop` (single-walk `prepare`/`emit`, covers 1-mesh/final meshes, fixed pre-existing `cache_at == first_e` LRU head self-loop) and added 8 exact ARM11 natives (`004B7240` `rt_anim_add_time` 4.16% live, `00104534` `loop_dbprt_grid`, `004C9DF0` `rw_camera_frustum_test_sphere`, `004A05D0` `rw_prim_transtype_setup`, `004ECAC0` `rw_im3d_triangle`, `004D7F60` `rp_sky_render_state_set`, `004FA8B8` `memclr`, `00524388` `strlen`).
+- **Related projects note:** `C-GBL/P3FES-Decompilation` (all 14,500 functions decompiled + analysis docs) revealed that `snaku`'s "palette quantising 3.3%" label is a misnomer for RenderWare's `_rwDMA*`/`_rwSky*` routines (`0x004D4A60..0x004D84C0`), and confirmed RW double-buffers dynamic packets in two 1.25 MiB DMA half-buffers (`0x9B0A00` / `0xAEFE00`) swapped at `_rwDMAForceBufferSwap` (`0x004D4DF0`).
+
+Console benchmark on 2026-11-25 (median ms per 30 vblanks, stereo off except `slot2.state`, 0 underruns, 0 missing/stale):
+
+| Scene | 2026-11-24 | 2026-11-25 | Note |
+| --- | --- | --- | --- |
+| Faculty office (`slot2.state`, default + `stats 1`) | — | 500.0 (100%, 7–11.5 pics/s) | 6,151 KB free heap, 173K cmd words left in stereo |
+| Lobby `draw 1` | 832 (18.0 pics/s) | 884 (17.0 pics/s) | Regressed +52 ms: 6,512 `clipper depth` (`cw <= 0`) declines to CPU VU1 + halved `CHAIN_MEMO` |
+| Lockers `draw 1` | 605 (24.8 pics/s) | 618 (24.3 pics/s) | Regressed +13 ms: 9,876 `clipper depth` declines (6.6% of generic batches) |
+| Lobby `draw 3;uncapped 1` | 474 | 482.5 | Regressed +8.5 ms: `CHAIN_MEMO` shrunk `2048 -> 1024` / `16384 -> 8192` + 3× tighter re-hash (`32..63`) |
+| Lobby auto-skip | 10.46 pics/s (98.7%, 505.7 mean) | 9.9–10.3 pics/s (100%, 501.0 med / 509.1 mean) | 0 underruns, 100% clock |
+| Battle `draw 1;uncapped 1` | 469 (31.9 pics/s) | 474 (31.7 pics/s) | 7,322 `clipper depth` declines; still >104% full speed |
+
+The regressions in this table are fixed, see the next section.
+
+### Regressions recovered, joined draws, and the "next steps" list (2026-11-25, later)
+
+Console, median ms per 30 vblanks, 45 s per run, 0 stalls, 0 missing textures and 0 sound underruns in every "after" run:
+
+| Scene | before | after |
+| --- | --- | --- |
+| Lobby `draw 1;stereo 0` | 886 | 837 |
+| Lockers `draw 1;stereo 0` | 613 | 601 |
+| Battle `draw 1;uncapped 1;stereo 0` | 476 | 464 |
+| Lobby `draw 3;uncapped 1;stereo 0` | 481 | 474 |
+| Lobby `draw 1`, 3D slider up | 1601 (9.3 pictures/s)* | 1026 (14.7) |
+| Lockers `draw 1`, 3D slider up | 774* | 769 |
+| Battle `draw 1;uncapped 1`, 3D slider up | 699* | 680 |
+| Lobby, default settings, 3D slider up | 7.8 pictures/s | 8.9 pictures/s |
+
+Rows with * were measured with everything here except the joined draws, so there "after" shows that change alone. At default settings the other scenes did not move: lobby with `stereo 0` 9.9 to 10.2 pictures/s, lockers 15 and 14.9, battle 8.4 and 8.4, office 9.3 and 9.0 (all in stereo except the first).
+
+What was done:
+- **Vertices behind the camera** go to the GPU again when the picture is not in stereo (`g_behind_on_gpu`); the clipper test then stops at the first vertex that rules a cull out. In stereo they still go to the program's own clipper: the shader limits each vertex's shift near the camera, and from a far vertex to one behind the camera that is not a straight line, so no formula per vertex in `gs.v.pica` gives the right shift between them.
+- **`CHAIN_MEMO` sizes** are back to 2048 / 16384. The re-hash interval stays at 32 to 63 uses: 96 to 223 gave 836 / 598 / 460 / 471.5 against 837 / 601 / 464 / 474 (lobby, lockers, battle, lobby `draw 3`), 1% at most, and notices a changed model later.
+- **Joined draws without indices.** Every entry of the vertex cache now has a copy of its first vertex before it and of its last after it (two if its count is odd), so entries that follow each other in the arena are one strip, and `draw_g3_direct` draws them with one `C3D_DrawArrays`. Lobby 1054 to 356 draws, battle 444 to 155, faculty office 557 to 238. Pictures are identical in Azahar (lobby, walk, battle, lockers, level-up, cold boot, c21). No console hang in the runs above, the office walk, a cold boot (100%, 30 pictures/s), and 10 minutes of dialogue in stereo from `slot2.state` through the start-of-year speech scene, the classroom and the dorm (97 to 100% of full speed, 2,835 pictures with 0 missing and 0 command-list splits, at least 154K command words left). `slot2.state` with `stereo 0` shows the office floor too.
+- **Light setup kept** between batches with the same lights (`light_words` in `g3model.hpp`). Not timed on its own.
+
+Tried and dropped, or not worth doing, with the reason:
+- **Sending RenderWare's DMA half-buffers by address.** Done without a fence, as the best case: lobby 835 against 839, lockers 598 against 601, and 10 missing textures in the lobby. A fence could only make it slower.
+- **Native ports of 00313490, 003B38F0, 001D4610 and the DMA helpers.** A sampling build that counted the natives apart shows 00313490 itself at 0.4% of the game thread (its 5% is `rt_anim_add_time` 3.6% and `hanim_update_matrices` 0.7%, native already), 003B38F0 0.9% in the lobby and 1.6% in the office, 001D4610 0.6% in the office, 004D84C0 1.4%. 00311730 is 3.1% outside its native loop. That is the only one left with something in it.
+- **Compiled memo replay on core 2.** With default settings the VU thread is idle 50% of the time in the lobby, 67% in the battle and 32% in the lockers, so faster replay shows nowhere. With `draw 1` in stereo the battle waits for the GPU (`present` 43%).
+- **`eerecomp --seen`** for memory was not needed: about 5.9 MB of heap is free.
+
+### Lobby speed: the wait for the I/O processor (2026-11-25, evening)
+
+**What cost time.** A sampling build that also notes the game's return address put 5.5% of the lobby's game thread (`draw 1`; 8.2% at `draw 3;uncapped 1`) under return address 0x005073F4, `WaitSema` in `sceSifCallRpc`: the game waiting for an I/O processor reply. About once in five vblanks the game sends a request right after a vblank, when the I/O processor still has most of a vblank of its own work (3.2 million cycles on average) to catch up on, and the runtime waited until the two clocks were level. That was 4 to 17 ms each time and 28 to 42 ms per 30 vblanks, nearly all of the 42 ms known before. Taking the wait out had been tried and made the game drop pictures, because the game does need the reply.
+
+**Fix.** The wait ends as soon as the I/O processor has sent the game a packet (`sif::reply_ready`, `iop_wait(enough)` in `iop3ds.cpp`, `idle()` in `system.cpp`; all in the patch tool). The I/O processor takes a request at its own time, so the reply comes within 0.05 to 1.5 ms. It does the rest of its backlog on core 1 while the game draws, so replies reach the game earlier than on a PS2, as they already could with `iop_horizon`. Waits are now 2 to 4 ms per 30 vblanks. `iopthread 0` is not affected.
+
+**Half-step levels.** Between 15 and 10 pictures/s and between 10 and 7.5 there was nothing. The skip level is now twice the average number of pictures skipped per drawn one: 0 is 30/s, 1 is 20, 2 is 15, 3 is 12, 4 is 10, 5 is 8.6 and so on. An odd level alternates two run lengths; every level draws into both frame buffers. The skip goes down two levels at a time and never to or past the level that failed last, which is retried only after the long wait. Levels above it are tried after one round. A round over 5 times its budget (console asleep, HOME Menu, loading) is ignored.
+
+**Measured on the console** (default settings, `debug 1024`, 0 sound underruns everywhere):
+
+| Scene (build p7) | 3D off: clock, pictures/s | 3D on: clock, pictures/s |
+| --- | --- | --- |
+| Lobby | 99.8%, 12.1 (11.9 to 12.5; p3 10.1) | 99.8%, 10.0 (9.9 to 10.2; p3 8.7, 7.4 to 10.1) |
+| Lockers | 100%, 20.1 | 99.7%, 15.3 |
+| Battle | 100%, 30 (p6) | 100%, 20.1 |
+| Faculty office | 100%, 30 (p6) | 99.9%, 20.2 |
+| Lobby to hallway walk | | 99.9%, 19.1 (p3 18.8) |
+
+On their own, the half-step levels did nothing for the lobby on the console (9.7 and 9.0 pictures/s, unsteady), although Azahar showed 12.5. Level 3 was 1 to 3% too slow there, and the shorter wait made room for it. With every picture drawn (`draw 1`) the lobby went from 59 to 61% of full speed, and `draw 3;uncapped 1` from 105 to 112%. The game still makes all of its pictures (18.3 per second at 61%).
+
+**Checked.** Azahar shots are identical to build p3 with `draw 1` in the lobby, lockers, battle, c21, level-up and cold boot (lockstep), and in the lobby, lockers and battle with the I/O processor on its own thread (p6; p7, which differs from it by one number, in the lobby, battle and cold boot).
+
+**What is left in the lobby** (`draw 1` / `draw 3;uncapped 1`, share of the game thread): the general VIF transfer 10.1% / 5.6%, the mesh loop 0049F5D0 13% / 6%, `rt_anim_add_time` 2.4% / 3.7%, `sync` and look-at bones 2.5% / 3.4%. The rest of `kwlnTaskUpdate` (7 to 9%) is spread over about 790 return addresses, none over 1%. 15 pictures/s needs about 7% more.
+
+**Program size.** A profiling build was too big for the console: text, data and bss of 49,599,444 bytes start, 49,928,580 do not (the PS2 memory cannot be mapped, 0xC860180A). The Makefile now refuses a program over 49,700,000. If the memory cannot be had, the program still starts the test link, so another build can be sent; checked in Azahar by forcing the failure, not on a console. Upload speed depends on Wi-Fi: the same build took 76 to 555 s.
+
+### Steady picture rate, and how close to full speed (2026-11-25, later still)
+
+**Cause of the swings.** In the stereo battle and office the automatic skipping swung between 5 and 16 pictures/s. The drawing queue hides several pictures, so a short try at "draw everything" looked on time. The game then fell behind, the skip rose once for each picture that found the queue still full, and it took 10 to 15 s to come back down. The good try had also halved the wait before the next one.
+
+**Fix** (`PicturePacing` and `choose_next_picture()` in `pica.cpp`):
+
+- A lower skip counts as good only after 12 rounds. If it falls behind before that, the skip goes back by one step, and the next try waits twice as long.
+- A try also fails when the drawing thread has almost nothing left over (under 1/32 of the time) in its second half.
+- After a raise because of a full queue, the next raise waits 12 pictures, unless the game does little but wait. A game that is at most 10% late raises the skip by one step.
+- New level: draw two of three pictures (draw, draw, skip). It averages 20 a second and still draws into both frame buffers. Before, the first step down from 30 was 15.
+
+The `game at` log line's "vu idle 0%" every third time was a 64-bit difference of counters that wrap at 32 bits. It is fixed in `main3ds.cpp`.
+
+**Measured on the console** (build p3, `debug 1024`, 45 to 100 s each, 0 sound underruns everywhere). "Drawing everything" is `draw 1`, plus `uncapped 1` in the battle, against 500.5 ms per 30 vblanks; over 100% means time left over. Pictures/s at full speed are 30.
+
+| Scene | Drawing everything, 3D off | Drawing everything, 3D on | Default, 3D off: clock, pictures/s | Default, 3D on: clock, pictures/s |
+| --- | --- | --- | --- | --- |
+| Battle | 462 ms, 108% | 679 ms, 74% | 100%, 30 | 100%, 20.2 (19.9 to 20.5; was about 8.4, 5 to 16) |
+| Faculty office | 500 ms, 100% (held at 60 Hz) | 736 ms, 68% | 100%, 30 | 100%, 20.2 (19.9 to 20.5; was 9.0, 5 to 16) |
+| Lockers | 600 ms, 83% | 770 ms, 65% | 100%, 20.0 | 100%, 15.2 (was 14.9) |
+| Lobby | 836 ms, 60% | 1024 ms, 49% | 100%, 10.1 | 99.6%, 8.7 (7.4 to 10.1; was 8.9) |
+| Lobby to hallway walk | | | | 99.9%, 18.8 (11.1 to 20.7; was 14.8) |
+| Cold boot, movie | | | | 97.8% with the first 5 s of loading (62%), 98 to 100% after; 30 |
+
+Checked: with `draw 1`, 61 Azahar shots of the battle, the lobby and the cold boot are the same as the build before. Console shots of the office and the battle (stereo, 7 pictures each) show no ghosting; saving a shot slows the game, so they do not hold the 20 a second themselves. Not checked: the new level in other scenes that blend the last picture. What remains: the lobby, where the game thread is the limit, and drawing twice in 3D, where the GPU is.
+
+### Faculty office blinking: cause and fix (2026-11-25)
+
+**Symptom.** In the faculty office the floor disappears for single pictures (black shows through), and so do single letters of the dialogue ("h", "--") and, once, a strip of wall.
+
+**Cause.** `apply_state()` in `pica.cpp` draws from an old render target instead of the texture the game has just uploaded. When a texture's address (TBP) is page-aligned and some `Target` has the same page as its FBP, that target is used as the texture (`source`, "Drawing with a picture that was rendered earlier"). It checks only the address. Nothing drops a target, or marks it old, when the game uploads a texture over that memory: `note_transfer()` does not look at targets, and a target goes only when all 8 slots are in use. The code has been like this since the port's first commit (0e578a9).
+
+In the lobby and the hallway the game draws a scratch picture at page 504 (block 16128, 128 wide) and reads it back as a 128x128 32-bit texture. The office does not draw it, but uses that memory for ordinary textures, and RenderWare moves those around GS memory from picture to picture. Whatever lands on block 16128 is drawn with the hallway's old scratch picture. That is why a different texture blinks each time, why only one picture at a time, and why it depends on having walked in from the hallway.
+
+**Proof on the console** (a build that only adds a log line at `source`, default settings plus `stats 1`, slot 1 in the lobby, walked to the office, "Let's see... In 1999..." line, 19 consecutive drawn pictures):
+
+| Pictures | Drawn from the old target at page 504 (last drawn at picture 783, about 700 pictures before) | Seen |
+| --- | --- | --- |
+| 55596, 55686, 55866 | 4-bit 128x128 `BCB140CF` and 4-bit 32x32 `A23BA8B1` | floor and "--" missing |
+| 55704, 55884 | 4-bit 32x32 `A75C20DB` | "h" of "Teacher" missing |
+| 55578, 55668, 55758, 55848 | 8-bit 128x128 `FE0D7A9C`, 5 times | nothing visible, either eye |
+| 55776 | 4-bit 32x32 `F1EA57BD`, twice | both "o" of "ago? Your" missing |
+| the other 9 | none | correct |
+
+Over 699 drawn office pictures of that run, 357 (51%) used the old target for something and 77 (11%) for the floor. The unchanged build showed the same faults in the same scene: 2 of 16 pictures without the floor, 2 without the "h".
+
+**Why the counters missed it.** Nothing is missing or stale by their measure: `missing` 0, `decoded` 0, shapes constant (922), no `[stale]`. The only trace is in `stats 1`: `changes` minus `reused` is 7 in every full office picture when it is right, and more when it blinks. `slot2.state` hides the fault completely (10 of 10 pictures right in this check, and the difference always 7), because a loaded state starts with no targets. So the earlier check of the office from `slot2.state` could not see it. The "Faculty office disappearing floor" fixes above were for other faults.
+
+**Not the cause:** running out of texture memory (271 KB free in the session where it was first seen, but it blinks the same with 1355 KB free and nothing decoded), remembered DMA chains, the vertex cache and the split command list (0 splits).
+
+**Fix.** Each `Target` keeps the value of `g_stamp` at its last draw (`draw_stamp`, set by `note_drawn()`), and it is used as `source` only if that is not older than the newest upload to the texture's first block (`g_block_stamp[tbp]`). Otherwise `find_texture` gives the uploaded texture. Testing only "was anything uploaded here" is wrong: in the lobby and hallway the scratch picture was read 754 times, correctly, at an address that also had an older upload. `stats 1` counts "old targets passed over" for each picture.
+
+**Checked on the console** with the same walk from the lobby into the office and the same dialogue line, 3D slider up: 35 of 35 screenshots (2 builds) right, and `changes` minus `reused` was 7 in all 600 pictures looked at. Old targets were passed over in 225 of 400 office pictures, and almost never in the lobby and hallway, where the scratch picture is still used. In Azahar the walk, level-up, movie, c21 and c22 scenes match the build before to within a few pixels, which come from the clipper change. Check this with the walk, not with a state saved inside the office.
+
+### Level census and cross-level optimizations (2026-11-26)
+
+A full census of `DATA.CVM` (446 packs, 296 with 3D geometry, 32,997 `RW_BINMESH` strips, 0 lists, 7,745 rasters / 131.8 Mpx), `BTL.CVM` (1,910 models), and all 114 VU1 programs in `SLUS_216.21` (using `C-GBL/P3FES-Decompilation` + disc tools) established the cross-level bottlenecks:
+- **Zero point/spot lights game-wide** (only ambient + directional) and **zero triangle lists in RMD geometry**.
+- **Linear-RAM pressure on heavy stages:** Lobby (`f006_001`) is only 504 Kpx, while untested stages reach 2.1× (Dorm Lounge `f004_010` 1,078 Kpx, Answer Cocytus `f042_*` 996 Kpx, Strip Mall `f009_*` 922 Kpx, Tziah `f024_*` 913 Kpx).
+- **Heavier geometry & mesh counts than lobby (16,726 tris):** 8 fields exceed lobby (`f035_003` Bunker 21,692, `f008_007` Paulownia Mall 21,087, `f012_001` Shrine 17,293, `f008_002` Club Escapade 16,810); Yabbashah/Caina reaches 334 meshes + 16×16 random-floor grid instancing; Tziah 264 meshes.
+- **Unaccelerated VU1 gap (Wave 3 target):** MatFX EnvMap (`eff=2`) — skinned `ELF 073`/`075` (0 bins in `vu1/`, currently hits the VU1 interpreter on 168 enemy/boss, 59 Persona, 68 NPC, and 18 party materials including Aigis) and generic `ELF 051`/`053` (10 CPU-AOT bins, used in 53 levels / 625 materials including Tartarus Adamah & Entrance).
+
+What landed in this pass (ELF `49,422,964` B, +4.7 KB vs p7, 277 KB under the `49,700,000` B cap):
+- **Static PICA200 shader branches & alpha-split bypass (`gs.v.pica`, `g3model.*`, `g3cache.cpp`, `pica.cpp`):** Added `.bool isdir`, `.bool isfog`, and `.bool iseye` (skipping directional lighting, fog, and stereo ALU when unused, plus skipping `ldir`/`lcol` uniform diffs on unlit batches). Replaced single-value `uniform_alpha` with exact `[alpha_min, alpha_max]` intervals to collapse 2-pass alpha splits (4× in stereo) to 1 pass whenever the whole interval lies on one side of the reference. Hooked `ELF 102` (`g3_skin_ortho` + UV xform) onto `g3 4`.
+- **Opaque 3D `GPU_RGB565` & linear-RAM hygiene (`pica.cpp`):** Large (`>= 64x64`) opaque 3D textures (constant alpha `0x80` or `0xFF`) allocate `GPU_RGB565` (halving linear RAM and FCRAM bandwidth; 2D UI/fonts/small/alpha-varying textures stay `RGBA8`). Deferred `g_shot_pixels` (288 KB linear RAM) to `save_shot()`, fixed 512-slot texture eviction fallback, and skipped unnecessary `reserve_geometry()` before `g3cache::place()`.
+- **Core 0 natives & hot-path ARM11 tuning (`native3ds.cpp`, `natives.txt`, `hot_skip.txt`):** Full native `0x00311730` (`mdl_look_hierarchy`), plus `rw_matrix_rotate`, `rw_v3d_normalize`, `rw_v3d_normalize_fast`, `cosf`, `sinf`. Eliminated `bl memset`, `bl set_interrupts`, and redundant `0x1000D000` MMIO reads in `native_rw_mesh_loop` / `rw_mat_dma_*`; inlined ARM11 `vsqrt.f32` and fast `divide()` in `native_rt_anim_add_time`; inlined matrix helpers (`calls=0`) in `native_hanim_update_matrices` and `native_loop_look_bones`.
+- **Core 0 DMAC/VIF/GIF fast paths (`dmac.cpp`, `vif.cpp`, `gs/gif.cpp`, `VIF_CORE0_EDITS` in `ps2run_3ds_patch.py`):** Dedicated non-MFIFO ch1 TTE loop + 1 KB `g_spr_pages[]` bitmask (avoiding wasted `unchanging` checks on `fromSPR` dynamic packets), direct skipped-frame FLG=1 `UNPACK` drops, single-record TTE+data coalescing, `NOP` span bridging, and single-packet `gif::scan()` fast path (80,000/80,000 exact).
+
+**Checked:** 14-scene Azahar A/B (10 core + 4 newly warped levels: `mall.state` f008_007, `dorm.state` f004_010, `tartarus_ent.state` f032_002, `tziah.state` f024_000): 0 EE-cycle delta across all 9 frame-limited states, 0 `bytes>30` across all 75 screenshots (2D UI bit-exact; 3D shows only expected 5-6-5 quantization, mean 0.01–0.90, max 6–12), 0 missing/stale/splits/exceptions, linear RAM free +344 to +1,040 KB (`lobby_d1` 1,657 → 2,697 KB, `dorm_d1` 2,693 → 3,261 KB, `mall_d1` 2,945 → 3,409 KB).
+
+Console benchmark on 2026-11-26 (median ms per 30 vblanks, 0 underruns, 0 missing/stale everywhere):
+
+| Scene | Build p7 | After | Change |
+| --- | --- | --- | --- |
+| Lobby `draw 1;stereo 0` | 836 ms (60%) | **777.0 ms (65%, 19.3 pics/s)** | **-59.0 ms (+7.6%)** |
+| Lockers `draw 1;stereo 0` | 600 ms (83%) | **556.0 ms (90%, 27.0 pics/s)** | **-44.0 ms (+7.9%)** |
+| Lobby `draw 3;uncapped 1;stereo 0` | ~447 ms (112%) | **427.0 ms (118%)** | **-20.0 ms (+4.7%)** |
+| Battle `draw 1;uncapped 1;stereo 0` | 462 ms (108%) | **415.5 ms (120%, 35.9 pics/s)** | **-46.5 ms (+11.2%)** |
+| Lobby `draw 1;stereo 10` | 1024 ms (49%) | **994.5 ms (50%, 15.1 pics/s)** | **-29.5 ms (+3.0%)** |
+| Battle `draw 1;uncapped 1;stereo 10` | 679 ms (74%) | **650.0 ms (77%, 23.1 pics/s)** | **-29.0 ms (+4.5%)** |
+| Lobby auto-skip (`stereo 0`) | 500 ms (12.1/s) | **500.0 ms (12.2/s, 100%)** | `linear_kb 2972`, `heap_kb 5958` |
+| Faculty office (`slot2.state`, `stats 1`) | 500 ms | **500.0 ms (99–100%)** | `linear_kb 2624`, `heap_kb 5968` |
+
+**Next steps (Wave 3):**
+1. Add `g3 4` GPU support for **MatFX EnvMap** (`ELF 051`/`053` generic and `ELF 073`/`075` skinned, ortho `076`), eliminating VU1 interpreter stalls on metallic enemies/bosses/Personas/Aigis and allowing the 10 CPU-AOT EnvMap bins to be pruned under the 49.7 MB ELF cap.
+2. Benchmark the 4 newly warped heavy levels (`mall.state`, `dorm.state`, `tartarus_ent.state`, `tziah.state`) on real New 3DS hardware and capture the 3 interpreted VU1 programs seen in `tziah_d1` (`record sdmc:/p3fes/vu1`) plus `033`/`035` (`ptank_spr3d` battle spells).
+
+### MatFX EnvMap on GPU, `ELF 061` Dual fix, `tziah` ortho, and lean Core 0 wins (2026-11-26, Wave 3)
+
+What landed (ELF `49,425,460` B, +2.5 KB vs Wave 2, 274.5 KB under the `49,700,000` B cap):
+- **PICA200 GPU MatFX EnvMap (`gs.v.pica`, `g3model.*`, `g3native.cpp`, `pica.cpp`):** Added `.fvec env[2]` and `.bool isnrm`/`isenv` to `gs.v.pica` so Pass 2 computes reflection UVs directly from the (skinned or unskinned) normal on PICA200 with zero CPU vertex-buffer rewrite. Hooked **Generic EnvMap** (`ELF 051`/`053`, 53 levels / 625 materials) and **Skinned EnvMap** (`ELF 073`/`075`, ortho `076`, matched via `ps2::g_vu1_code` — eliminates VU1 interpreter stalls on 313 metallic enemy/boss/Persona/NPC/Aigis models).
+- **Fixed `ELF 061` Dual (`program 43`)** and **eliminated `tziah_d1` interpreted VU1 (`ELF 041` ortho)**: rewired `program 43` from `ELF 053` to `ELF 061` (`0x36F0`, raw `uv2`), and hooked `ELF 041` (`0x2E68`, `g_vu1_code`) onto `g3 4`.
+- **Lean Core 0 natives (`native3ds.cpp`, `natives.txt`, `hot_skip.txt`):** Added `spr_ptr()` fast path in `rw_mat_dma_emit`/`rw_dma_matrix_packet`, plus `0049FF10 rw_add_light` and `004A0480 rw_atomic_instance_test`. (Full `0049F5D0` / `004A09D0` / `004A06C0` natives were tried and reverted after console testing showed +9.5 ms on `lobby_d1` from redundant fallback pre-validation and +10.4 KB L1 I-cache pressure.)
+
+**Checked:** Azahar A/B (`p3fes.3dsx` vs Wave 2): 0 EE-cycle delta across all loaded scenes, `lobby_d1`/`battle_d1`/`tziah_d1` 100% bit-exact (`0.000`/`0`), **`tziah_d1` interpreted VU1 `3 → 0`**, **`tartarus_ent_d1` (`f032_002`, 20 EnvMap mats) CPU shapes `7,166 → 1,019` (-85.8%)**, `g3` `559 → 764`, mean pixel diff `0.028`, 0 missing/stale/splits/exceptions.
+
+Console benchmark (median ms per 30 vblanks, 0 underruns, 0 missing/stale everywhere):
+
+| Scene | Build p7 | Wave 2 | **Wave 3** | **Delta vs p7** |
+| --- | --- | --- | --- | --- |
+| Lockers `draw 1;stereo 0` | 600 ms (83%) | 556.0 ms (90%) | **551.0 ms (91%, 27.3 pics/s)** | **-49.0 ms (+8.9%)** |
+| Battle `draw 1;uncapped 1;stereo 0` | 462 ms (108%) | 415.5 ms (120%) | **412.0 ms (121%, 36.4 pics/s)** | **-50.0 ms (+12.1%)** |
+| Lobby `draw 3;uncapped 1;stereo 0` | ~447 ms (112%) | 427.0 ms (118%) | **426.0 ms (118%)** | **-21.0 ms (+4.9%)** |
+| Lobby `draw 1;stereo 10` | 1024 ms (49%) | 994.5 ms (50%) | **993.0 ms (51%, 15.1 pics/s)** | **-31.0 ms (+3.1%)** |
+| Battle `draw 1;uncapped 1;stereo 10` | 679 ms (74%) | 650.0 ms (77%) | **649.0 ms (77%, 23.1 pics/s)** | **-30.0 ms (+4.6%)** |
+| Lobby `draw 1;stereo 0` | 836 ms (60%) | 777.0 ms (65%) | **785.0 ms (mean 781.5, 64%)** | **-51.0 ms (+6.5%)** |
+| Lobby auto-skip (`stereo 0`) | 500 ms (12.1/s) | 500.0 ms (12.2/s) | **501.0 ms (12.1–14.5/s)** | 0 underruns |
+| Faculty office (`slot2.state`, `stats 1`) | 500 ms | 500.0 ms (99%) | **500.0 ms (100%, mean 502.0)** | `linear_kb 2624` |
+
+**Pruned redundant EnvMap VU1 bins & benchmarked 4 newly warped levels on the console (Wave 4):**
+- Moved 10 unreferenced mid-program `ELF 051`/`053` CPU-AOT bins out of `games/p3fes/vu1/` (92 bins remain; kept the 3 bins referenced by symbol in `g3native.cpp`). `p3fes.elf` shrank **-231,152 B (-225.7 KB)** (`49,425,460 → 49,194,308` B, **505.7 KB headroom** under the `49,700,000` B cap). Azahar A/B (`tartarus_ent_d1`, `dorm_d1`, `lobby_d1`, `tziah_d1`) matched 4/4 bit-exact with 0 EE-cycle delta and 0 interpreted VU1 calls.
+- Live New 3DS hardware benchmarks on the 4 heavy warped levels (`0` missing textures, `0` interpreted VU1 calls, `0` audio underruns in all clean runs):
+
+| Level | Default (`stereo 0`) | `draw 1; stereo 10` | `heap_kb` | `linear_kb` |
+| --- | --- | --- | --- | --- |
+| **Tziah** (`f024_000`) | **500.0 ms (100%, 30.0 pics/s)** | **500.0 ms (100%, 30.0 pics/s)** | 8,009 | 4,148 |
+| **Tartarus Entrance** (`f032_002`, 20 EnvMap mats) | **500.0 ms (100%, 29.9 pics/s)** | **763.5 ms (66%, 19.7 pics/s)** | 8,013 | 3,724 |
+| **Dorm 1F Lounge** (`f004_010`, 1,078 Kpx VRAM) | **500.0 ms (100%, 20.1 pics/s)** | **737.0 ms (68%, 20.5 pics/s)** | 5,961 | 3,536 |
+| **Paulownia Mall** (`f008_007`, 21k tris / 27.8k verts) | **500.0 ms (99%, 17.7 pics/s)** | **1092.0 ms (46%, 13.7 pics/s)** | 8,013 | 3,684 |
+
+### Alternating stereo submission, TEV stage fold, L1 I-cache tightening, and VIF/GS fast paths (2026-11-27, Wave 5)
+
+What landed (ELF `49,195,080` B, +772 B vs Wave 4, **504.9 KB headroom** under `49,700,000` B cap):
+- **Stereo & PICA200 TEV (`pica.cpp`, `g3cache.cpp`, `g3model.cpp`, `g3native.cpp`):** Eliminated per-draw `set_eye(false)` ping-pong in stereo (each draw renders the already-bound eye first, cutting `C3D_FrameDrawOn` flushes/rebinds in half from `2N → N`); folded Stage 1's 2× alpha doubling into Stage 0 and moved Fog to Stage 1 (1 active TEV stage when `!fog`, 2 when `fog`, cached `fog_ramp_bound`); guarded 64-bit `g3cache` stats behind `g_mode == 2`; hooked no-cull `ELF 046`, `059`, and `095` onto `g3 4`.
+- **Core 0 L1 I-cache shrink & compact leaf natives (`native3ds.cpp`, `natives.txt`):** Extracted shared cold helpers (`resolve_root_ltm`, `mat_mul_vu0_cold`, `scale_mat_3x3`, `slerp_weights`) shrinking the top 4 hot natives by `-3.1 KB` (net `native3ds.o` shrank `-1,736 B` even after adding 3 compact leaf natives: `004C6700 rw_v3d_transform_point`, `004C6840 rw_v3d_transform_vector`, `00521300 memmove`).
+- **Core 2 VIF decode & GS deferred-upload bitmask (`vif.cpp`, `gs.cpp`, `VIF_CORE2_GS_EDITS` in `ps2run_3ds_patch.py`):** Tightened Core 2 VIF record decode + deferred MPG MRU cache, Core 0 `memo_play`, and added word-level active bitmask scanning (`__builtin_ctz`/`__builtin_clz`) for `gs.cpp` deferred uploads (100,000/100,000 exact).
+
+**Checked:** 14-scene Azahar A/B vs Wave 4: **14/14 scenes 100% bit-exact** (`0.000` mean / `0` max across all 74 screenshots, 0 EE-cycle delta on all 9 loaded states, +1.3K–4.2K command words left/frame, 0 missing/stale/splits/exceptions).
+
+Console benchmark (median ms per 30 vblanks, 0 underruns, 0 missing/stale everywhere):
+
+| Scene | Build p7 | Wave 3b / W4 | **Wave 5** | **Total vs p7** |
+| --- | --- | --- | --- | --- |
+| **Lobby `draw 1; stereo 0`** | 836 ms | 785.0 ms (W2 777) | **769.0 ms (65%, 19.5 pics/s)** | **-67.0 ms (+8.7%)** |
+| **Lobby `draw 1; stereo 10`** | 1024 ms | 993.0 ms | **982.0 ms (mean 966.8, 15.3/s)** | **-42.0 ms (+4.3%)** |
+| **Battle `draw 1; uncapped 1; stereo 10`** | 679 ms | 649.0 ms | **641.0 ms (78%, 23.5 pics/s)** | **-38.0 ms (+5.9%)** |
+| **Paulownia Mall `draw 1; stereo 10`** | — | 1092.0 ms (W4) | **1089.0 ms (mean 1086.1, 13.8/s)** | **-3.0 ms vs W4** |
+| **Lobby `draw 3; uncapped 1; stereo 0`** | ~447 ms | 426.0 ms | **424.0 ms (118%)** | **-23.0 ms (+5.4%)** |
+| **Battle `draw 1; uncapped 1; stereo 0`** | 462 ms | 412.0 ms | **411.0 ms (121%, 36.4 pics/s)** | **-51.0 ms (+12.4%)** |
+| **Lockers `draw 1; stereo 0`** | 600 ms | 551.0 ms | **552.0 ms (91%, 27.3 pics/s)** | **-48.0 ms (+8.7%)** |
+| **Lobby auto-skip (`stereo 0`)** | 500 ms (12.1/s) | 501.0 ms (12.1–14.5/s) | **501.0 ms (12.1–14.5/s)** | 0 underruns |
+
+### Hardware profiling (`SAMPLE=1` + `pmu 0 8`), `GAMEOPT=-Os` L1 I-cache win, Early-Z, and `0046B510` (2026-11-27, Wave 6)
+
+A fresh `SAMPLE=1` + `pmu 0 8` hardware profile on the New 3DS (`lobby_d1`, `lobby_d3`, `lockers_d1`, `mall_stereo`) revealed:
+- **L1 I-cache misses are Core 0's #1 drag:** `4.40%` misses per instruction (`5.28M` misses / 30 vblanks in `lobby_d1`, `IPC = 0.194`), with `31.5–33.0%` of Core 0 in non-hot `unit_*.cpp` and `21.6%` in `_rwDMAHandler` (`dma 12.8% + vif 8.5%`), while Core 2 sat `29–54%` idle in mono scenes.
+- **`mall_stereo`** spent `29.5%` in GPU `present`, `12.4%` in `x0`, and `1.54%` in CPU-AOT `vu1_AE90084E87FFCB73` (`ELF 046` full-clipper triangle list).
+
+What landed (default `GAMEOPT ?= -Os` for cold `unit_*.cpp`, keeping `hot_*.cpp` at `-O2`):
+- **`GAMEOPT=-Os` on cold `unit_*.cpp` (`port3ds/Makefile`, `port3ds/build.sh`):** Shrank `p3fes.elf` by **-6.73 MB (-16.6% `.text`)** (`49,181,492 → 42,453,308` B, **7.25 MB headroom** under the 49.7 MB cap; `.3dsx` upload dropped to 53 s) and cut L1 I-cache misses by **~10%** (`lobby_d1` `5.28M → 4.73M`, `lobby_d3` `3.20M → 2.86M`, `lockers_d1` `4.03M → 3.63M`), unlocking steady **15.1 pics/s @ 100%** in Lobby auto-skip!
+- **Full-clipper triangle lists & Early-Z (`g3model.cpp`, `g3cache.cpp`, `pica.cpp`):** Relaxed `gpu_batch_setup`'s `list` guard so `ELF 046` full-clipper triangle lists (`vu1_AE90084E87FFCB73`) run on `g3 4` (`mall_d1` declines `1,100 → 0`, `lobby_d1` `40 → 0`); disabled `C3D_AlphaTest` on `ATE=1, AFAIL=0` draws whose `[alpha_min, alpha_max]` interval always passes (re-enabling PICA200 Early-Z); unrolled `g3cache::place` and templated `diff_and_check_uniforms<CheckEnv>`.
+- **Core 0 `0x0046B510` & I-cache compaction (`native3ds.cpp`, `natives.txt`, `hot_skip.txt`, `dmac.cpp`, `vif.cpp`, `VIF_DMAC_ICACHE_EDITS`):** Added compact native `0046B510 rp_skin_matrix_updating` (2.9% `lobby_d1`), trimmed `native_rw_mesh_loop` & `native_rt_anim_add_time`, and compacted Core 0/2 DMAC/VIF hot paths.
+
+**Checked:** 14-scene Azahar A/B vs Wave 5: 13/14 bit-exact, 0 EE-cycle delta on all 9 loaded states, `mall_d1` `1,100 → 0` clipper declines (`mean 0.012`), 0 missing/stale/splits/exceptions.
+
+Console benchmark (median ms per 30 vblanks, 0 underruns, 0 missing/stale everywhere):
+
+| Scene | Build p7 | Wave 5 | Wave 6B `-O2` | **Wave 6B `GAMEOPT=-Os`** | **Total vs p7** |
+| --- | --- | --- | --- | --- | --- |
+| **Lobby auto-skip (`stereo 0`)** | 500 ms (12.1/s) | 501 ms (12.1–14.5/s) | 500 ms (12.0–12.7/s) | **504 ms (STEADY 15.1/s @ 100%)** | **+3.0 pics/s (+25%)** |
+| **Lobby `draw 1; stereo 0`** | 836 ms | 769.0 ms | 782.0 ms | **765.5 ms (66%, 19.7 pics/s)** | **-70.5 ms (+9.2%)** |
+| **Lockers `draw 1; stereo 0`** | 600 ms | 552.0 ms | 556.0 ms | **540.0 ms (93%, 27.8 pics/s)** | **-60.0 ms (+11.1%)** |
+| **Lobby `draw 3; uncapped 1`** | ~447 ms | 424.0 ms | 426.0 ms | **417.0 ms (120%)** | **-30 ms (-57 vs 11-24)** |
+| **Battle `draw 1; uncapped 1`** | 462 ms | 411.0 ms | 411.0 ms | **399.0 ms (125%, 37.5 pics/s)** | **-63.0 ms (+15.8%)** |
+| **Battle `draw 1; uncapped; 3D`** | 679 ms | 641.0 ms | 644.0 ms | **633.0 ms (79%, 23.8 pics/s)** | **-46.0 ms (+7.3%)** |
+| **Lobby `draw 1; stereo 10`** | 1024 ms | 982.0 ms | 992.5 ms | **984.5 ms (mean 967.2, 15.3/s)** | **-39.5 ms (+4.0%)** |
+| **Paulownia Mall `draw 1; 3D`** | — | 1089.0 ms | 1088.0 ms | **1069.0 ms (47%, 14.1 pics/s)** | **-20.0 ms vs W5** |
 
 ## Testing
 `route.txt` holds the button presses from a cold boot to the first battle, one `frame:button[:frames]` per line, for `ps2run --press`. It is timed for the Mac build: a 3DS cold boot drifts from it by hundreds of frames, so to reach a later scene on the 3DS, make a saved state on the Mac and load it.

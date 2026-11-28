@@ -362,7 +362,10 @@ bool clipper_culls_all(const Input &in, u32 top, u32 n) {
 
 bool run(const Input &in, std::vector<std::uint8_t> &out, std::vector<std::uint32_t> &ends, End &end) {
     end = End{};
-    if (in.program == 65 || in.program == 43 || in.program == 44) return false;   // g3_skin_ortho and dual-texture MatFX are handled by gpu_batch only
+    if (in.program == 41 || in.program == 43 || in.program == 44 || in.program == 45 || in.program == 46 ||
+        in.program == 51 || in.program == 53 || in.program == 59 || in.program == 65 || in.program == 66 ||
+        in.program == 73 || in.program == 75 || in.program == 76 || in.program == 95 || in.program == 102)
+        return false;   // handled by gpu_batch only
     const u32 flags = in.mem[0x3FF * 16];
     const u32 top = in.top & 1023u, n = in.itop & 1023u;
     const bool skin = in.program == 64;
@@ -424,7 +427,13 @@ constexpr u32 kOne = 0x3F800000u;   // 1.0f
 
 }
 
-bool clipper_culls_all_direct(const Input &in, const std::uint8_t *pos_src, u32 pos_step, u32 n) {
+bool g_behind_on_gpu = false;
+
+// The clipper's all-outside test and, in stereo, a look for vertices behind the camera: 1 when all vertices are beyond one same
+// clip plane (nothing drawn), 2 when one has w <= 0 or not a number (the program's own clipper then runs), 0 for the GPU.
+// Vertices beyond the near or far plane are clipped by the GPU (gs.v.pica gives it clip space).
+template <bool Behind, class Pos>
+static inline int clipper_test(const Input &in, u32 n, u32 count, Pos pos) {
     const Batch b{in, 0, n};
     const Vec v28 = b.vf(28), v29 = b.vf(29), v30 = b.vf(30), v31 = b.vf(31);
     const Vec m26 = load(in.mem, 0x3FD), m27 = load(in.mem, 0x3FE);
@@ -432,11 +441,17 @@ bool clipper_culls_all_direct(const Input &in, const std::uint8_t *pos_src, u32 
     const float sx = m26.y, sy = 0.0f + m27.y, sz = 0.0f + m27.z;
     const float az = 0.0f + m26.z;
     u32 all = 63;
-    for (u32 k = 0; k < n && all; ++k, pos_src += pos_step) {
+    bool w_bad = false;
+    for (u32 k = 0; k < count && (all || (Behind && !w_bad)); ++k) {
         float p[3];
-        std::memcpy(p, pos_src, 12);
+        pos(k, p);
         const float cw = ((bw * 1.0f + v28.w * p[0]) + v29.w * p[1]) + v30.w * p[2];
-        const std::int32_t lim = key(f(bits(cw * 1.0f) & 0x7FFFFFFFu));
+        const u32 w_bits = bits(cw * 1.0f);
+        if constexpr (Behind) {
+            if (k < n && (w_bits - 0x00800000u) >= 0x7F000000u) w_bad = true;
+            if (!all) continue;
+        }
+        const std::int32_t lim = key(f(w_bits & 0x7FFFFFFFu));
         u32 codes = 0;
         if (all & 3u) {
             const float cx = ((bx * 1.0f + v28.x * p[0]) + v29.x * p[1]) + v30.x * p[2];
@@ -457,7 +472,22 @@ bool clipper_culls_all_direct(const Input &in, const std::uint8_t *pos_src, u32 
         }
         all &= codes;
     }
-    return all != 0;
+    if (all != 0) return 1;
+    return Behind && w_bad ? 2 : 0;
+}
+
+static int clipper_test_direct(const Input &in, const std::uint8_t *src, u32 step, u32 n) {
+    const auto pos = [src, step](u32 k, float *p) { std::memcpy(p, src + k * step, 12); };
+    return g_behind_on_gpu ? clipper_test<false>(in, n, n, pos) : clipper_test<true>(in, n, n, pos);
+}
+
+static int clipper_test_indirect(const Input &in, u32 top, u32 n) {
+    const auto pos = [&in, top](u32 k, float *p) {
+        const Vec v = load(in.mem, top + 4u * k);
+        p[0] = v.x, p[1] = v.y, p[2] = v.z;
+    };
+    const u32 count = (n + 1u) & ~1u;
+    return g_behind_on_gpu ? clipper_test<false>(in, n, count, pos) : clipper_test<true>(in, n, count, pos);
 }
 
 // A list of n / 3 triangles as one strip: each triangle after the first is joined by its predecessor's last vertex and its
@@ -483,6 +513,7 @@ struct BoneCache {
     std::uint32_t gen = 0;
     std::uint16_t seen_gen = 0;
     std::uint8_t by_hash[64]{};   // slot + 1 for a hash's bucket, 0 for none
+    bool hash_dirty = false;      // set by restore_bones; rebuilt lazily in resolve_bone_slot
     BoneUse uses[kMaxBoneUses];   // the current batch's bone addresses in the order first met, with their slots
     int use_count = 0;            // -1: more than kMaxBoneUses
 };
@@ -514,6 +545,13 @@ static inline std::uint32_t rows_hash(const std::uint32_t rows[12]) {
 
 static inline unsigned hash_bucket(std::uint32_t h) { return (h ^ (h >> 11) ^ (h >> 22)) & 63u; }
 
+static inline bool rows_nonfinite(const std::uint32_t rows[12]) {
+    constexpr std::uint32_t kExp = 0x7F800000u;
+    for (int j = 0; j < 12; ++j)
+        if ((rows[j] & kExp) == kExp) return true;
+    return false;
+}
+
 // Puts the bone into the slot, for the shader too (a new generation, so the uniforms are sent).
 static void set_bone_slot(int slot, const std::uint32_t rows[12], std::uint32_t h, Gpu &g) {
     const unsigned old = hash_bucket(g_bones.slot_hash[slot]);
@@ -525,11 +563,37 @@ static void set_bone_slot(int slot, const std::uint32_t rows[12], std::uint32_t 
     float m[12];
     std::memcpy(m, rows, sizeof m);
     for (int c = 0; c < 3; ++c) set4(g.bone[3 * slot + c], m[c], m[3 + c], m[6 + c], m[9 + c]);
+    if (rows_nonfinite(rows)) g.bone_nonfinite |= (1u << slot);
+    else g.bone_nonfinite &= ~(1u << slot);
     g.bone_gen[slot] = ++g_bones.gen;
+}
+
+// Same without updating by_hash/slot_hash: restore_bones already knows the slot and marks the hash table dirty.
+static void set_bone_slot_direct(int slot, const std::uint32_t rows[12], Gpu &g) {
+    g_bones.hash_dirty = true;
+    std::memcpy(g_bones.slot_rows[slot], rows, 12 * sizeof(std::uint32_t));
+    float m[12];
+    std::memcpy(m, rows, sizeof m);
+    for (int c = 0; c < 3; ++c) set4(g.bone[3 * slot + c], m[c], m[3 + c], m[6 + c], m[9 + c]);
+    if (rows_nonfinite(rows)) g.bone_nonfinite |= (1u << slot);
+    else g.bone_nonfinite &= ~(1u << slot);
+    g.bone_gen[slot] = ++g_bones.gen;
+}
+
+static void rebuild_bone_hashes() {
+    std::memset(g_bones.by_hash, 0, sizeof g_bones.by_hash);
+    for (unsigned s = 0; s < kGpuBones; ++s) {
+        if (!g_bones.used_in[s]) continue;
+        const std::uint32_t h = rows_hash(g_bones.slot_rows[s]);
+        g_bones.slot_hash[s] = h;
+        g_bones.by_hash[hash_bucket(h)] = static_cast<std::uint8_t>(s + 1);
+    }
+    g_bones.hash_dirty = false;
 }
 
 [[gnu::noinline]] static int resolve_bone_slot(const std::uint8_t *mem, u32 address, u32 batch, std::uint16_t seen_gen, Gpu &g) {
     G3_PROF_EXTRA(9);   // SAMPLE=1: the bone lookup, apart from the rest of gpu_batch (x8)
+    if (g_bones.hash_dirty) rebuild_bone_hashes();
     std::uint32_t rows[12];
     bone_rows(mem, address, rows);
     const std::uint32_t h = rows_hash(rows);
@@ -567,8 +631,42 @@ int last_bones(const BoneUse *&uses) {
 
 bool restore_bones(const std::uint8_t *mem, const BoneUse *uses, int count, Gpu &g) {
     if (count < 0 || count > static_cast<int>(kMaxBoneUses)) return false;
-    std::uint32_t rows[kMaxBoneUses][12];
+    // Fast path when all bones map to distinct slots (almost every batch): compare VU1 memory directly against slot_rows.
     std::uint32_t mask = 0;
+    bool dup = false;
+    for (int i = 0; i < count; ++i) {
+        const u32 bit = 1u << uses[i].slot;
+        if (mask & bit) { dup = true; break; }
+        mask |= bit;
+    }
+    if (!dup) {
+        const u32 batch = ++g_bones.batch;
+        for (int i = 0; i < count; ++i) {
+            const int slot = uses[i].slot;
+            const u32 base_q = (uses[i].address + 696u) & 1023u;
+            const u32 *sr = g_bones.slot_rows[slot];
+            if (base_q <= 1020u) {
+                const auto *q = reinterpret_cast<const u32 *>(mem + base_q * 16u);
+                const u32 diff = (q[0] ^ sr[0]) | (q[1] ^ sr[1]) | (q[2] ^ sr[2]) |
+                                 (q[4] ^ sr[3]) | (q[5] ^ sr[4]) | (q[6] ^ sr[5]) |
+                                 (q[8] ^ sr[6]) | (q[9] ^ sr[7]) | (q[10] ^ sr[8]) |
+                                 (q[12] ^ sr[9]) | (q[13] ^ sr[10]) | (q[14] ^ sr[11]);
+                if (diff) {
+                    const u32 rows[12] = {q[0], q[1], q[2], q[4], q[5], q[6], q[8], q[9], q[10], q[12], q[13], q[14]};
+                    set_bone_slot_direct(slot, rows, g);
+                }
+            } else {
+                u32 rows[12];
+                bone_rows(mem, uses[i].address, rows);
+                if (std::memcmp(sr, rows, sizeof rows) != 0) set_bone_slot_direct(slot, rows, g);
+            }
+            g_bones.used_in[slot] = batch;
+        }
+        g.slots = mask;
+        return true;
+    }
+    std::uint32_t rows[kMaxBoneUses][12];
+    mask = 0;
     for (int i = 0; i < count; ++i) {
         bone_rows(mem, uses[i].address, rows[i]);
         // Two of its bones were one matrix when its vertices were made, and they share a slot: they must still be one.
@@ -580,27 +678,41 @@ bool restore_bones(const std::uint8_t *mem, const BoneUse *uses, int count, Gpu 
     for (int i = 0; i < count; ++i) {
         const int slot = uses[i].slot;
         if (g_bones.used_in[slot] != batch && std::memcmp(g_bones.slot_rows[slot], rows[i], sizeof rows[i]) != 0)
-            set_bone_slot(slot, rows[i], rows_hash(rows[i]), g);
+            set_bone_slot_direct(slot, rows[i], g);
         g_bones.used_in[slot] = batch;
     }
     g.slots = mask;
     return true;
 }
 
-template <bool Lights>
-[[gnu::noinline]] static void fill_generic_direct_impl(Gpu &g, GpuVertex *dst, const DirectStreams *ds, u32 n, u32 pos_w, u32 uv_w, u32 nrm_step) {
+template <bool Lights, bool UvXform>
+[[gnu::noinline]] static void fill_generic_direct_impl(const std::uint8_t *mem, Gpu &g, GpuVertex *dst, const DirectStreams *ds, u32 n, u32 pos_w, u32 uv_w, u32 nrm_step) {
     const auto *p = reinterpret_cast<const u32 *>(ds->s[0].src);
     const auto *t = reinterpret_cast<const u32 *>(ds->s[1].src);
     const auto *c = reinterpret_cast<const u32 *>(ds->s[2].src);
     const std::uint8_t *nm = Lights ? ds->s[3].src : nullptr;
     auto *o = reinterpret_cast<u32 *>(dst);
-    const u32 a0 = c[0] >> 24;
-    u32 adiff = 0;
+    const Vec m956 = UvXform ? load(mem, 956u) : Vec{};
+    const Vec m957 = UvXform ? load(mem, 957u) : Vec{};
+    const Vec m958 = UvXform ? load(mem, 958u) : Vec{};
+    u32 amin = 255u, amax = 0u;
     for (u32 k = 0; k < n; ++k, p += pos_w, t += uv_w, ++c, o += 12) {
         o[0] = p[0]; o[1] = p[1]; o[2] = p[2];
-        o[3] = t[0]; o[4] = t[1];
+        if constexpr (UvXform) {
+            float u1, v1;
+            std::memcpy(&u1, &t[0], 4);
+            std::memcpy(&v1, &t[1], 4);
+            const float uo = m958.x + m956.x * u1 + m957.x * v1;
+            const float vo = m958.y + m956.y * u1 + m957.y * v1;
+            std::memcpy(&o[3], &uo, 4);
+            std::memcpy(&o[4], &vo, 4);
+        } else {
+            o[3] = t[0]; o[4] = t[1];
+        }
         const u32 col = c[0];
-        adiff |= (col >> 24) ^ a0;
+        const u32 a = col >> 24;
+        if (a < amin) amin = a;
+        if (a > amax) amax = a;
         o[5] = col;
         if constexpr (Lights) {
             o[6] = static_cast<u32>(nm[0]) | (static_cast<u32>(nm[1]) << 8) | (static_cast<u32>(nm[2]) << 16);
@@ -610,25 +722,32 @@ template <bool Lights>
         }
         o[7] = kOne; o[8] = 0; o[9] = 0; o[10] = 0; o[11] = 0;
     }
-    g.alpha_uniform = adiff == 0;
-    g.alpha_val = static_cast<std::uint8_t>(a0);
+    g.alpha_min = static_cast<std::uint8_t>(amin);
+    g.alpha_max = static_cast<std::uint8_t>(amax);
 }
 
-static inline void fill_generic_direct(Gpu &g, GpuVertex *dst, const DirectStreams *ds, u32 n, u32 pos_w, u32 uv_w, u32 nrm_step, bool lights) {
-    if (lights) fill_generic_direct_impl<true>(g, dst, ds, n, pos_w, uv_w, nrm_step);
-    else fill_generic_direct_impl<false>(g, dst, ds, n, pos_w, uv_w, nrm_step);
+static inline void fill_generic_direct(const std::uint8_t *mem, Gpu &g, GpuVertex *dst, const DirectStreams *ds, u32 n, u32 pos_w, u32 uv_w, u32 nrm_step, bool lights, bool uv_xform) {
+    if (uv_xform) {
+        if (lights) fill_generic_direct_impl<true, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+        else fill_generic_direct_impl<false, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+    } else if (lights) {
+        fill_generic_direct_impl<true, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+    } else {
+        fill_generic_direct_impl<false, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+    }
 }
 
-template <bool Lights, bool Uv1Xform, bool HasUv2>
+template <bool Lights, bool Uv1Xform, bool Uv2Xform, bool HasUv2>
 [[gnu::noinline]] static void fill_dual_direct_impl(const std::uint8_t *mem, Gpu &g, GpuVertex *dst, const DirectStreams *ds, u32 n, u32 pos_w, u32 uv_w, u32 nrm_step) {
     const auto *p = reinterpret_cast<const u32 *>(ds->s[0].src);
     const auto *t = reinterpret_cast<const u32 *>(ds->s[1].src);
     const auto *c = reinterpret_cast<const u32 *>(ds->s[2].src);
     const std::uint8_t *nm = Lights ? ds->s[3].src : nullptr;
     auto *o = reinterpret_cast<u32 *>(dst);
-    const Vec m963 = load(mem, 963u), m964 = load(mem, 964u), m965 = load(mem, 965u);
-    const u32 a0 = c[0] >> 24;
-    u32 adiff = 0;
+    const Vec m963 = (Uv1Xform || Uv2Xform) ? load(mem, 963u) : Vec{};
+    const Vec m964 = (Uv1Xform || Uv2Xform) ? load(mem, 964u) : Vec{};
+    const Vec m965 = (Uv1Xform || Uv2Xform) ? load(mem, 965u) : Vec{};
+    u32 amin = 255u, amax = 0u;
     for (u32 k = 0; k < n; ++k, p += pos_w, t += uv_w, ++c, o += 12) {
         o[0] = p[0]; o[1] = p[1]; o[2] = p[2];
         if constexpr (Uv1Xform) {
@@ -643,7 +762,9 @@ template <bool Lights, bool Uv1Xform, bool HasUv2>
             o[3] = t[0]; o[4] = t[1];
         }
         const u32 col = c[0];
-        adiff |= (col >> 24) ^ a0;
+        const u32 a = col >> 24;
+        if (a < amin) amin = a;
+        if (a > amax) amax = a;
         o[5] = col;
         if constexpr (Lights) {
             o[6] = static_cast<u32>(nm[0]) | (static_cast<u32>(nm[1]) << 8) | (static_cast<u32>(nm[2]) << 16);
@@ -656,39 +777,50 @@ template <bool Lights, bool Uv1Xform, bool HasUv2>
             float u2, v2;
             std::memcpy(&u2, &t[2], 4);
             std::memcpy(&v2, &t[3], 4);
-            g.uv2[k][0] = m965.z + m963.z * u2 + m964.z * v2;
-            g.uv2[k][1] = m965.w + m963.w * u2 + m964.w * v2;
+            if constexpr (Uv2Xform) {
+                g.uv2[k][0] = m965.z + m963.z * u2 + m964.z * v2;
+                g.uv2[k][1] = m965.w + m963.w * u2 + m964.w * v2;
+            } else {
+                g.uv2[k][0] = u2;
+                g.uv2[k][1] = v2;
+            }
         } else {
-            g.uv2[k][0] = m965.z;
-            g.uv2[k][1] = m965.w;
+            g.uv2[k][0] = Uv2Xform ? m965.z : 0.0f;
+            g.uv2[k][1] = Uv2Xform ? m965.w : 0.0f;
         }
     }
-    g.alpha_uniform = adiff == 0;
-    g.alpha_val = static_cast<std::uint8_t>(a0);
+    g.alpha_min = static_cast<std::uint8_t>(amin);
+    g.alpha_max = static_cast<std::uint8_t>(amax);
 }
 
-static inline void fill_dual_direct(const std::uint8_t *mem, Gpu &g, GpuVertex *dst, const DirectStreams *ds, u32 n, u32 pos_w, u32 uv_w, u32 nrm_step, bool lights, bool uv1_xform) {
+static inline void fill_dual_direct(const std::uint8_t *mem, Gpu &g, GpuVertex *dst, const DirectStreams *ds, u32 n, u32 pos_w, u32 uv_w, u32 nrm_step, bool lights, bool uv1_xform, bool uv2_xform) {
     const bool has_uv2 = uv_w >= 4u;
     if (lights) {
         if (uv1_xform) {
-            if (has_uv2) fill_dual_direct_impl<true, true, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
-            else fill_dual_direct_impl<true, true, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+            if (has_uv2) fill_dual_direct_impl<true, true, true, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+            else fill_dual_direct_impl<true, true, true, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+        } else if (uv2_xform) {
+            if (has_uv2) fill_dual_direct_impl<true, false, true, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+            else fill_dual_direct_impl<true, false, true, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
         } else {
-            if (has_uv2) fill_dual_direct_impl<true, false, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
-            else fill_dual_direct_impl<true, false, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+            if (has_uv2) fill_dual_direct_impl<true, false, false, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+            else fill_dual_direct_impl<true, false, false, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
         }
     } else {
         if (uv1_xform) {
-            if (has_uv2) fill_dual_direct_impl<false, true, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
-            else fill_dual_direct_impl<false, true, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+            if (has_uv2) fill_dual_direct_impl<false, true, true, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+            else fill_dual_direct_impl<false, true, true, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+        } else if (uv2_xform) {
+            if (has_uv2) fill_dual_direct_impl<false, false, true, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+            else fill_dual_direct_impl<false, false, true, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
         } else {
-            if (has_uv2) fill_dual_direct_impl<false, false, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
-            else fill_dual_direct_impl<false, false, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+            if (has_uv2) fill_dual_direct_impl<false, false, false, true>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
+            else fill_dual_direct_impl<false, false, false, false>(mem, g, dst, ds, n, pos_w, uv_w, nrm_step);
         }
     }
 }
 
-template <bool Lights, bool DirectW>
+template <bool Lights, bool DirectW, bool UvXform>
 [[gnu::noinline]] static int fill_skin_direct_impl(const std::uint8_t *mem, u32 top, Gpu &g, GpuVertex *dst, const DirectStreams *ds, u32 n, u32 pos_w, u32 uv_w, u32 nrm_step, u32 batch, std::uint16_t seen_gen) {
     const auto *p = reinterpret_cast<const u32 *>(ds->s[0].src);
     const auto *t = reinterpret_cast<const u32 *>(ds->s[1].src);
@@ -696,9 +828,11 @@ template <bool Lights, bool DirectW>
     const std::uint8_t *nm = Lights ? ds->s[3].src : nullptr;
     const auto *wp = DirectW ? reinterpret_cast<const u32 *>(ds->s[4].src) : nullptr;
     auto *o = reinterpret_cast<u32 *>(dst);
+    const Vec m956 = UvXform ? load(mem, 956u) : Vec{};
+    const Vec m957 = UvXform ? load(mem, 957u) : Vec{};
+    const Vec m958 = UvXform ? load(mem, 958u) : Vec{};
     u32 slots = 0;
-    const u32 a0 = c[0] >> 24;
-    u32 adiff = 0;
+    u32 amin = 255u, amax = 0u;
     std::uint16_t *const seen = g_bones.address_seen;
     std::uint8_t *const slot_tbl = g_bones.address_slot;
     u32 last_addr = ~0u;
@@ -724,9 +858,21 @@ template <bool Lights, bool DirectW>
     };
     for (u32 k = 0; k < n; ++k, p += pos_w, t += uv_w, ++c, o += 12) {
         o[0] = p[0]; o[1] = p[1]; o[2] = p[2];
-        o[3] = t[0]; o[4] = t[1];
+        if constexpr (UvXform) {
+            float u1, v1;
+            std::memcpy(&u1, &t[0], 4);
+            std::memcpy(&v1, &t[1], 4);
+            const float uo = m958.x + m956.x * u1 + m957.x * v1;
+            const float vo = m958.y + m956.y * u1 + m957.y * v1;
+            std::memcpy(&o[3], &uo, 4);
+            std::memcpy(&o[4], &vo, 4);
+        } else {
+            o[3] = t[0]; o[4] = t[1];
+        }
         const u32 col = c[0];
-        adiff |= (col >> 24) ^ a0;
+        const u32 a = col >> 24;
+        if (a < amin) amin = a;
+        if (a > amax) amax = a;
         o[5] = col;
         if constexpr (Lights) {
             o[6] = static_cast<u32>(nm[0]) | (static_cast<u32>(nm[1]) << 8) | (static_cast<u32>(nm[2]) << 16);
@@ -792,25 +938,36 @@ template <bool Lights, bool DirectW>
         o[11] = bones;
     }
     g.slots = slots;
-    g.alpha_uniform = adiff == 0;
-    g.alpha_val = static_cast<std::uint8_t>(a0);
+    g.alpha_min = static_cast<std::uint8_t>(amin);
+    g.alpha_max = static_cast<std::uint8_t>(amax);
     return 0;
 }
 
-static inline int fill_skin_direct(const std::uint8_t *mem, u32 top, Gpu &g, GpuVertex *dst, const DirectStreams *ds, u32 n, u32 pos_w, u32 uv_w, u32 nrm_step, bool lights, u32 batch, std::uint16_t seen_gen) {
+static inline int fill_skin_direct(const std::uint8_t *mem, u32 top, Gpu &g, GpuVertex *dst, const DirectStreams *ds, u32 n, u32 pos_w, u32 uv_w, u32 nrm_step, bool lights, bool uv_xform, u32 batch, std::uint16_t seen_gen) {
     const bool direct_w = (ds->mask & 16u) != 0;
-    if (lights) {
-        if (direct_w) return fill_skin_direct_impl<true, true>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
-        return fill_skin_direct_impl<true, false>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
+    if (uv_xform) {
+        if (lights) {
+            if (direct_w) return fill_skin_direct_impl<true, true, true>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
+            return fill_skin_direct_impl<true, false, true>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
+        }
+        if (direct_w) return fill_skin_direct_impl<false, true, true>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
+        return fill_skin_direct_impl<false, false, true>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
     }
-    if (direct_w) return fill_skin_direct_impl<false, true>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
-    return fill_skin_direct_impl<false, false>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
+    if (lights) {
+        if (direct_w) return fill_skin_direct_impl<true, true, false>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
+        return fill_skin_direct_impl<true, false, false>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
+    }
+    if (direct_w) return fill_skin_direct_impl<false, true, false>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
+    return fill_skin_direct_impl<false, false, false>(mem, top, g, dst, ds, n, pos_w, uv_w, nrm_step, batch, seen_gen);
 }
 
-[[gnu::noinline]] static int fill_skin_indirect(const std::uint8_t *mem, u32 top, Gpu &g, GpuVertex *dst, u32 n, bool lights, u32 batch, std::uint16_t seen_gen) {
+[[gnu::noinline]] static int fill_skin_indirect(const std::uint8_t *mem, u32 top, Gpu &g, GpuVertex *dst, u32 n, bool lights, bool uv_xform, u32 batch, std::uint16_t seen_gen) {
     auto *o = reinterpret_cast<u32 *>(dst);
+    const Vec m956 = uv_xform ? load(mem, 956u) : Vec{};
+    const Vec m957 = uv_xform ? load(mem, 957u) : Vec{};
+    const Vec m958 = uv_xform ? load(mem, 958u) : Vec{};
     u32 slots = 0;
-    u32 a0 = 0, adiff = 0;
+    u32 amin = 255u, amax = 0u;
     for (u32 k = 0; k < n; ++k, o += 12) {
         const u32 at = top + 5u * k;
         u32 p[4], t[4], w[4];
@@ -819,10 +976,21 @@ static inline int fill_skin_direct(const std::uint8_t *mem, u32 top, Gpu &g, Gpu
         words(mem, at + 4u, w);
         u32 col, nrm;
         if (!colour_normal(mem, at + 2u, lights, col, nrm)) return kGpuRange;
-        if (k == 0) a0 = col >> 24;
-        else adiff |= (col >> 24) ^ a0;
+        const u32 a = col >> 24;
+        if (a < amin) amin = a;
+        if (a > amax) amax = a;
         o[0] = p[0]; o[1] = p[1]; o[2] = p[2];
-        o[3] = t[0]; o[4] = t[1];
+        if (uv_xform) {
+            float u1, v1;
+            std::memcpy(&u1, &t[0], 4);
+            std::memcpy(&v1, &t[1], 4);
+            const float uo = m958.x + m956.x * u1 + m957.x * v1;
+            const float vo = m958.y + m956.y * u1 + m957.y * v1;
+            std::memcpy(&o[3], &uo, 4);
+            std::memcpy(&o[4], &vo, 4);
+        } else {
+            o[3] = t[0]; o[4] = t[1];
+        }
         o[5] = col; o[6] = nrm;
         u32 bones = 0;
         for (int i = 0; i < 4; ++i) {
@@ -847,8 +1015,8 @@ static inline int fill_skin_direct(const std::uint8_t *mem, u32 top, Gpu &g, Gpu
         o[11] = bones;
     }
     g.slots = slots;
-    g.alpha_uniform = adiff == 0;
-    g.alpha_val = static_cast<std::uint8_t>(a0);
+    g.alpha_min = static_cast<std::uint8_t>(amin);
+    g.alpha_max = static_cast<std::uint8_t>(amax);
     return 0;
 }
 
@@ -858,20 +1026,25 @@ int gpu_batch_setup(const Input &in, Gpu &g, End &end, BatchPlan &plan) {
     const std::uint8_t *mem = in.mem;
     const u32 flags = mem[0x3FF * 16];
     const u32 top = in.top & 1023u, n = in.itop & 1023u;
-    const bool ortho = in.program == 65;
-    const bool dual = in.program == 43 || in.program == 44;
-    const bool dual_uv1 = in.program == 44;
-    const bool skin = in.program == 64 || ortho;
-    if (n == 0 || n > 256u || top + (skin ? 5u : 4u) * n > 0x3D0u) return kGpuNotModelled;
-    if (ortho && (flags & 6u)) return kGpuNotModelled;   // only non-clipper strip (0x0FF0) for g3_skin_ortho
+    const bool ortho = in.program == 41 || in.program == 65 || in.program == 76 || in.program == 102;
+    const bool dual = in.program == 43 || in.program == 44 || in.program == 59 || in.program == 95;
+    const bool dual_uv1 = in.program == 44 || in.program == 95;
+    const bool dual_uv2 = in.program == 44 || in.program == 95;
+    const bool env = in.program == 51 || in.program == 53 || in.program == 73 || in.program == 75 || in.program == 76;
+    const bool no_cull = in.program == 46 || in.program == 51 || in.program == 59 || in.program == 73 || in.program == 95;
+    const bool uv_xform = in.program == 45 || in.program == 66 || in.program == 102;
+    const bool skin = in.program == 64 || in.program == 65 || in.program == 66 || in.program == 73 || in.program == 75 || in.program == 76 || in.program == 102;
+    if (n == 0 || n > 256u || top + (skin ? 5u : 4u) * n > ((uv_xform || dual || env) ? 956u : 0x3D0u)) return kGpuNotModelled;
+    if (ortho && (flags & 6u)) return kGpuNotModelled;   // only non-clipper strip for ortho programs
     // Triangle lists: only g3_generic's plain ones (flags 0xC) are known. Their vertices are the strip's, each triangle with
     // the strip's facing test as if it began at an even place (042 0x1520 on; tools/g3check -liststrip).
     const bool list = flags & 4u;
-    if (list && (skin || dual || (flags & 3u) || n % 3u)) return kGpuNotModelled;
+    if (list && (skin || dual || env || uv_xform || ortho || ((flags & 2u) ? !(flags & 8u) : (flags & 1u)) || n % 3u)) return kGpuNotModelled;
     const Vec v3 = load(mem, 0x3FC);
     if (v3.w + 0.0f != 0.0f) return kGpuNotModelled;
     const Vec mat = load(mem, 0x3FB);
     const bool has_lights = u16_at(mem, 0x3D4, 12) != 0;
+    const bool need_normals = has_lights || env;
     const DirectStreams *ds = in.streams;
     bool direct = false;
     u32 pos_w = 0, uv_w = 0, nrm_step = 0;
@@ -879,7 +1052,7 @@ int gpu_batch_setup(const Input &in, Gpu &g, End &end, BatchPlan &plan) {
         const bool ok_pos = (ds->mask & 1u) && ds->s[0].num >= n && ds->s[0].vl == 0 && (ds->s[0].vn == 2 || ds->s[0].vn == 3);
         const bool ok_uv = (ds->mask & 2u) && ds->s[1].num >= n && ds->s[1].vl == 0 && (ds->s[1].vn >= 1 && ds->s[1].vn <= 3);
         const bool ok_col = (ds->mask & 4u) && ds->s[2].num >= n && ds->s[2].vn == 3 && ds->s[2].vl == 2 && ds->s[2].usn;
-        const bool ok_nrm = !has_lights || ((ds->mask & 8u) && ds->s[3].num >= n && ds->s[3].vl == 2 && !ds->s[3].usn && (ds->s[3].vn == 2 || ds->s[3].vn == 3));
+        const bool ok_nrm = !need_normals || ((ds->mask & 8u) && ds->s[3].num >= n && ds->s[3].vl == 2 && !ds->s[3].usn && (ds->s[3].vn == 2 || ds->s[3].vn == 3));
         const bool ok_wgt = !skin || !(ds->mask & 16u) || (ds->s[4].num >= n && ds->s[4].vn == 3 && ds->s[4].vl == 0);
         const std::uintptr_t align_check =
             reinterpret_cast<std::uintptr_t>(ds->s[0].src) | reinterpret_cast<std::uintptr_t>(ds->s[1].src) |
@@ -888,7 +1061,7 @@ int gpu_batch_setup(const Input &in, Gpu &g, End &end, BatchPlan &plan) {
             direct = true;
             pos_w = static_cast<u32>(ds->s[0].vn + 1u);
             uv_w = static_cast<u32>(ds->s[1].vn + 1u);
-            nrm_step = has_lights ? static_cast<u32>(ds->s[3].vn + 1u) : 0u;
+            nrm_step = need_normals ? static_cast<u32>(ds->s[3].vn + 1u) : 0u;
         } else {
             return -2;
         }
@@ -897,12 +1070,12 @@ int gpu_batch_setup(const Input &in, Gpu &g, End &end, BatchPlan &plan) {
         if (skin || !(flags & 8u)) return kGpuNotModelled;
         end.clipper = true;
         G3_PROF_EXTRA(11);
-        const bool culled = direct ? clipper_culls_all_direct(in, ds->s[0].src, pos_w * 4u, n) : clipper_culls_all(in, top, n);
-        if (culled) {
+        const int clip = direct ? clipper_test_direct(in, ds->s[0].src, pos_w * 4u, n) : clipper_test_indirect(in, top, n);
+        if (clip == 1) {
             end.swap = false;
             return -1;
         }
-        // PICA200 clips homogeneous clip space (near, far, w <= 0, and guard band) in hardware.
+        if (clip == 2) return kGpuClipDepth;
     }
 
     // PRIM from the GIF tag: a Gouraud triangle strip with ST coordinates is what the shader and the strip indices assume.
@@ -911,55 +1084,84 @@ int gpu_batch_setup(const Input &in, Gpu &g, End &end, BatchPlan &plan) {
     if (!(tag_hi & (1u << 14))) return kGpuPrim;   // no PRE: PRIM would stay as it was
     g.prim = (tag_hi >> 15) & 0x7FFu;
     if ((g.prim & 7u) != (list ? 3u : 4u) || !(g.prim & 8u) || (g.prim & 0x100u)) return kGpuPrim;
-    if (dual) {
-        const Vec tag2 = load(mem, 956u);
+    if (dual || env) {
+        const Vec tag2 = load(mem, env ? 962u : 956u);
         const u32 tag2_hi = bits(tag2.y);
         if (!(tag2_hi & (1u << 14))) return kGpuPrim;
         g.prim2 = (tag2_hi >> 15) & 0x7FFu;
         if ((g.prim2 & 7u) != 4u || !(g.prim2 & 8u) || (g.prim2 & 0x100u)) return kGpuPrim;
     }
+    g.env = false;
+    if (env) {
+        const Vec m0 = load(mem, 963u), m1 = load(mem, 964u), m2 = load(mem, 965u), ev = load(mem, 966u);
+        const float sx = 0.0f - ev.z, sy = 0.0f - ev.w;
+        set4(g.env_u, m0.x * sx, m1.x * sx, m2.x * sx, (0.0f - ev.x) * sx);
+        set4(g.env_v, m0.y * sy, m1.y * sy, m2.y * sy, (0.0f - ev.y) * sy);
+        g.env_coeff = m2.w;
+    }
 
     // Lights: ambient ones summed; directional ones each get N.L clamped at 0. Without lights, the colour times the material.
-    float amb_x = 0.0f, amb_y = 0.0f, amb_z = 0.0f;
-    unsigned directional = 0;
-    if (has_lights) {
-        const Vec m8 = load(mem, 0x3D0), m9 = load(mem, 0x3D1), m10 = load(mem, 0x3D2), m11 = load(mem, 0x3D3);
-        const float v10w = 0.0f - 1.0f * m11.w;
-        u32 at = 0x3D4;
-        unsigned count = 0;
-        for (;;) {
-            if (count == 32u) return kGpuNotModelled;
-            const u32 type = u16_at(mem, at, 12);
-            if (type == 2u) {   // ambient
-                const Vec lc = load(mem, at);
-                amb_x += lc.x * v3.x;
-                amb_y += lc.y * v3.x;
-                amb_z += lc.z * v3.x;
-                ++count;
-                at += 1u;
-                continue;
-            }
-            if (type == 1u) {   // directional
-                if (directional == 3u) return kGpuLights;
-                const Vec lc = load(mem, at), p = load(mem, at + 1u);
-                float dx = m8.x * p.x, dy = m8.y * p.x, dz = m8.z * p.x;
-                dx = dx + m9.x * p.y; dy = dy + m9.y * p.y; dz = dz + m9.z * p.y;
-                dx = dx + m10.x * p.z; dy = dy + m10.y * p.z; dz = dz + m10.z * p.z;
-                set4(g.light_dir[directional], dx * v10w, dy * v10w, dz * v10w, 0.0f);
-                set4(g.light_colour[directional], lc.x * v3.z, lc.y * v3.z, lc.z * v3.z, 0.0f);
-                ++directional;
-                ++count;
-                at += 2u;
-                continue;
-            }
-            if (type == 0x80u || type == 0x81u || type == 0x82u) return kGpuNotModelled;
-            break;
-        }
+    // The batches of one model have the same lights, so what the last ones gave is kept with the memory they came from.
+    const u32 light_x = bits(v3.x), light_z = bits(v3.z);
+    bool same_lights = false;
+    if (has_lights && g.light_words && g.light_x == light_x && g.light_z == light_z) {
+        const u32 *now = reinterpret_cast<const u32 *>(mem + 0x3D0u * 16u), *was = g.light_mem;
+        u32 diff = 0;
+        for (unsigned left = g.light_words; left && !diff; left -= 4u, now += 4, was += 4)
+            diff = (now[0] ^ was[0]) | (now[1] ^ was[1]) | (now[2] ^ was[2]) | (now[3] ^ was[3]);
+        same_lights = diff == 0u;
     }
-    set4(g.ambient, amb_x, amb_y, amb_z, 0.0f);
-    for (unsigned d = directional; d < 3u; ++d) {
-        set4(g.light_dir[d], 0, 0, 0, 0);
-        set4(g.light_colour[d], 0, 0, 0, 0);
+    if (!same_lights) {
+        g.light_words = 0;
+        float amb_x = 0.0f, amb_y = 0.0f, amb_z = 0.0f;
+        unsigned directional = 0;
+        if (has_lights) {
+            const Vec m8 = load(mem, 0x3D0), m9 = load(mem, 0x3D1), m10 = load(mem, 0x3D2), m11 = load(mem, 0x3D3);
+            const float v10w = 0.0f - 1.0f * m11.w;
+            u32 at = 0x3D4;
+            unsigned count = 0;
+            for (;;) {
+                if (count == 32u) return kGpuNotModelled;
+                const u32 type = u16_at(mem, at, 12);
+                if (type == 2u) {   // ambient
+                    const Vec lc = load(mem, at);
+                    amb_x += lc.x * v3.x;
+                    amb_y += lc.y * v3.x;
+                    amb_z += lc.z * v3.x;
+                    ++count;
+                    at += 1u;
+                    continue;
+                }
+                if (type == 1u) {   // directional
+                    if (directional == 3u) return kGpuLights;
+                    const Vec lc = load(mem, at), p = load(mem, at + 1u);
+                    float dx = m8.x * p.x, dy = m8.y * p.x, dz = m8.z * p.x;
+                    dx = dx + m9.x * p.y; dy = dy + m9.y * p.y; dz = dz + m9.z * p.y;
+                    dx = dx + m10.x * p.z; dy = dy + m10.y * p.z; dz = dz + m10.z * p.z;
+                    set4(g.light_dir[directional], dx * v10w, dy * v10w, dz * v10w, 0.0f);
+                    set4(g.light_colour[directional], lc.x * v3.z, lc.y * v3.z, lc.z * v3.z, 0.0f);
+                    ++directional;
+                    ++count;
+                    at += 2u;
+                    continue;
+                }
+                if (type == 0x80u || type == 0x81u || type == 0x82u) return kGpuNotModelled;
+                break;
+            }
+            const u32 words = (at + 1u - 0x3D0u) * 4u;   // up to the entry that ended the list
+            if (words <= 64u) {
+                std::memcpy(g.light_mem, mem + 0x3D0u * 16u, words * 4u);
+                g.light_words = words;
+                g.light_x = light_x;
+                g.light_z = light_z;
+            }
+        }
+        set4(g.ambient, amb_x, amb_y, amb_z, 0.0f);
+        for (unsigned d = directional; d < 3u; ++d) {
+            set4(g.light_dir[d], 0, 0, 0, 0);
+            set4(g.light_colour[d], 0, 0, 0, 0);
+        }
+        g.has_dir_lights = directional > 0u;
     }
     set4(g.material, mat.x, mat.y, mat.z, mat.w);
 
@@ -979,31 +1181,36 @@ int gpu_batch_setup(const Input &in, Gpu &g, End &end, BatchPlan &plan) {
     }
     set4(g.offset, v2.x, v2.y, v2.z, 0);
     g.ortho = ortho;
-    g.fog = ortho ? ((g.prim & 0x20u) != 0) : (((flags & 1u) != 0) || (end.clipper && (((g.prim | (dual ? g.prim2 : 0ull)) & 0x20u) != 0)));
+    g.fog = ortho ? ((g.prim & 0x20u) != 0) : (((flags & 1u) != 0) || (end.clipper && (((g.prim | ((dual || env) ? g.prim2 : 0ull)) & 0x20u) != 0)));
     g.xyzf = ((bits(tag.z) >> 8) & 0xFu) == 4u;
     g.clipper = end.clipper;
     g.fog_scale = fog.z;
     g.fog_near = fog.w;
 
     // Which facings keep their triangles: ADC set means the GS leaves the triangle out.
-    const u32 cull = u16_at(mem, 0x3FF, 8);
-    bool adc_negative, adc_positive;
-    if (g.fog || ortho || end.clipper) {
-        adc_negative = cull != 32u;
-        adc_positive = cull != 0u;
+    if (no_cull) {
+        g.keep_negative = true;
+        g.keep_positive = true;
     } else {
-        const u32 base = ((cull + 0x7FE0u) | 0x7FE0u) & 0xFFFFu;
-        adc_negative = ((base + 32u) >> 15) & 1u;
-        adc_positive = (base >> 15) & 1u;
+        const u32 cull = u16_at(mem, 0x3FF, 8);
+        bool adc_negative, adc_positive;
+        if (g.fog || ortho) {
+            adc_negative = cull != 32u;
+            adc_positive = cull != 0u;
+        } else {
+            const u32 base = ((cull + 0x7FE0u) | 0x7FE0u) & 0xFFFFu;
+            adc_negative = ((base + 32u) >> 15) & 1u;
+            adc_positive = (base >> 15) & 1u;
+        }
+        g.keep_negative = !adc_negative;
+        g.keep_positive = !adc_positive;
+        if (!g.keep_negative && !g.keep_positive) return (cull != 0u && cull != 32u) ? kGpuNotModelled : -1;
     }
-    g.keep_negative = !adc_negative;
-    g.keep_positive = !adc_positive;
-    if (!g.keep_negative && !g.keep_positive) return -1;
 
     g.n = n;
     g.skin = skin;
     g.slots = 0;
-    plan = BatchPlan{skin, dual, dual_uv1, list, direct, has_lights, top, n, pos_w, uv_w, nrm_step};
+    plan = BatchPlan{skin, dual, dual_uv1, dual_uv2, env, uv_xform, list, direct, has_lights, need_normals, top, n, pos_w, uv_w, nrm_step};
     return 0;
 }
 
@@ -1012,28 +1219,34 @@ int gpu_batch_fill(const Input &in, Gpu &g, const BatchPlan &plan, GpuVertex *ds
     if (!plan.skin) {
         G3_PROF_EXTRA(12);
         if (plan.direct) {
-            if (plan.dual) fill_dual_direct(mem, g, dst, in.streams, plan.n, plan.pos_w, plan.uv_w, plan.nrm_step, plan.lights, plan.dual_uv1);
-            else fill_generic_direct(g, dst, in.streams, plan.n, plan.pos_w, plan.uv_w, plan.nrm_step, plan.lights);
+            if (plan.dual) fill_dual_direct(mem, g, dst, in.streams, plan.n, plan.pos_w, plan.uv_w, plan.nrm_step, plan.normals, plan.dual_uv1, plan.dual_uv2);
+            else fill_generic_direct(mem, g, dst, in.streams, plan.n, plan.pos_w, plan.uv_w, plan.nrm_step, plan.normals, plan.uv_xform);
         } else {
             auto *o = reinterpret_cast<u32 *>(dst);
-            const Vec m963 = plan.dual ? load(mem, 963u) : Vec{}, m964 = plan.dual ? load(mem, 964u) : Vec{}, m965 = plan.dual ? load(mem, 965u) : Vec{};
-            u32 a0 = 0, adiff = 0;
+            const u32 uv_base = plan.dual ? 963u : 956u;
+            const bool do_uv1 = plan.dual_uv1 || plan.uv_xform;
+            const bool need_mat = do_uv1 || plan.dual_uv2;
+            const Vec m0 = need_mat ? load(mem, uv_base) : Vec{};
+            const Vec m1 = need_mat ? load(mem, uv_base + 1u) : Vec{};
+            const Vec m2 = need_mat ? load(mem, uv_base + 2u) : Vec{};
+            u32 amin = 255u, amax = 0u;
             for (u32 k = 0; k < plan.n; ++k, o += 12) {
                 const u32 at = plan.top + 4u * k;
                 u32 p[4], t[4];
                 words(mem, at, p);
                 words(mem, at + 1u, t);
                 u32 col, nrm;
-                if (!colour_normal(mem, at + 2u, plan.lights, col, nrm)) return kGpuRange;
-                if (k == 0) a0 = col >> 24;
-                else adiff |= (col >> 24) ^ a0;
+                if (!colour_normal(mem, at + 2u, plan.normals, col, nrm)) return kGpuRange;
+                const u32 a = col >> 24;
+                if (a < amin) amin = a;
+                if (a > amax) amax = a;
                 o[0] = p[0]; o[1] = p[1]; o[2] = p[2];
-                if (plan.dual_uv1) {
+                if (do_uv1) {
                     float u1, v1;
                     std::memcpy(&u1, &t[0], 4);
                     std::memcpy(&v1, &t[1], 4);
-                    const float u1o = m965.x + m963.x * u1 + m964.x * v1;
-                    const float v1o = m965.y + m963.y * u1 + m964.y * v1;
+                    const float u1o = m2.x + m0.x * u1 + m1.x * v1;
+                    const float v1o = m2.y + m0.y * u1 + m1.y * v1;
                     std::memcpy(&o[3], &u1o, 4);
                     std::memcpy(&o[4], &v1o, 4);
                 } else {
@@ -1045,12 +1258,17 @@ int gpu_batch_fill(const Input &in, Gpu &g, const BatchPlan &plan, GpuVertex *ds
                     float u2, v2;
                     std::memcpy(&u2, &t[2], 4);
                     std::memcpy(&v2, &t[3], 4);
-                    g.uv2[k][0] = m965.z + m963.z * u2 + m964.z * v2;
-                    g.uv2[k][1] = m965.w + m963.w * u2 + m964.w * v2;
+                    if (plan.dual_uv2) {
+                        g.uv2[k][0] = m2.z + m0.z * u2 + m1.z * v2;
+                        g.uv2[k][1] = m2.w + m0.w * u2 + m1.w * v2;
+                    } else {
+                        g.uv2[k][0] = u2;
+                        g.uv2[k][1] = v2;
+                    }
                 }
             }
-            g.alpha_uniform = adiff == 0;
-            g.alpha_val = static_cast<std::uint8_t>(a0);
+            g.alpha_min = static_cast<std::uint8_t>(amin);
+            g.alpha_max = static_cast<std::uint8_t>(amax);
         }
         if (plan.list) list_to_strip(g);
         return 0;
@@ -1064,8 +1282,8 @@ int gpu_batch_fill(const Input &in, Gpu &g, const BatchPlan &plan, GpuVertex *ds
     const std::uint16_t seen_gen = g_bones.seen_gen;
     g_bones.use_count = 0;
     G3_PROF_EXTRA(13);
-    if (plan.direct) return fill_skin_direct(mem, plan.top, g, dst, in.streams, plan.n, plan.pos_w, plan.uv_w, plan.nrm_step, plan.lights, batch, seen_gen);
-    return fill_skin_indirect(mem, plan.top, g, dst, plan.n, plan.lights, batch, seen_gen);
+    if (plan.direct) return fill_skin_direct(mem, plan.top, g, dst, in.streams, plan.n, plan.pos_w, plan.uv_w, plan.nrm_step, plan.normals, plan.uv_xform, batch, seen_gen);
+    return fill_skin_indirect(mem, plan.top, g, dst, plan.n, plan.normals, plan.uv_xform, batch, seen_gen);
 }
 
 int gpu_batch(const Input &in, Gpu &g, End &end) {
@@ -1080,7 +1298,7 @@ int gpu_batch(const Input &in, Gpu &g, End &end) {
 // sets the screen offset vf2 from M[0x3F8]+M[0x3F9], sets vi13/vi14, and stores the branch target in M[0x3FF].y.
 void init_state(int program, std::uint8_t *mem, ps2::Vu0Regs &r) {
     const Vec m5 = load(mem, 0x3F7), m2 = load(mem, 0x3F8), m3 = load(mem, 0x3F9);
-    if (program == 65) {
+    if (program == 41 || program == 65 || program == 76 || program == 102) {
         for (int k = 0; k < 4; ++k) {
             const Vec q = load(mem, 0x3F0u + static_cast<u32>(k));
             const float x = (k == 3 ? q.x - 0.5f : q.x) * m5.x;
@@ -1097,14 +1315,39 @@ void init_state(int program, std::uint8_t *mem, ps2::Vu0Regs &r) {
         r.vf[2].w[3] = 0u;
         r.i = 0x3F000000u;
         const u32 flags = u16_at(mem, 0x3FF, 0);
-        r.vi[13] = 430u;
-        r.vi[14] = 565u;
+        if (program == 76) {
+            const bool full_clip = (flags & 2u) && (flags & 8u);
+            r.vi[12] = 360u;
+            r.vi[13] = full_clip ? 436u : 473u;
+            r.vi[14] = full_clip ? 512u : 586u;
+            u32 i15;
+            if (flags & 2u) {
+                if (flags & 8u) i15 = (flags & 4u) ? 1174u : 816u;
+                else i15 = (flags & 4u) ? 744u : 654u;
+            } else {
+                i15 = (flags & 4u) ? 596u : 520u;
+            }
+            std::memcpy(mem + 0x3FF * 16 + 4, &i15, 4);
+            return;
+        }
+        r.vi[13] = program == 41 ? 552u : 430u;
+        r.vi[14] = program == 41 ? 764u : 565u;
         u32 i12;
-        if (flags & 2u) {
-            if (flags & 8u) i12 = (flags & 4u) ? 1195u : 793u;
-            else i12 = (flags & 4u) ? 723u : 635u;
+        if (program == 41) {
+            if (flags & 2u) {
+                if (flags & 8u) i12 = (flags & 4u) ? 1105u : 703u;
+                else i12 = (flags & 4u) ? 633u : 545u;
+            } else {
+                i12 = (flags & 4u) ? 492u : 420u;
+            }
         } else {
-            i12 = (flags & 4u) ? 582u : 510u;
+            if (flags & 2u) {
+                if (flags & 8u) i12 = (flags & 4u) ? 1195u : 793u;
+                else i12 = (flags & 4u) ? 723u : 635u;
+            } else {
+                i12 = (flags & 4u) ? 582u : 510u;
+            }
+            if (program == 102) i12 += 21u;
         }
         std::memcpy(mem + 0x3FF * 16 + 4, &i12, 4);
         return;
@@ -1126,23 +1369,24 @@ void init_state(int program, std::uint8_t *mem, ps2::Vu0Regs &r) {
     r.vf[2].w[3] = 0u;
     r.i = 0x3F000000u;
     const u32 flags = u16_at(mem, 0x3FF, 0);
-    if (program == 43 || program == 44) {
+    if (program == 43 || program == 44 || program == 51 || program == 53 || program == 59 || program == 73 || program == 75 || program == 95) {
         const bool full_clip = (flags & 2u) && (flags & 8u);
-        r.vi[12] = 448u;
-        r.vi[13] = full_clip ? 563u : 617u;
-        r.vi[14] = full_clip ? 678u : 786u;
+        const bool skin_3buf = program == 73 || program == 75;
+        r.vi[12] = skin_3buf ? 360u : 448u;
+        r.vi[13] = skin_3buf ? (full_clip ? 436u : 473u) : (full_clip ? 563u : 617u);
+        r.vi[14] = skin_3buf ? (full_clip ? 512u : 586u) : (full_clip ? 678u : 786u);
         u32 i15;
-        if (program == 43) {
+        if (program == 43) {   // ELF 061 dual[1]
             if (flags & 2u) {
-                if (flags & 8u) i15 = (flags & 4u) ? 1438u : 1073u;
-                else if (flags & 4u) i15 = (flags & 1u) ? 995u : 829u;
-                else i15 = (flags & 1u) ? 889u : 739u;
+                if (flags & 8u) i15 = (flags & 4u) ? 1416u : 1058u;
+                else if (flags & 4u) i15 = (flags & 1u) ? 980u : 814u;
+                else i15 = (flags & 1u) ? 874u : 724u;
             } else if (flags & 4u) {
-                i15 = (flags & 1u) ? 670u : 526u;
+                i15 = (flags & 1u) ? 655u : 508u;
             } else {
-                i15 = (flags & 1u) ? 581u : 458u;
+                i15 = (flags & 1u) ? 565u : 437u;
             }
-        } else {
+        } else if (program == 44) {   // ELF 097 dualuv[1]
             if (flags & 2u) {
                 if (flags & 8u) i15 = (flags & 4u) ? 1437u : 1079u;
                 else if (flags & 4u) i15 = (flags & 1u) ? 1001u : 835u;
@@ -1152,13 +1396,75 @@ void init_state(int program, std::uint8_t *mem, ps2::Vu0Regs &r) {
             } else {
                 i15 = (flags & 1u) ? 586u : 458u;
             }
+        } else if (program == 59) {   // ELF 059 dual[0] no-cull
+            if (flags & 2u) {
+                if (flags & 8u) i15 = (flags & 4u) ? 943u : 626u;
+                else i15 = (flags & 1u) ? 562u : 515u;
+            } else {
+                i15 = (flags & 1u) ? 465u : 423u;
+            }
+        } else if (program == 95) {   // ELF 095 dualuv[0] no-cull
+            if (flags & 2u) {
+                if (flags & 8u) i15 = (flags & 4u) ? 964u : 647u;
+                else i15 = (flags & 1u) ? 583u : 536u;
+            } else {
+                i15 = (flags & 1u) ? 486u : 444u;
+            }
+        } else if (program == 51) {   // ELF 051 gen_env[0]
+            if (flags & 2u) {
+                if (flags & 8u) i15 = (flags & 4u) ? 970u : 646u;
+                else i15 = (flags & 1u) ? 581u : 534u;
+            } else {
+                i15 = (flags & 1u) ? 484u : 444u;
+            }
+        } else if (program == 53) {   // ELF 053 gen_env[1]
+            if (flags & 2u) {
+                if (flags & 8u) i15 = (flags & 4u) ? 1438u : 1073u;
+                else if (flags & 4u) i15 = (flags & 1u) ? 995u : 829u;
+                else i15 = (flags & 1u) ? 889u : 739u;
+            } else if (flags & 4u) {
+                i15 = (flags & 1u) ? 670u : 526u;
+            } else {
+                i15 = (flags & 1u) ? 581u : 458u;
+            }
+        } else if (program == 73) {   // ELF 073 skin_env[0]
+            if (flags & 2u) {
+                if (flags & 8u) i15 = (flags & 4u) ? 1046u : 722u;
+                else i15 = (flags & 1u) ? 657u : 610u;
+            } else {
+                i15 = (flags & 1u) ? 560u : 520u;
+            }
+        } else {   // ELF 075 skin_env[1]
+            if (flags & 2u) {
+                if (flags & 8u) i15 = (flags & 4u) ? 1514u : 1149u;
+                else if (flags & 4u) i15 = (flags & 1u) ? 1071u : 905u;
+                else i15 = (flags & 1u) ? 965u : 815u;
+            } else if (flags & 4u) {
+                i15 = (flags & 1u) ? 746u : 602u;
+            } else {
+                i15 = (flags & 1u) ? 657u : 534u;
+            }
         }
         std::memcpy(mem + 0x3FF * 16 + 4, &i15, 4);
         return;
     }
-    const bool skin = program == 64;
-    r.vi[13] = skin ? 430u : 552u;
-    r.vi[14] = skin ? 565u : 764u;
+    if (program == 46) {   // ELF 046 g3_generic[0] no-cull
+        r.vi[13] = 552u;
+        r.vi[14] = 764u;
+        u32 i12;
+        if (flags & 2u) {
+            if (flags & 8u) i12 = (flags & 4u) ? 987u : 608u;
+            else i12 = (flags & 1u) ? 547u : 506u;
+        } else {
+            i12 = (flags & 1u) ? 458u : 422u;
+        }
+        std::memcpy(mem + 0x3FF * 16 + 4, &i12, 4);
+        return;
+    }
+    const bool skin = program == 64 || program == 66;
+    const bool uv_xform = program == 45 || program == 66;
+    r.vi[13] = skin ? 430u : (uv_xform ? 544u : 552u);
+    r.vi[14] = skin ? 565u : (uv_xform ? 750u : 764u);
     u32 i12;
     if (flags & 2u) {
         if (flags & 8u) i12 = (flags & 4u) ? (skin ? 1528u : 1438u) : (skin ? 1113u : 1023u);
@@ -1169,13 +1475,14 @@ void init_state(int program, std::uint8_t *mem, ps2::Vu0Regs &r) {
     } else {
         i12 = (flags & 1u) ? (skin ? 644u : 554u) : (skin ? 524u : 434u);
     }
+    if (uv_xform) i12 += 21u;
     std::memcpy(mem + 0x3FF * 16 + 4, &i12, 4);
 }
 
 // The batch end (042 0x3940, 064 0x3C10): the two output buffers vi13 and vi14 change places, vi15 points back at the batch
 // start (0x198 / 8) for the next MSCNT, and the E bit leaves TPC just past the end.
 void leave_state(int program, const End &end, ps2::Vu0Regs &r) {
-    if (program == 43 || program == 44) {
+    if (program == 43 || program == 44 || program == 51 || program == 53 || program == 59 || program == 73 || program == 75 || program == 76 || program == 95) {
         if (end.swap) {
             const std::uint16_t a = r.vi[12], b = r.vi[13], c = r.vi[14];
             r.vi[12] = c;
@@ -1187,8 +1494,10 @@ void leave_state(int program, const End &end, ps2::Vu0Regs &r) {
                 const float w = f(r.vf[i].w[3]) + 0.0f;
                 r.vf[i].w[2] = bits(w - w);
             }
-        r.vi[15] = 54;
-        r.tpc = 0x3798u;
+        r.vi[15] = (program == 51 || program == 59 || program == 73 || program == 76 || program == 95) ? 40 : 54;
+        r.tpc = program == 43 ? 0x36F0u : program == 44 ? 0x3798u : program == 51 ? 0x28A8u :
+                program == 53 ? 0x3808u : program == 59 ? 0x2768u : program == 73 ? 0x2B08u :
+                program == 75 ? 0x3A68u : program == 95 ? 0x2810u : 0x2F88u;
         return;
     }
     if (end.swap) {
@@ -1201,8 +1510,9 @@ void leave_state(int program, const End &end, ps2::Vu0Regs &r) {
             const float w = f(r.vf[i].w[3]) + 0.0f;   // the clipper's first pass sets z to 0 + w, its end subtracts it from itself
             r.vf[i].w[2] = bits(w - w);
         }
-    r.vi[15] = program == 65 ? 37 : 51;
-    r.tpc = program == 65 ? 0x3138u : program == 64 ? 0x3C38u : 0x3968u;
+    r.vi[15] = program == 46 ? 39 : (program == 41 || program == 65 || program == 102) ? 37 : 51;
+    r.tpc = program == 41 ? 0x2E68u : program == 46 ? 0x2AA8u : program == 102 ? 0x31E0u : program == 65 ? 0x3138u :
+            program == 66 ? 0x3CE0u : program == 64 ? 0x3C38u : program == 45 ? 0x3A10u : 0x3968u;
 }
 #endif
 

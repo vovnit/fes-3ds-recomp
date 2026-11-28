@@ -25,7 +25,7 @@ namespace {
 
 constexpr std::uint32_t kChunk = 8000;            // EE cycles, about 30 microseconds on the console
 constexpr std::uint32_t kMaxLag = 10000000;       // EE cycles, two PS2 frames: past this the game waits
-constexpr std::size_t kStack = 1u << 20;
+constexpr std::size_t kStack = 128u << 10;
 constexpr std::uint32_t kEdges = 32;
 
 struct Edge {
@@ -191,13 +191,17 @@ void iop_edge(bool start) {
     wake();
 }
 
-void iop_wait() {
+// The game's wait for a reply ends when one is there (enough): the I/O processor is often a vblank's work behind by then, and the
+// game, which the rest of the picture waits on, has nothing to gain from all of it.
+void iop_wait(bool (*enough)()) {
     if (!g_running) return;
     wake();
     const WaitTimer timer;
     while (behind(g_target.load(std::memory_order_relaxed)) > 0 ||
-           g_edge_out.load(std::memory_order_acquire) != g_edge_in.load(std::memory_order_relaxed))
+           g_edge_out.load(std::memory_order_acquire) != g_edge_in.load(std::memory_order_relaxed)) {
+        if (enough && enough()) return;
         svcSleepThread(20000);
+    }
 }
 
 }

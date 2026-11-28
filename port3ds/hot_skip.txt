@@ -1,8 +1,23 @@
 # Labels that get no hot copy (p3fes_eehot.py make --skip): loop starts inside functions that are natives, reached only
 # when the native hands the call back to the game's code.
+003118A0
+003118D8
+00311914
+00311C38
+00312AE4
+00312B60
+0046B5A4
+0046B6CC
+0046B790
+0046B864
+004C9E1C
+004FA8C8
 005039C0
 00503B00
 00521444
 005214A4
 005241A0
 00524238
+00524400
+0052447C
+0052449C

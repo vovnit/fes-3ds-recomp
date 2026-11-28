@@ -6,6 +6,8 @@ CTRU      := $(DEVKITPRO)/libctru
 PORTLIBS  := $(DEVKITPRO)/portlibs/3ds
 TOOLS     := $(DEVKITPRO)/tools/bin
 OUT       := /w/build/3ds
+# Code and data together. 49599444 starts, 49928580 does not (the PS2 memory cannot be mapped).
+MOST      := 49700000
 
 ARCH      := -march=armv6k -mtune=arm1136jf-s -mfloat-abi=hard -mtp=soft
 OPT       ?= -O2
@@ -67,6 +69,7 @@ $(OUT)/p3fes.3dsx: $(OUT)/p3fes.elf
 $(OUT)/p3fes.elf: $(OBJS) $(CONFIG)
 	$(PREFIX)g++ -specs=3dsx.specs $(ARCH) -Wl,--gc-sections $(GPU_WRAP) -Wl,-Map,$(OUT)/p3fes.map $(OBJS) -L$(CTRU)/lib -L$(PORTLIBS)/lib -lcitro3d -lctru -lz -lm -o $@
 	$(PREFIX)size $@
+	@$(PREFIX)size $@ | awk 'NR == 2 && $$4 > $(MOST) { print "The program takes " $$4 " bytes; over $(MOST) the console has no room left for the PS2 memory."; exit 1 }' || { rm -f $@; exit 1; }
 
 # The g3 model must round as the VU programs do: every multiply and add on its own (tools/g3check builds it the same way).
 $(OUT)/obj/p/port3ds/g3model.o: CXXFLAGS += -O3 -ffp-contract=off
@@ -82,8 +85,9 @@ $(OUT)/obj/w/runtime/src/gs/queue.o: CXXFLAGS += -O3
 $(OUT)/obj/p/port3ds/remote3ds.o: CXXFLAGS += -I$(PORTLIBS)/include
 
 # Translated game code: exceptions never pass through it, and leaving them out makes it smaller.
-# GAMEOPT adds flags for the translated EE code alone (generated/p3fes/unit_*), for experiments such as -mthumb.
-GAMEOPT   ?=
+# GAMEOPT sets flags for the cold translated EE units (generated/p3fes/unit_*), while hot_*.cpp stays -O2.
+# -Os shrinks the ELF by 6.7 MB and cuts ARM11 L1 I-cache misses by ~10%, lifting Lobby auto-skip from 12 to 15 pics/s.
+GAMEOPT   ?= -Os
 $(OUT)/obj/w/generated/%.o: /w/generated/%.cpp $(CONFIG)
 	@mkdir -p $(dir $@)
 	$(PREFIX)g++ $(CXXFLAGS) $(if $(findstring /p3fes/unit_,$<),$(GAMEOPT)) -DPS2_VU_FAST -fno-exceptions -fno-rtti -I/w/generated/p3fes -Wno-unused-label -Wno-unused-variable -c $< -o $@

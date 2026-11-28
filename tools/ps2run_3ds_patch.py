@@ -2790,13 +2790,13 @@ void iop_lock();
 void iop_unlock();
 void iop_advance(std::uint64_t ee_cycles);
 void iop_edge(bool start);
-void iop_wait();
+void iop_wait(bool (*enough)() = nullptr);   // until it is level with the game, or enough() says so
 struct IopGuard {
     IopGuard() { iop_lock(); }
     ~IopGuard() { iop_unlock(); }
 };
 #else
-inline void iop_wait() {}
+inline void iop_wait(bool (*)() = nullptr) {}
 struct IopGuard {};
 #endif
 '''),
@@ -2810,7 +2810,7 @@ std::uint64_t g_iop_tight = 0;   // until this time, a game with nothing to do w
 
 void idle(Cpu &c) {
 #ifdef __3DS__
-    if (now() < g_iop_tight) iop_wait();
+    if (now() < g_iop_tight) iop_wait(sif::reply_ready);
 #endif
     std::uint64_t next = next_event_time();
 '''),
@@ -2895,6 +2895,7 @@ void request_iop_sync() {
 void dump();
 ''', '''void pump();
 bool pump_wanted();
+bool reply_ready();
 void dump();
 '''),
     ],
@@ -2960,6 +2961,7 @@ void pump() {
 }
 
 bool pump_wanted() { return g_sif_wake.load() || g_sif_binds.load(); }
+bool reply_ready() { return g_sif_wake.load(); }   // a packet for the game
 
 void pump() {
     g_sif_wake.store(false);
@@ -5540,9 +5542,9 @@ bool run_unchanging(int unit, Unit &u, const std::uint8_t *data, std::uint32_t q
 IOPAHEAD_EDITS = {
     'runtime/include/ps2/system.hpp': [
         (r"""void iop_edge(bool start);
-void iop_wait();""", r"""void iop_edge(bool start);
+void iop_wait(bool (*enough)() = nullptr);   // until it is level with the game, or enough() says so""", r"""void iop_edge(bool start);
 void iop_horizon(std::uint32_t ee_cycles);   // ps2run_3ds_patch.py: the I/O processor may run this far past the last edge
-void iop_wait();"""),
+void iop_wait(bool (*enough)() = nullptr);   // until it is level with the game, or enough() says so"""),
     ],
     'runtime/src/system.cpp': [
         (r"""        iop_edge(start);
@@ -9328,6 +9330,2481 @@ Unchanging *g_last_unchanging = nullptr;'''),
     ],
 }
 
+# Finite 3DS FPU results for div/sqrt/rsqrt and non-finite EE float scrubbing on state load:
+# ARM11 VFP treats 0x7FFFFFFF as Quiet NaN and runs in round-to-nearest with default NaN, whereas PS2 EE has no NaN/Inf.
+FPU_FINITE_EDITS = {
+    'runtime/include/ps2/fpu.hpp': [
+        ('''inline Result div(std::uint32_t a, std::uint32_t b) {
+#ifdef PS2_VU_FAST
+    if (exponent(b)) return {from_float(to_float(a) / to_float(b)), false};   // denormals count as zero in the FPU
+#endif
+    a = flush(a);
+    b = flush(b);
+    const std::uint32_t sign = (a ^ b) & kSign;
+    if (!(b & kAbs)) return {sign | kAbs, true};
+    if (!(a & kAbs)) return {sign, false};
+#ifdef __3DS__
+    return {from_float(to_float(a) / to_float(b)), false};
+#else
+    return {from_double(to_double(a) / to_double(b)), false};
+#endif
+}
+
+inline std::uint32_t sqrt(std::uint32_t a) {
+    a = flush(a) & kAbs;
+    if (!a) return 0;
+#ifdef __3DS__
+    return from_float(std::sqrt(to_float(a)));
+#else
+    return from_double(std::sqrt(to_double(a)));
+#endif
+}
+
+inline Result rsqrt(std::uint32_t a, std::uint32_t b) {
+    a = flush(a);
+    b = flush(b) & kAbs;
+    if (!b) return {(a & kSign) | kAbs, true};
+    if (!(a & kAbs)) return {a & kSign, false};
+#ifdef __3DS__
+    return {from_float(to_float(a) / std::sqrt(to_float(b))), false};
+#else
+    return {from_double(to_double(a) / std::sqrt(to_double(b))), false};
+#endif
+}''',
+         '''#if defined(__3DS__) || defined(PS2_VU_FAST)
+inline std::uint32_t clamp_nonfinite(std::uint32_t r) {
+    return (r & kAbs) >= 0x7F800000u ? ((r & kSign) | 0x7F7FFFFFu) : r;
+}
+#endif
+
+inline Result div(std::uint32_t a, std::uint32_t b) {
+#ifdef PS2_VU_FAST
+    if (exponent(b)) return {clamp_nonfinite(from_float(to_float(a) / to_float(b))), false};   // denormals count as zero in the FPU
+#endif
+    a = flush(a);
+    b = flush(b);
+    const std::uint32_t sign = (a ^ b) & kSign;
+#ifdef __3DS__
+    if (!(b & kAbs)) return {sign | 0x7F7FFFFFu, true};
+    if (!(a & kAbs)) return {sign, false};
+    return {clamp_nonfinite(from_float(to_float(a) / to_float(b))), false};
+#else
+    if (!(b & kAbs)) return {sign | kAbs, true};
+    if (!(a & kAbs)) return {sign, false};
+    return {from_double(to_double(a) / to_double(b)), false};
+#endif
+}
+
+inline std::uint32_t sqrt(std::uint32_t a) {
+    a = flush(a) & kAbs;
+    if (!a) return 0;
+#ifdef __3DS__
+    if (a >= 0x7F800000u) a = 0x7F7FFFFFu;
+    return from_float(std::sqrt(to_float(a)));
+#else
+    return from_double(std::sqrt(to_double(a)));
+#endif
+}
+
+inline Result rsqrt(std::uint32_t a, std::uint32_t b) {
+    a = flush(a);
+    b = flush(b) & kAbs;
+#ifdef __3DS__
+    if (!b) return {(a & kSign) | 0x7F7FFFFFu, true};
+    if (!(a & kAbs)) return {a & kSign, false};
+    if (b >= 0x7F800000u) b = 0x7F7FFFFFu;
+    return {clamp_nonfinite(from_float(to_float(a) / std::sqrt(to_float(b)))), false};
+#else
+    if (!b) return {(a & kSign) | kAbs, true};
+    if (!(a & kAbs)) return {a & kSign, false};
+    return {from_double(to_double(a) / std::sqrt(to_double(b))), false};
+#endif
+}'''),
+    ],
+    'runtime/src/kernel.cpp': [
+        ('''    s.pod(g_boot_argc);
+    s.pod(g_boot_argv);
+}''',
+         '''    s.pod(g_boot_argc);
+    s.pod(g_boot_argv);
+#ifdef __3DS__
+    if (s.loading()) {
+        std::uint32_t cleared = 0;
+        auto scrub = [&cleared](auto &cpu) {
+            for (std::uint32_t &v : cpu.f)
+                if ((v & 0x7FFFFFFFu) >= 0x7F800000u) {
+                    v = 0u;
+                    ++cleared;
+                }
+            if ((cpu.facc & 0x7FFFFFFFu) >= 0x7F800000u) {
+                cpu.facc = 0u;
+                ++cleared;
+            }
+        };
+        scrub(g_cpu);
+        for (auto &[id, t] : g_threads) scrub(t.context);
+        if (cleared) std::fprintf(stderr, "[state] cleared %u non-finite EE float(s)\\n", cleared);
+    }
+#endif
+}'''),
+    ],
+}
+
+# Reused font glyph and small texture buffers (32x32 PSMT4 = 512 B) have transparent zeros in their top/bottom rows, so a
+# 2-word corner-only sample() collided across different letters and returned a stale hash for 1000+ sends. Always full-hash
+# small PATH3 uploads (<= 2 KB) and zero samples, restore 4-word sample(), and re-verify every 128..383 sends.
+UNCHANGING_SAMPLE_EDITS = {
+    'runtime/src/gs/queue.hpp': [
+        ('bool unchanging(const std::uint8_t *data, std::uint32_t bytes);   // ps2run_3ds_patch.py: both take a place in main PS2 memory',
+         'bool unchanging(const std::uint8_t *data, std::uint32_t bytes, bool full_check = false);   // ps2run_3ds_patch.py: both take a place in main PS2 memory'),
+    ],
+    'runtime/src/gs/queue.cpp': [
+        ('''// Two words: the first and the last (blocks are whole quadwords, at least 16 bytes) — halves L1D misses on Core 0.
+std::uint32_t sample(const std::uint8_t *data, std::uint32_t bytes) {
+    std::uint32_t a, d;
+    std::memcpy(&a, data, 4);
+    std::memcpy(&d, data + bytes - 4, 4);
+    return a ^ (d * 7u);
+}''',
+         '''// Four words: the first, the last, and two between (blocks are whole quadwords, at least 16 bytes).
+// Reading only corners misses reused texture/glyph buffers whose top and bottom edges are transparent zeros.
+std::uint32_t sample(const std::uint8_t *data, std::uint32_t bytes) {
+    const std::uint32_t q = (bytes >> 2) & ~3u;
+    std::uint32_t a, b, c, d;
+    std::memcpy(&a, data, 4);
+    std::memcpy(&b, data + q, 4);
+    std::memcpy(&c, data + q * 2 + 4, 4);
+    std::memcpy(&d, data + bytes - 4, 4);
+    return a ^ (b * 3u) ^ (c * 5u) ^ (d * 7u);
+}'''),
+        ('bool unchanging(const std::uint8_t *data, std::uint32_t bytes) {',
+         'bool unchanging(const std::uint8_t *data, std::uint32_t bytes, bool full_check) {'),
+        ('    if (known && e.rest && sample(data, bytes) == e.sample) {',
+         '    if (!full_check && known && e.rest && e.sample && sample(data, bytes) == e.sample) {'),
+        ('            e.rest = static_cast<std::uint16_t>(1000u + (h >> 24));',
+         '            e.rest = static_cast<std::uint16_t>(128u + (h >> 24));'),
+    ],
+    'runtime/src/gs/gif.cpp': [
+        ('            const bool stable = gs::queue::unchanging(data, qwc * 16u);',
+         '            const bool stable = gs::queue::unchanging(data, qwc * 16u, qwc <= 128u);'),
+    ],
+}
+
+# The game draws a model by calling a chain of DMA tags that does not change. A chain seen twice with the same bytes is kept as the
+# records it sent to the VU thread, and the next call sends those as one record (memo_play in vif.cpp). Measured on the New 3DS
+# (2026-11-24): with every picture drawn the lobby went from 934 to 834 ms per 30 vblanks together with the native bone loops, of which
+# this is about 80. The record store is twice the size, as the lobby's records overflowed it about once a second.
+CHAIN_MEMO_EDITS = {
+    'runtime/src/gs/queue.hpp': [
+        ('''    void close();
+    bool peek(Header &header, const std::uint8_t *&payload);''',
+         '''    void close();
+    // ps2run_3ds_patch.py: the message being built with extend(), if it is of this type.
+    const std::uint8_t *open_message(Type type, std::uint32_t &bytes) const {
+        bytes = open_type_ == type ? open_bytes_ : 0;
+        return bytes ? open_at_ + sizeof(Header) : nullptr;
+    }
+    std::uint32_t closes() const { return closes_; }
+    bool peek(Header &header, const std::uint8_t *&payload);'''),
+        ('''    std::uint8_t *open_at_ = nullptr;
+    std::uint32_t open_bytes_ = 0, next_ = 0;
+    Type open_type_ = kWrap;''',
+         '''    std::uint8_t *open_at_ = nullptr;
+    std::uint32_t open_bytes_ = 0, next_ = 0, closes_ = 0;
+    Type open_type_ = kWrap;'''),
+        ('''void rewritten(const std::uint8_t *data, std::uint32_t bytes);
+extern std::uint32_t g_unchanging_hash;   // ps2run_3ds_patch.py: the bytes' hash when unchanging() last said yes''',
+         '''void rewritten(const std::uint8_t *data, std::uint32_t bytes);
+extern std::uint32_t g_rewritten_gen;     // goes up when a page is first marked rewritten
+bool any_rewritten(std::uint32_t off, std::uint32_t bytes);
+extern std::uint32_t g_unchanging_hash;   // ps2run_3ds_patch.py: the bytes' hash when unchanging() last said yes'''),
+    ],
+    'runtime/src/gs/queue.cpp': [
+        ('''}
+std::uint32_t g_unchanging_hash = 0;''',
+         '''}
+std::uint32_t g_rewritten_gen = 0;
+std::uint32_t g_unchanging_hash = 0;'''),
+        ('''    const std::uint32_t first = static_cast<std::uint32_t>(data - g_ram) >> 12, last = static_cast<std::uint32_t>(data - g_ram + bytes - 1) >> 12;
+    for (std::uint32_t p = first; p <= last && p < kRamSize / 4096; ++p) g_rewritten[p >> 5] |= 1u << (p & 31u);
+}''',
+         '''    const std::uint32_t first = static_cast<std::uint32_t>(data - g_ram) >> 12, last = static_cast<std::uint32_t>(data - g_ram + bytes - 1) >> 12;
+    for (std::uint32_t p = first; p <= last && p < kRamSize / 4096; ++p) {
+        const std::uint32_t bit = 1u << (p & 31u);
+        if (g_rewritten[p >> 5] & bit) continue;
+        g_rewritten[p >> 5] |= bit;
+        ++g_rewritten_gen;
+    }
+}
+
+bool any_rewritten(std::uint32_t off, std::uint32_t bytes) {
+    for (std::uint32_t p = off >> 12, last = (off + bytes - 1u) >> 12; p <= last; ++p)
+        if (g_rewritten[p >> 5] & (1u << (p & 31u))) return true;
+    return false;
+}'''),
+        ('''    open_bytes_ = 0;
+}''',
+         '''    open_bytes_ = 0;
+    ++closes_;
+}'''),
+    ],
+    'runtime/src/vif.hpp': [
+        ('''bool has_pending1();
+#endif''',
+         '''bool has_pending1();
+// ps2run_3ds_patch.py: a called chain of unchanging data (a model) sent whole, see memo_play in vif.cpp.
+struct MemoEnd {
+    std::uint32_t chcr_tag, madr;
+};
+bool memo_play(std::uint32_t target, MemoEnd &end);   // true: sent; the chain returns
+bool memo_begin(std::uint32_t target);                // true: walk it with memo_block for each tag and data, then memo_end or memo_abort
+void memo_block(std::uint32_t off, std::uint32_t bytes);
+void memo_end(const MemoEnd &end);
+void memo_abort();
+#endif'''),
+    ],
+    'runtime/src/vif.cpp': [
+        ('''bool g_skip_unsafe = false;
+std::uint32_t g_wrote = 0;''',
+         '''bool g_skip_unsafe = false;
+bool g_memo_bad = false;   // ps2run_3ds_patch.py: the chain being walked for memo_begin copied data, or did something outside the registers
+bool g_memo_mask_wrote = false;   // true if shadow VIF1 wrote u.mask during memo_begin (avoids mutating u.mask)
+std::uint32_t g_wrote = 0;'''),
+        ('''    const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
+    if constexpr (IsShadow && Record) {''',
+         '''    const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
+    if constexpr (IsShadow)
+        if ((cmd & 0x80000000u) || op == 0x06 || (op & 0x7Eu) == 0x30u || ((op & 0x60u) == 0x60u && u.mode == 2)) g_memo_bad = true;
+    if constexpr (IsShadow && Record) {'''),
+        ('''    case 0x20: u.mask = data[0]; break;''',
+         '''    case 0x20: u.mask = data[0]; if constexpr (IsShadow) g_memo_mask_wrote = true; break;'''),
+        ('''            if (gif::scan_signals(2, p, qwc)) {
+                if constexpr (Record) g_side = true;''',
+         '''            if (gif::scan_signals(2, p, qwc)) {
+                g_memo_bad = true;
+                if constexpr (Record) g_side = true;'''),
+        ('''                        u.code = cmd;
+                        gif::scan_signals(2, reinterpret_cast<const std::uint8_t *>(at), qwc);
+                        at += need;''',
+         '''                        u.code = cmd;
+                        if (gif::scan_signals(2, reinterpret_cast<const std::uint8_t *>(at), qwc)) g_memo_bad = true;
+                        at += need;'''),
+        ('''    if (w & kWMask) u.mask = r.mask;
+    if (w & (kWRow | kWCol)) {
+        if (w & kWRow) std::memcpy(u.row, g_replay_rc[idx].row, sizeof u.row);''',
+         '''    if (w & kWMask) { u.mask = r.mask; g_memo_mask_wrote = true; }
+    if (w & (kWRow | kWCol)) {
+        g_memo_bad = true;
+        if (w & kWRow) std::memcpy(u.row, g_replay_rc[idx].row, sizeof u.row);'''),
+        ('''// kept transfer is parsed once more. 256 KB, from the heap on first use.
+constexpr std::uint32_t kRecordWords = 65536, kKeptRecordWords = 4096;
+std::uint32_t *g_records = nullptr;''',
+         '''// kept transfer is parsed once more. 512 KB, from the heap on first use.
+constexpr std::uint32_t kRecordWords = 131072, kKeptRecordWords = 4096;
+std::uint32_t *g_records = nullptr;'''),
+        ('''#ifdef PS2_PICA
+        if (qwc <= 512u) {''',
+         '''#ifdef PS2_PICA
+        g_memo_bad = true;
+        if (qwc <= 512u) {'''),
+        ('''            PS2_PROF(ps2::prof::Vif);
+            if (qwc <= 512u) {''',
+         '''            PS2_PROF(ps2::prof::Vif);
+            g_memo_bad = true;
+            if (qwc <= 512u) {'''),
+        ('''                                const bool has_sig = gif::scan_signals(2, data, qwc);
+                                if (is_unchanging && !has_sig) gs::queue::mark_unchanging_no_signals();''',
+         '''                                const bool has_sig = gif::scan_signals(2, data, qwc);
+                                if (has_sig) g_memo_bad = true;
+                                if (is_unchanging && !has_sig) gs::queue::mark_unchanging_no_signals();'''),
+        ('''                        }
+                        if (qwc <= 512u) {''',
+         '''                        }
+                        g_memo_bad = true;
+                        if (qwc <= 512u) {'''),
+        ('''    else transfer_dynamic(unit, data, qwc);
+}''',
+         '''    else transfer_dynamic(unit, data, qwc);
+}
+
+
+// ps2run_3ds_patch.py: the game draws a model by calling a chain of DMA tags that never changes: in the lobby 228 calls a picture to
+// the same places, 2,200 tags and 2.5 MB. Walking those tags, checking each one's data and parsing the commands split across them was
+// half of the DMA and VIF time on this thread. A chain whose tags and data were the same bytes on kMemoSame walks, all of it sent to
+// the VU thread by address, is kept as the records it sent and what it left in the registers, and the next call with the same
+// registers sends those as one record. Skipped pictures keep their own, as their records leave data out. The same rules as
+// unchanging() in gs/queue.cpp hold: no page the game is seen to rewrite, a few words of the first block and of one or two others in
+// turn compared on every use, and all of the bytes every 96 to 223 uses. The data itself is read where it is, as before.
+namespace {
+struct MemoBlock {
+    std::uint32_t off, bytes, sample;
+};
+struct Memo {
+    std::uint32_t target = 0, hash = 0, epoch = 0, gen = 0;
+    Key before{};
+    std::uint32_t records = 0, first_block = 0, mask = 0, code = 0, chcr_tag = 0, madr = 0;
+    std::uint16_t words = 0, blocks = 0, rest = 0, wait = 0, rot = 0, idle = 0;
+    std::uint16_t cycle = 0, ofst = 0, tops = 0, base = 0, itops = 0, top = 0, itop = 0, mark = 0;
+    std::uint8_t mode = 0, num = 0, dbf = 0, same = 0, changed = 0, ready = 0, skip = 0;
+};
+constexpr std::uint32_t kMemos = 2048, kMemoBlocks = 16384, kMemoWalk = 512, kMemoSame = 2, kMemoWords = 2048;
+Memo *g_memos = nullptr;
+MemoBlock *g_memo_blocks = nullptr, *g_memo_walk = nullptr;
+std::uint32_t g_memo_blocks_used = 0, g_memo_walk_n = 0, g_memo_gen = 1;
+Memo *g_memo_now = nullptr;
+Unit g_memo_unit;
+std::uint32_t g_memo_closes = 0, g_memo_epoch = 0;
+
+std::uint32_t memo_sample(const std::uint8_t *data, std::uint32_t bytes) {
+    const std::uint32_t q = (bytes >> 2) & ~3u;
+    std::uint32_t a, b, c, d;
+    std::memcpy(&a, data, 4);
+    std::memcpy(&b, data + q, 4);
+    std::memcpy(&c, data + q * 2 + (bytes > 16u ? 4u : 0u), 4);   // every word of a bare tag
+    std::memcpy(&d, data + bytes - 4, 4);
+    return a ^ (b * 3u) ^ (c * 5u) ^ (d * 7u);
+}
+std::uint32_t memo_hash(const MemoBlock *b, std::uint32_t n) {
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        h = (h ^ b[i].off) * 16777619u;
+        const auto *w = reinterpret_cast<const std::uint32_t *>(g_ram + b[i].off);
+        for (std::uint32_t left = b[i].bytes >> 4; left; --left, w += 4) {
+            h = (h ^ w[0]) * 16777619u;
+            h = (h ^ w[1]) * 16777619u;
+            h = (h ^ w[2]) * 16777619u;
+            h = (h ^ w[3]) * 16777619u;
+        }
+    }
+    return h;
+}
+bool memo_rewritten(const MemoBlock *b, std::uint32_t n) {
+    for (std::uint32_t i = 0; i < n; ++i)
+        if (gs::queue::any_rewritten(b[i].off, b[i].bytes)) return true;
+    return false;
+}
+void memo_forget() {
+    for (std::uint32_t i = 0; i < kMemos; ++i) g_memos[i] = Memo{};
+    g_memo_blocks_used = 0;
+}
+inline Memo *memo_set(std::uint32_t target, const Key &k) {   // four places; a skipped picture's records leave data out, so they are kept apart
+    std::uint32_t h = ((target >> 4) ^ (gs::queue::g_ee_skip ? 0x8000000u : 0u)) * 2654435761u;
+    h = (h ^ k.a) * 16777619u;
+    h = (h ^ k.b) * 16777619u;
+    h = (h ^ k.c) * 16777619u;
+    return g_memos + ((h ^ (h >> 15)) & (kMemos - 4u));
+}
+inline Memo *memo_find(Memo *set, std::uint32_t target, const Key &k) {
+    for (Memo *m = set; m < set + 4; ++m)
+        if (m->target == target && m->skip == gs::queue::g_ee_skip && m->before == k) return m;
+    return nullptr;
+}
+inline bool memo_clean(const Unit &u) {
+    return gs::queue::vu_active() && !on_vu_thread() && !u.stalled && u.pending.empty() && !u.dropping && !u.passing && !gif::scan_active(2);
+}
+// Registers nothing in a chain reads: marked before the walk, so that one it writes with the value it already had is seen.
+// u.mask IS read by mode-2 unpacks, so mask writes are tracked via g_memo_mask_wrote without mutating u.mask.
+constexpr std::uint32_t kMemoMark = 0x5EA5A000u;
+void memo_mark(Unit &u) {
+    u.top ^= kMemoMark;
+    u.itop ^= kMemoMark;
+    u.mark ^= kMemoMark;
+}
+std::uint32_t memo_unmark(Unit &u, const Unit &before) {   // which were written
+    std::uint32_t changed = 0;
+    if (u.top == (before.top ^ kMemoMark)) u.top = before.top; else changed |= 1u;
+    if (u.itop == (before.itop ^ kMemoMark)) u.itop = before.itop; else changed |= 2u;
+    if (u.mark == (before.mark ^ kMemoMark)) u.mark = before.mark; else changed |= 4u;
+    if (g_memo_mask_wrote) changed |= 8u;
+    return changed;
+}
+}
+
+bool memo_play(std::uint32_t target, MemoEnd &end) {
+    Unit &u = g_units[1];
+    if (!g_memos || (target & 0x80000000u) || !memo_clean(u)) return false;
+    target &= kRamSize - 16u;
+    const Key before = key_of(u);
+    Memo *const at = memo_find(memo_set(target, before), target, before);
+    if (!at || !at->ready || at->epoch != g_epoch) return false;
+    Memo &m = *at;
+    const MemoBlock *b = g_memo_blocks + m.first_block;
+    const std::uint32_t n = m.blocks;
+    if (m.gen != gs::queue::g_rewritten_gen) {
+        if (memo_rewritten(b, n)) {
+            m.ready = 0;
+            m.same = 0;
+            m.wait = 255;
+            return false;
+        }
+        m.gen = gs::queue::g_rewritten_gen;
+    }
+    bool ok = memo_sample(g_ram + b[0].off, b[0].bytes) == b[0].sample;
+    if (ok && n > 1u) {
+        if (n <= 4u) {
+            for (std::uint32_t r = 1u; r < n && ok; ++r)
+                ok = memo_sample(g_ram + b[r].off, b[r].bytes) == b[r].sample;
+        } else {
+            ok = memo_sample(g_ram + b[n - 1u].off, b[n - 1u].bytes) == b[n - 1u].sample;
+            std::uint32_t r = m.rot;
+            for (std::uint32_t k = 2u; k && ok; --k) {
+                if (++r >= n - 1u) r = 1u;
+                ok = memo_sample(g_ram + b[r].off, b[r].bytes) == b[r].sample;
+            }
+            m.rot = static_cast<std::uint16_t>(r);
+        }
+    }
+    if (ok && !m.rest--) {
+        ok = memo_hash(b, n) == m.hash;
+        m.rest = static_cast<std::uint16_t>(32u + ((m.hash >> 26) & 31u));
+    }
+    if (!ok) {
+        m.ready = 0;
+        m.same = 0;
+        m.wait = 8;
+        return false;
+    }
+    PS2_PROF(ps2::prof::Vif);
+    if (g_kept_words) send_kept();
+    if (m.words > 2u) {
+        auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 8u));
+        rec[0] = 0x20000000u | m.words;
+        rec[1] = m.records;
+    } else if (m.words) {
+        std::memcpy(gs::queue::vu().extend(gs::queue::kVif1Records, m.words * 4u), g_records + m.records, m.words * 4u);
+    }
+    u.cycle = m.cycle;
+    u.ofst = m.ofst;
+    u.tops = m.tops;
+    u.base = m.base;
+    u.itops = m.itops;
+    u.mode = m.mode;
+    u.dbf = m.dbf;
+    u.num = m.num;
+    u.code = m.code;
+    if (m.changed & 1u) u.top = m.top;
+    if (m.changed & 2u) u.itop = m.itop;
+    if (m.changed & 4u) u.mark = m.mark;
+    if (m.changed & 8u) u.mask = m.mask;
+    m.idle = 0;
+    end = MemoEnd{m.chcr_tag, m.madr};
+    return true;
+}
+
+bool memo_begin(std::uint32_t target) {
+    Unit &u = g_units[1];
+    if ((target & 0x80000000u) || !memo_clean(u)) return false;
+    if (!g_records) return false;   // run_unchanging makes it
+    if (!g_memos) {
+        g_memos = new Memo[kMemos]();
+        g_memo_blocks = new MemoBlock[kMemoBlocks];
+        g_memo_walk = new MemoBlock[kMemoWalk];
+    }
+    target &= kRamSize - 16u;
+    const Key before = key_of(u);
+    Memo *const set = memo_set(target, before);
+    Memo *at = memo_find(set, target, before);
+    if (!at) {
+        // A place that is free or out of date, or else the first of the four that has not been played for 64 tries.
+        for (Memo *m = set; m < set + 4 && !at; ++m)
+            if (!m->target || (m->ready && m->epoch != g_epoch)) at = m;
+        for (Memo *m = set; m < set + 4 && !at; ++m)
+            if (++m->idle >= 64u) at = m;
+        if (!at) return false;
+        *at = Memo{};
+        at->target = target;
+        at->skip = gs::queue::g_ee_skip;
+        at->before = before;
+    }
+    Memo &m = *at;
+    if (m.wait) {
+        --m.wait;
+        return false;
+    }
+    if (g_kept_words) send_kept();
+    gs::queue::vu().close();
+    g_memo_closes = gs::queue::vu().closes();
+    g_memo_epoch = g_epoch;
+    g_memo_now = &m;
+    g_memo_walk_n = 0;
+    g_memo_bad = false;
+    g_memo_mask_wrote = false;
+    g_memo_unit = u;
+    memo_mark(u);
+    return true;
+}
+
+void memo_block(std::uint32_t off, std::uint32_t bytes) {
+    if (!g_memo_now) return;
+    if (g_memo_walk_n >= kMemoWalk || off + bytes > kRamSize) {
+        g_memo_bad = true;
+        return;
+    }
+    g_memo_walk[g_memo_walk_n++] = MemoBlock{off, bytes, 0u};
+}
+
+void memo_abort() {
+    if (!g_memo_now) return;
+    memo_unmark(g_units[1], g_memo_unit);
+    g_memo_now->wait = 64;
+    g_memo_now = nullptr;
+}
+
+void memo_end(const MemoEnd &end) {
+    Memo *const now = g_memo_now;
+    if (!now) return;
+    g_memo_now = nullptr;
+    Memo &m = *now;
+    Unit &u = g_units[1];
+    const std::uint32_t changed = memo_unmark(u, g_memo_unit);
+    const std::uint32_t n = g_memo_walk_n;
+    if (g_kept_words) send_kept();
+    std::uint32_t bytes = 0;
+    const std::uint8_t *sent = gs::queue::vu().open_message(gs::queue::kVif1Records, bytes);
+    if (g_memo_bad || !n || m.skip != gs::queue::g_ee_skip || !memo_clean(u) || gs::queue::vu().closes() != g_memo_closes || g_epoch != g_memo_epoch || !sent || bytes > kMemoWords * 4u ||
+        std::memcmp(u.row, g_memo_unit.row, sizeof u.row) || std::memcmp(u.col, g_memo_unit.col, sizeof u.col) || u.stat != g_memo_unit.stat || u.err != g_memo_unit.err) {
+        m.same = 0;
+        m.wait = 32;
+        return;
+    }
+    if (memo_rewritten(g_memo_walk, n)) {
+        m.same = 0;
+        m.wait = 255;
+        return;
+    }
+    const std::uint32_t h = memo_hash(g_memo_walk, n);
+    if (h != m.hash || !m.same) {
+        m.hash = h;
+        m.same = 1;
+        return;
+    }
+    if (++m.same < kMemoSame) return;
+    const std::uint32_t words = bytes / 4u;
+    if (kRecordWords - g_records_used < words + kKeptRecordWords) return;   // run_unchanging starts the records again first
+    if (!(m.blocks >= n)) {
+        if (g_memo_blocks_used + n > kMemoBlocks) {
+            const Memo keep = m;
+            memo_forget();
+            m = keep;
+            m.ready = 0;
+        }
+        m.first_block = g_memo_blocks_used;
+        g_memo_blocks_used += n;
+    }
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MemoBlock &b = g_memo_blocks[m.first_block + i];
+        b = g_memo_walk[i];
+        b.sample = memo_sample(g_ram + b.off, b.bytes);
+    }
+    m.blocks = static_cast<std::uint16_t>(n);
+    m.records = g_records_used;
+    m.words = static_cast<std::uint16_t>(words);
+    std::memcpy(g_records + g_records_used, sent, bytes);
+    g_records_used += words;
+    m.epoch = g_epoch;
+    m.gen = gs::queue::g_rewritten_gen;
+    m.rest = static_cast<std::uint16_t>(32u + ((h >> 26) & 31u));
+    m.rot = 0;
+    m.wait = 0;
+    m.cycle = static_cast<std::uint16_t>(u.cycle);
+    m.ofst = static_cast<std::uint16_t>(u.ofst);
+    m.tops = static_cast<std::uint16_t>(u.tops);
+    m.base = static_cast<std::uint16_t>(u.base);
+    m.itops = static_cast<std::uint16_t>(u.itops);
+    m.top = static_cast<std::uint16_t>(u.top);
+    m.itop = static_cast<std::uint16_t>(u.itop);
+    m.mark = static_cast<std::uint16_t>(u.mark);
+    m.mask = u.mask;
+    m.mode = static_cast<std::uint8_t>(u.mode);
+    m.num = static_cast<std::uint8_t>(u.num);
+    m.code = u.code;
+    m.dbf = u.dbf;
+    m.changed = static_cast<std::uint8_t>(changed);
+    m.chcr_tag = end.chcr_tag;
+    m.madr = end.madr;
+    m.ready = 1;
+}'''),
+    ],
+    'runtime/src/dmac.cpp': [
+        ('''#endif
+    for (int guard = 0; guard < 1'000'000; ++guard) {''',
+         '''#endif
+#ifdef PS2_PICA
+    const bool memo_calls = ch == 1 && tte && !mfifo;
+    bool memo_at = false;
+#endif
+    for (int guard = 0; guard < 1'000'000; ++guard) {'''),
+        ('''        bool end = false;
+        const std::uint32_t tag_at = c.tadr;''',
+         '''        bool end = false;
+#ifdef PS2_PICA
+        const bool memo_call = memo_calls && id == 5 && !qwc && !(irq && tie) && !(c.chcr & 0x30u);
+        if (memo_at) {   // inside a called chain that is being looked at: only tags that go on or come back
+            const bool ok = !(irq && tie) && (id == 1 || id == 2 || id == 3 || id == 4 || id == 6) && !((c.tadr | (id == 3 || id == 4 ? addr_full : 0u)) & 0x80000000u);
+            if (!ok) {
+                vif::memo_abort();
+                memo_at = false;
+            } else {
+                const bool here = id != 3 && id != 4;
+                vif::memo_block(c.tadr & (kRamSize - 16u), here ? 16u + qwc * 16u : 16u);
+                if (!here && qwc) vif::memo_block(addr_full & (kRamSize - 16u), qwc * 16u);
+            }
+        }
+#endif
+        const std::uint32_t tag_at = c.tadr;'''),
+        (r'''        c.madr = data;
+        if (ch == 2 && g_starts[2] <= 2) std::fprintf(stderr, "[dma] gif tag id %u qwc %u addr 0x%08X data 0x%08X\n", id, qwc, addr_full, data);''',
+         r'''        c.madr = data;
+#ifdef PS2_PICA
+        if (memo_call) {
+            vif::MemoEnd left;
+            if (vif::memo_play(c.tadr, left)) {
+                c.tadr = c.asr[0];
+                c.chcr = (c.chcr & 0xFFCFu) | left.chcr_tag;
+                c.madr = left.madr;
+                if (end || (tie && irq)) break;
+                continue;
+            }
+            memo_at = vif::memo_begin(c.tadr);
+        }
+#endif
+        if (ch == 2 && g_starts[2] <= 2) std::fprintf(stderr, "[dma] gif tag id %u qwc %u addr 0x%08X data 0x%08X\n", id, qwc, addr_full, data);'''),
+        ('''        }
+        if (vif_stalled(ch)) {
+            pause(ch, end || (tie && irq));''',
+         '''        }
+#ifdef PS2_PICA
+        if (memo_at && id == 6) {
+            vif::memo_end(vif::MemoEnd{c.chcr & 0xFFFF0000u, c.madr});
+            memo_at = false;
+        }
+#endif
+        if (vif_stalled(ch)) {
+#ifdef PS2_PICA
+            if (memo_at) vif::memo_abort();
+#endif
+            pause(ch, end || (tie && irq));'''),
+        ('''    }
+    c.qwc = 0;''',
+         '''    }
+#ifdef PS2_PICA
+    if (memo_at) vif::memo_abort();
+#endif
+    c.qwc = 0;'''),
+    ],
+}
+
+# Exact shift/mask + whole-page fast path for rect_blocks() (eliminates ARM11 software divides on Core 2 uploads,
+# ~22% of Core 2 busy time in live samples.txt) and preserve 0x80000000u sentinel in gif.cpp GsSink::image()
+# so RAM-backed VIF1 DIRECT uploads still compute a real content hash in pica::note_data().
+UPLOAD_FAST_EDITS = {
+    'runtime/src/gs/gs.cpp': [
+        ('''template <class F>
+bool rect_blocks(std::uint32_t psm, std::uint32_t dbp, std::uint32_t dbw, std::uint32_t dsax, std::uint32_t dsay, std::uint32_t rrw,
+                 std::uint32_t rrh, F &&fn) {
+    std::uint32_t bw, bh, cols;
+    const int *table;
+    switch (psm) {
+    case PSMCT32: case PSMCT24: bw = 8; bh = 8; cols = 8; table = &kBlock32[0][0]; break;
+    case PSMCT16: bw = 16; bh = 8; cols = 4; table = &kBlock16[0][0]; break;
+    case PSMCT16S: bw = 16; bh = 8; cols = 4; table = &kBlock16S[0][0]; break;
+    case PSMT8: bw = 16; bh = 16; cols = 8; table = &kBlock32[0][0]; break;
+    case PSMT4: bw = 32; bh = 16; cols = 4; table = &kBlock16[0][0]; break;
+    default: return false;
+    }
+    if (!rrw || !rrh || dsax + rrw > 2048u || dsay + rrh > 2048u) return false;
+    std::uint32_t pw, ph;
+    psm_page_dims(psm, pw, ph);
+    const std::uint32_t per_row = std::max<std::uint32_t>(1, dbw * 64 / pw);
+    const bool can_be_whole = psm != PSMCT24;   // 24-bit pixels leave the top byte of each word as it was
+    const std::uint32_t x0 = dsax / bw, x1 = (dsax + rrw - 1u) / bw, y0 = dsay / bh, y1 = (dsay + rrh - 1u) / bh;
+    for (std::uint32_t by = y0; by <= y1; ++by) {
+        const std::uint32_t py = by * bh;
+        const bool whole_y = can_be_whole && py >= dsay && py + bh <= dsay + rrh;
+        for (std::uint32_t bx = x0; bx <= x1; ++bx) {
+            const std::uint32_t px = bx * bw;
+            const std::uint32_t block = dbp + ((px / pw) + (py / ph) * per_row) * 32u +
+                                        static_cast<std::uint32_t>(table[((py % ph) / bh) * cols + (px % pw) / bw]);
+            if (!fn(block & 16383u, whole_y && px >= dsax && px + bw <= dsax + rrw)) return true;
+        }
+    }
+    return true;
+}''',
+         '''template <class F>
+bool rect_blocks(std::uint32_t psm, std::uint32_t dbp, std::uint32_t dbw, std::uint32_t dsax, std::uint32_t dsay, std::uint32_t rrw,
+                 std::uint32_t rrh, F &&fn) {
+    std::uint32_t bw_s, bh_s, pw_s, ph_s, cols_s;
+    const int *table;
+    switch (psm) {
+    case PSMCT32: case PSMCT24: bw_s = 3; bh_s = 3; pw_s = 6; ph_s = 5; cols_s = 3; table = &kBlock32[0][0]; break;
+    case PSMCT16:               bw_s = 4; bh_s = 3; pw_s = 6; ph_s = 6; cols_s = 2; table = &kBlock16[0][0]; break;
+    case PSMCT16S:              bw_s = 4; bh_s = 3; pw_s = 6; ph_s = 6; cols_s = 2; table = &kBlock16S[0][0]; break;
+    case PSMT8:                 bw_s = 4; bh_s = 4; pw_s = 7; ph_s = 6; cols_s = 3; table = &kBlock32[0][0]; break;
+    case PSMT4:                 bw_s = 5; bh_s = 4; pw_s = 7; ph_s = 7; cols_s = 2; table = &kBlock16[0][0]; break;
+    default: return false;
+    }
+    if (!rrw || !rrh || dsax + rrw > 2048u || dsay + rrh > 2048u) return false;
+    const std::uint32_t per_row = std::max<std::uint32_t>(1u, (dbw << 6) >> pw_s);
+    const bool can_be_whole = psm != PSMCT24;   // 24-bit pixels leave the top byte of each word as it was
+    const std::uint32_t pw_mask = (1u << pw_s) - 1u, ph_mask = (1u << ph_s) - 1u;
+    if (can_be_whole && (dsax & pw_mask) == 0u && (dsay & ph_mask) == 0u && (rrw & pw_mask) == 0u && (rrh & ph_mask) == 0u) {
+        const std::uint32_t px0 = dsax >> pw_s, py0 = dsay >> ph_s;
+        const std::uint32_t px_n = rrw >> pw_s, py_n = rrh >> ph_s;
+        if (px_n == per_row && px0 == 0u) {
+            const std::uint32_t total = (px_n * py_n) << 5;
+            const std::uint32_t start = dbp + ((py0 * per_row) << 5);
+            if (start + total <= 16384u) {
+                for (std::uint32_t b = start, end = start + total; b < end; ++b)
+                    if (!fn(b, true)) return true;
+            } else {
+                for (std::uint32_t i = 0; i < total; ++i)
+                    if (!fn((start + i) & 16383u, true)) return true;
+            }
+            return true;
+        }
+        const std::uint32_t row_blocks = px_n << 5;
+        for (std::uint32_t py = py0; py < py0 + py_n; ++py) {
+            const std::uint32_t start = dbp + ((py * per_row + px0) << 5);
+            if (start + row_blocks <= 16384u) {
+                for (std::uint32_t b = start, end = start + row_blocks; b < end; ++b)
+                    if (!fn(b, true)) return true;
+            } else {
+                for (std::uint32_t i = 0; i < row_blocks; ++i)
+                    if (!fn((start + i) & 16383u, true)) return true;
+            }
+        }
+        return true;
+    }
+    const std::uint32_t bw = 1u << bw_s, bh = 1u << bh_s;
+    const std::uint32_t cols_mask = (1u << cols_s) - 1u;
+    const std::uint32_t rows_s = ph_s - bh_s, rows_mask = (1u << rows_s) - 1u;
+    const std::uint32_t x0 = dsax >> bw_s, x1 = (dsax + rrw - 1u) >> bw_s;
+    const std::uint32_t y0 = dsay >> bh_s, y1 = (dsay + rrh - 1u) >> bh_s;
+    const std::uint32_t whole_x0 = (dsax + bw - 1u) >> bw_s, whole_x1 = (dsax + rrw) >> bw_s;
+    const std::uint32_t whole_y0 = (dsay + bh - 1u) >> bh_s, whole_y1 = (dsay + rrh) >> bh_s;
+    for (std::uint32_t by = y0; by <= y1; ++by) {
+        const bool whole_y = can_be_whole && by >= whole_y0 && by < whole_y1;
+        const std::uint32_t row_base = dbp + (((by >> rows_s) * per_row) << 5);
+        const int *const trow = table + ((by & rows_mask) << cols_s);
+        for (std::uint32_t bx = x0; bx <= x1; ++bx) {
+            const std::uint32_t block = (row_base + ((bx >> cols_s) << 5) + static_cast<std::uint32_t>(trow[bx & cols_mask])) & 16383u;
+            if (!fn(block, whole_y && bx >= whole_x0 && bx < whole_x1)) return true;
+        }
+    }
+    return true;
+}'''),
+    ],
+    'runtime/src/gs/gif.cpp': [
+        ('        const std::uint32_t h = chunk_hash ? ((chunk_hash ^ (qoff * 0x9E3779B1u) ^ (qwords * 0x85EBCA6Bu)) | 1u) : 0u;',
+         '        const std::uint32_t h = (chunk_hash == 0u || chunk_hash == 0x80000000u) ? chunk_hash : ((chunk_hash ^ (qoff * 0x9E3779B1u) ^ (qwords * 0x85EBCA6Bu)) | 1u);'),
+    ],
+}
+
+# Core 0 VIF/DMAC/GIF transfer fast paths (shown + skipped pictures):
+# - Non-MFIFO ch1 TTE chain fast loop + 1 KB g_spr_pages bitmask so dynamic RW half-buffer tags skip unchanging()
+# - transfer_tte / transfer_dynamic / transfer_tte_data skipped-frame fast paths + dynamic TTE+data coalescing
+# - run_skipped<Capture> inline fast paths for op<=0x17 and UNPACK + single-NOP keep-span bridging
+# - gif::scan single-packet IMAGE and PACKED A+D fast path avoiding Path writes
+VIF_CORE0_EDITS = {
+    'runtime/src/dmac.cpp': [
+        ('''void spr_to_ram(Channel &c, std::uint32_t qwc) {''',
+         '''#ifdef PS2_PICA
+std::uint32_t g_spr_pages[kRamSize / 4096u / 32u];
+inline void mark_spr_pages(std::uint32_t off, std::uint32_t bytes) {
+    if (!bytes) return;
+    const std::uint32_t first = off >> 12;
+    const std::uint32_t last = (off + bytes - 1u) >> 12;
+    for (std::uint32_t p = first; p <= last; ++p)
+        g_spr_pages[p >> 5] |= 1u << (p & 31u);
+}
+inline bool spr_page_hit(std::uint32_t off, std::uint32_t bytes) {
+    const std::uint32_t first = off >> 12;
+    const std::uint32_t last = (off + bytes - 1u) >> 12;
+    return ((g_spr_pages[first >> 5] >> (first & 31u)) & 1u) != 0u ||
+           ((g_spr_pages[last >> 5] >> (last & 31u)) & 1u) != 0u;
+}
+#endif
+
+void spr_to_ram(Channel &c, std::uint32_t qwc) {'''),
+        ('''#ifdef PS2_PICA
+        if (!wrap && !(at & 0x80000000u)) gs::queue::rewritten(target(at), n * 16);   // ps2run_3ds_patch.py: the game builds its packets this way
+#endif''',
+         '''#ifdef PS2_PICA
+        if (!wrap && !(at & 0x80000000u)) {
+            gs::queue::rewritten(target(at), n * 16);   // ps2run_3ds_patch.py: the game builds its packets this way
+            mark_spr_pages(at & (kRamSize - 16u), n * 16u);
+        }
+#endif'''),
+        ('''#ifdef PS2_PICA
+    const bool memo_calls = ch == 1 && tte && !mfifo;
+    bool memo_at = false;
+#endif''',
+         '''#ifdef PS2_PICA
+    static const bool trace_tags1 = std::getenv("PS2_TRACE_DMA1") != nullptr;
+    if (ch == 1 && tte && !mfifo && !trace_tags1) {
+        bool memo_at = false;
+        for (int guard = 0; guard < 1'000'000; ++guard) {
+            const std::uint8_t *tagp = source(c.tadr);
+            std::uint64_t tag;
+            std::memcpy(&tag, tagp, 8);
+            c.chcr = (c.chcr & 0xFFFFu) | (static_cast<std::uint32_t>(tag >> 16) << 16);
+            const std::uint32_t qwc = static_cast<std::uint32_t>(tag) & 0xFFFFu;
+            const std::uint32_t id = static_cast<std::uint32_t>(tag >> 28) & 7u;
+            const bool irq = (tag >> 31) & 1u;
+            const std::uint32_t addr = static_cast<std::uint32_t>(tag >> 32) & 0x7FFFFFF0u;
+            const std::uint32_t addr_full = addr | (static_cast<std::uint32_t>(tag >> 63) << 31);
+            std::uint32_t tte_words[2];
+            std::memcpy(tte_words, tagp + 8, 8);
+            if (!qwc) vif::transfer_tte(1, tte_words);
+            bool end = false;
+            const bool memo_call = id == 5 && !qwc && !(irq && tie) && !(c.chcr & 0x30u);
+            if (memo_at) {
+                const bool ok = !(irq && tie) && (id == 1 || id == 2 || id == 3 || id == 4 || id == 6) && !((c.tadr | (id == 3 || id == 4 ? addr_full : 0u)) & 0x80000000u);
+                if (!ok) {
+                    vif::memo_abort();
+                    memo_at = false;
+                } else {
+                    const bool here = id != 3 && id != 4;
+                    vif::memo_block(c.tadr & (kRamSize - 16u), here ? 16u + qwc * 16u : 16u);
+                    if (!here && qwc) vif::memo_block(addr_full & (kRamSize - 16u), qwc * 16u);
+                }
+            }
+            std::uint32_t data = c.tadr + 16;
+            switch (id) {
+            case 0: data = addr_full; c.tadr += 16; end = true; break;
+            case 1: c.tadr = data + qwc * 16; break;
+            case 2: c.tadr = addr_full; break;
+            case 3: case 4: data = addr_full; c.tadr += 16; break;
+            case 5: {
+                const std::uint32_t asp = (c.chcr >> 4) & 3u;
+                if (asp < 2) c.asr[asp] = data + qwc * 16;
+                c.chcr = (c.chcr & ~0x30u) | (std::min<std::uint32_t>(asp + 1, 2u) << 4);
+                c.tadr = addr_full;
+                break;
+            }
+            case 6: {
+                const std::uint32_t asp = (c.chcr >> 4) & 3u;
+                if (asp > 0) {
+                    c.tadr = c.asr[asp - 1];
+                    c.chcr = (c.chcr & ~0x30u) | ((asp - 1) << 4);
+                } else {
+                    end = true;
+                }
+                break;
+            }
+            default: end = true; break;
+            }
+            c.madr = data;
+            if (memo_call) {
+                vif::MemoEnd left;
+                if (vif::memo_play(c.tadr, left)) {
+                    c.tadr = c.asr[0];
+                    c.chcr = (c.chcr & 0xFFCFu) | left.chcr_tag;
+                    c.madr = left.madr;
+                    if (end || (tie && irq)) break;
+                    continue;
+                }
+                memo_at = vif::memo_begin(c.tadr);
+            }
+            if (qwc) {
+                const bool in_spr = (data & 0x80000000u) != 0u;
+                const std::uint32_t off = in_spr ? (data & (kScratchpadSize - 1)) : (data & (kRamSize - 16u));
+                const std::size_t bytes = static_cast<std::size_t>(qwc) * 16u;
+                const std::size_t room = in_spr ? (kScratchpadSize - off) : (kRamSize - off);
+                if (bytes <= room) {
+                    const std::uint8_t *src = in_spr ? g_spr + off : g_ram + off;
+                    const bool may_unchanging = !in_spr && !spr_page_hit(off, static_cast<std::uint32_t>(bytes));
+                    vif::transfer_tte_data(1, tte_words, src, qwc, may_unchanging);
+                } else {
+                    vif::transfer_tte(1, tte_words);
+                    deliver(1, data, qwc);
+                }
+            }
+            c.madr = data + qwc * 16;
+            if (memo_at && id == 6) {
+                vif::memo_end(vif::MemoEnd{c.chcr & 0xFFFF0000u, c.madr});
+                memo_at = false;
+            }
+            if (vif::stalled(1)) {
+                if (memo_at) vif::memo_abort();
+                pause(1, end || (tie && irq));
+                return;
+            }
+            if (end || (tie && irq)) break;
+        }
+        if (memo_at) vif::memo_abort();
+        c.qwc = 0;
+        finish(1);
+        return;
+    }
+    const bool memo_calls = ch == 1 && tte && !mfifo;
+    bool memo_at = false;
+#endif'''),
+        ('''    g_mfifo_waiting = false;
+}''',
+         '''    g_mfifo_waiting = false;
+#ifdef PS2_PICA
+    std::memset(g_spr_pages, 0, sizeof g_spr_pages);
+#endif
+}'''),
+        ('''        const Channel &v = g_ch[1];
+        g_mfifo_waiting = mfifo_vif1()''',
+         '''#ifdef PS2_PICA
+        std::memset(g_spr_pages, 0, sizeof g_spr_pages);
+#endif
+        const Channel &v = g_ch[1];
+        g_mfifo_waiting = mfifo_vif1()'''),
+    ],
+    'runtime/src/vif.cpp': [
+        ('''std::size_t run_skipped(int unit, Unit &u, const std::uint32_t *words, std::size_t count);''',
+         '''template <bool Capture>
+std::size_t run_skipped(int unit, Unit &u, const std::uint32_t *words, std::size_t count);'''),
+        ('''    g_wrote = kWCode;   // a transfer of only padding still clears the code register
+    const std::size_t pos = run_skipped(unit, u, words, count);
+    g_capture = nullptr;''',
+         '''    g_wrote = kWCode;   // a transfer of only padding still clears the code register
+    const std::size_t pos = keep_records ? run_skipped<true>(unit, u, words, count)
+                                         : run_skipped<false>(unit, u, words, count);
+    g_capture = nullptr;'''),
+        ('''std::size_t run_skipped(int unit, Unit &u, const std::uint32_t *words, std::size_t count) {
+    std::size_t pos = 0;
+    if (u.dropping) {
+        pos = std::min<std::size_t>(u.dropping, count);
+        u.dropping -= static_cast<std::uint32_t>(pos);
+    } else if (u.passing) {
+        pos = std::min<std::size_t>(u.passing, count);
+        u.passing -= static_cast<std::uint32_t>(pos);
+        keep_data(words, pos);
+    }
+    const bool drop = gs::queue::g_ee_skip;
+    while (pos < count && !u.stalled) {
+        const std::uint32_t cmd = words[pos];
+        if (!cmd) {
+            u.code = 0;
+            ++pos;
+            continue;
+        }
+        const std::size_t start = pos + 1;
+        const std::uint32_t need = data_words(u, cmd);
+        const bool whole = start + need <= count;
+        const bool unpacks = (cmd & 0x60000000u) == 0x60000000u && u.mode != 2;
+        const bool is_mpg = ((cmd >> 24) & 0x7Fu) == 0x4Au;
+        const bool is_direct = !drop && (((cmd >> 24) & 0x7Fu) == 0x50u || ((cmd >> 24) & 0x7Fu) == 0x51u);
+        // These two do nothing with their data on this side, so they can run before it has all arrived, unless they also stop the DMA.
+        if (!whole && !((unpacks || is_mpg) && !(cmd >> 31))) break;
+        const bool buffered = drop && unpacks && (cmd & 0x80008000u) == 0x8000u;
+        execute<false, true>(unit, u, cmd, words + start);
+        if (whole) {
+            if (!buffered && (unpacks || is_mpg || is_direct)) {
+                const auto *at_bytes = reinterpret_cast<const std::uint8_t *>(words + start);
+                if ((need >= kAddressedWords || (is_mpg && need >= 4u)) && at_bytes >= g_ram && at_bytes + need * 4u <= g_ram + kRamSize) {
+                    if (g_kept_words) send_kept();
+                    auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 12u));
+                    rec[0] = static_cast<std::uint32_t>(need) | 0xC0000000u;
+                    rec[1] = cmd;
+                    rec[2] = static_cast<std::uint32_t>(at_bytes - g_ram);
+                    capture(rec, 3u);
+                } else {
+                    keep(words + pos, 1u + need);
+                }
+            } else if (!buffered) {
+                keep(words + pos, 1u + need);
+            }
+            pos = start + need;
+        } else {
+            const std::size_t have = count - pos;
+            (buffered ? u.dropping : u.passing) = static_cast<std::uint32_t>(1u + need - have);
+            if (!buffered) {
+                keep(words + pos, 1);
+                keep_data(words + start, have - 1);
+            }
+            pos = count;
+        }
+    }
+    keep(words + pos, count - pos);
+    if (g_kept_words) send_kept();
+    return pos;
+}''',
+         '''template <bool Capture>
+std::size_t run_skipped(int unit, Unit &u, const std::uint32_t *words, std::size_t count) {
+    std::size_t pos = 0;
+    if (u.dropping) {
+        pos = std::min<std::size_t>(u.dropping, count);
+        u.dropping -= static_cast<std::uint32_t>(pos);
+    } else if (u.passing) {
+        pos = std::min<std::size_t>(u.passing, count);
+        u.passing -= static_cast<std::uint32_t>(pos);
+        keep_data(words, pos);
+    }
+    const bool drop = Capture ? false : gs::queue::g_ee_skip;
+    while (pos < count && !u.stalled) {
+        const std::uint32_t cmd = words[pos];
+        if (!cmd) {
+            u.code = 0;
+            if (g_kept_words && g_kept + g_kept_words == words + pos && pos + 1 < count && words[pos + 1]) ++g_kept_words;
+            ++pos;
+            continue;
+        }
+        if (!(cmd & 0x80000000u)) {
+            const std::uint32_t op = cmd >> 24;
+            if (op <= 0x17u && op != 0x06u) {
+                const std::uint32_t imm = cmd & 0xFFFFu;
+                bool ok = true;
+                switch (op) {
+                case 0x01: u.cycle = imm; if constexpr (Capture) g_wrote |= 1u; break;
+                case 0x02: u.ofst = imm & 0x3FFu; u.dbf = false; u.tops = u.base; if constexpr (Capture) g_wrote |= 2u | 4u | 8u; break;
+                case 0x03: u.base = imm & 0x3FFu; if constexpr (Capture) g_wrote |= 16u; break;
+                case 0x04: u.itops = imm & 0x3FFu; if constexpr (Capture) g_wrote |= 32u; break;
+                case 0x05: u.mode = imm & 3u; if constexpr (Capture) g_wrote |= 64u; break;
+                case 0x07: u.mark = imm; if constexpr (Capture) g_wrote |= 128u; break;
+                case 0x10: case 0x11: case 0x13: break;
+                case 0x14: case 0x15:
+                    u.top = u.tops; u.itop = u.itops; u.dbf = !u.dbf; u.tops = u.base + (u.dbf ? u.ofst : 0);
+                    if constexpr (Capture) { g_skip_unsafe = true; g_wrote |= 256u | 512u | 4u | 8u; }
+                    break;
+                case 0x17:
+                    u.top = u.tops; u.itop = u.itops; u.dbf = !u.dbf; u.tops = u.base + (u.dbf ? u.ofst : 0);
+                    if constexpr (Capture) g_wrote |= 256u | 512u | 4u | 8u;
+                    break;
+                default: ok = false; break;
+                }
+                if (ok) {
+                    u.code = cmd;
+                    if constexpr (Capture) g_wrote |= 16384u;
+                    keep(words + pos, 1u);
+                    ++pos;
+                    continue;
+                }
+            } else if ((op & 0x60u) == 0x60u && u.mode != 2u) {
+                const std::uint32_t num = (cmd >> 16) & 0xFFu;
+                const std::uint32_t need = unpack_words(cmd, u, num ? num : 256u);
+                const std::size_t start = pos + 1;
+                u.code = cmd;
+                u.num = 0;
+                if constexpr (Capture) {
+                    if (!(cmd & 0x8000u)) g_skip_unsafe = true;
+                    g_wrote |= 8192u | 16384u;
+                }
+                const bool buffered = drop && (cmd & 0x8000u);
+                if (start + need <= count) {
+                    if (!buffered) {
+                        const auto *at_bytes = reinterpret_cast<const std::uint8_t *>(words + start);
+                        if (need >= kAddressedWords && at_bytes >= g_ram && at_bytes + need * 4u <= g_ram + kRamSize) {
+                            if (g_kept_words) send_kept();
+                            auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 12u));
+                            rec[0] = need | 0xC0000000u;
+                            rec[1] = cmd;
+                            rec[2] = static_cast<std::uint32_t>(at_bytes - g_ram);
+                            if constexpr (Capture) capture(rec, 3u);
+                        } else {
+                            keep(words + pos, 1u + need);
+                        }
+                    }
+                    pos = start + need;
+                } else {
+                    const std::size_t have = count - pos;
+                    (buffered ? u.dropping : u.passing) = static_cast<std::uint32_t>(1u + need - have);
+                    if (!buffered) {
+                        keep(words + pos, 1);
+                        keep_data(words + start, have - 1);
+                    }
+                    pos = count;
+                }
+                continue;
+            }
+        }
+        const std::size_t start = pos + 1;
+        const std::uint32_t need = data_words(u, cmd);
+        const bool whole = start + need <= count;
+        const bool unpacks = (cmd & 0x60000000u) == 0x60000000u && u.mode != 2;
+        const bool is_mpg = ((cmd >> 24) & 0x7Fu) == 0x4Au;
+        const bool is_direct = !drop && (((cmd >> 24) & 0x7Fu) == 0x50u || ((cmd >> 24) & 0x7Fu) == 0x51u);
+        // These two do nothing with their data on this side, so they can run before it has all arrived, unless they also stop the DMA.
+        if (!whole && !((unpacks || is_mpg) && !(cmd >> 31))) break;
+        const bool buffered = drop && unpacks && (cmd & 0x80008000u) == 0x8000u;
+        execute<false, true, Capture>(unit, u, cmd, words + start);
+        if (whole) {
+            if (!buffered && (unpacks || is_mpg || is_direct)) {
+                const auto *at_bytes = reinterpret_cast<const std::uint8_t *>(words + start);
+                if ((need >= kAddressedWords || (is_mpg && need >= 4u)) && at_bytes >= g_ram && at_bytes + need * 4u <= g_ram + kRamSize) {
+                    if (g_kept_words) send_kept();
+                    auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 12u));
+                    rec[0] = static_cast<std::uint32_t>(need) | 0xC0000000u;
+                    rec[1] = cmd;
+                    rec[2] = static_cast<std::uint32_t>(at_bytes - g_ram);
+                    if constexpr (Capture) capture(rec, 3u);
+                } else {
+                    keep(words + pos, 1u + need);
+                }
+            } else if (!buffered) {
+                keep(words + pos, 1u + need);
+            }
+            pos = start + need;
+        } else {
+            const std::size_t have = count - pos;
+            (buffered ? u.dropping : u.passing) = static_cast<std::uint32_t>(1u + need - have);
+            if (!buffered) {
+                keep(words + pos, 1);
+                keep_data(words + start, have - 1);
+            }
+            pos = count;
+        }
+    }
+    keep(words + pos, count - pos);
+    if (g_kept_words) send_kept();
+    return pos;
+}'''),
+        ('''            const std::size_t pos = run_skipped(unit, u, words, count);''',
+         '''            const std::size_t pos = run_skipped<false>(unit, u, words, count);'''),
+        ('''void transfer_tte(int unit, const std::uint32_t words[2]) {
+    if (unit == 1 && gs::queue::vu_active() && !on_vu_thread()) {
+        Unit &u = g_units[1];
+        if (!words[0] && !words[1] && !u.stalled && u.pending.empty() && !u.dropping && !u.passing) {
+            u.code = 0;
+            return;
+        }
+        if (!gs::queue::g_ee_skip && !u.stalled && u.pending.empty() && !u.dropping && !u.passing) {
+            PS2_PROF(ps2::prof::Vif);
+            auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 12u));
+            rec[0] = 2u;
+            rec[1] = words[0];
+            rec[2] = words[1];
+            const std::size_t pos = run<false, true>(1, u, words, 2);
+            if (pos < 2) u.pending.assign(words + pos, words + 2);
+            return;
+        }
+    }
+    alignas(16) std::uint32_t q[4] = {0, 0, words[0], words[1]};
+    transfer(unit, reinterpret_cast<const std::uint8_t *>(q), 1);
+}
+
+void transfer_dynamic(int unit, const std::uint8_t *data, std::uint32_t qwc) {
+    if (unit == 1 && gs::queue::vu_active() && !on_vu_thread() && !gs::queue::g_ee_skip && qwc > 0) {
+        Unit &u = g_units[1];
+        if (!u.stalled && !u.dropping && !u.passing) {
+            PS2_PROF(ps2::prof::Vif);
+            g_memo_bad = true;
+            if (qwc <= 512u) {
+                const std::uint32_t w = qwc * 4u;
+                auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 4u + w * 4u));
+                rec[0] = w;
+                std::memcpy(rec + 1, data, w * 4u);
+            } else {
+                gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16u);
+            }
+            const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+            const std::size_t count = static_cast<std::size_t>(qwc) * 4u;
+            if (!run_transfer<false, true>(1, u, words, count)) {
+                const std::size_t old = u.pending.size();
+                u.pending.resize(old + count);
+                std::memcpy(u.pending.data() + old, data, count * 4u);
+                process(1, u, false, true);
+            }
+            return;
+        }
+    }
+    transfer(unit, data, qwc);
+}''',
+         '''void transfer_tte(int unit, const std::uint32_t words[2]) {
+    if (unit == 1 && gs::queue::vu_active() && !on_vu_thread()) {
+        Unit &u = g_units[1];
+        if (!u.stalled && u.pending.empty() && !u.dropping && !u.passing) {
+            const std::uint32_t w0 = words[0], w1 = words[1];
+            if (!w0 && !w1) {
+                u.code = 0;
+                return;
+            }
+            auto simple_cmd = [](std::uint32_t w) {
+                if (!w) return true;
+                if (w & 0x80000000u) return false;
+                const std::uint32_t op = w >> 24;
+                return op <= 0x05u || op == 0x07u || op == 0x10u || op == 0x11u || op == 0x13u ||
+                       op == 0x14u || op == 0x15u || op == 0x17u;
+            };
+            if (!gs::queue::g_ee_skip || (simple_cmd(w0) && simple_cmd(w1))) {
+                PS2_PROF(ps2::prof::Vif);
+                if (!w0) {
+                    auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 8u));
+                    rec[0] = 1u;
+                    rec[1] = w1;
+                    const std::size_t pos = run<false, true>(1, u, words + 1, 1);
+                    if (pos < 1) u.pending.assign(words + 1, words + 2);
+                    return;
+                }
+                if (!w1 && simple_cmd(w0)) {
+                    auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 8u));
+                    rec[0] = 1u;
+                    rec[1] = w0;
+                    run<false, true>(1, u, words, 2);
+                    return;
+                }
+                auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 12u));
+                rec[0] = 2u;
+                rec[1] = w0;
+                rec[2] = w1;
+                const std::size_t pos = run<false, true>(1, u, words, 2);
+                if (pos < 2) u.pending.assign(words + pos, words + 2);
+                return;
+            }
+        }
+    }
+    alignas(16) std::uint32_t q[4] = {0, 0, words[0], words[1]};
+    transfer(unit, reinterpret_cast<const std::uint8_t *>(q), 1);
+}
+
+void transfer_dynamic(int unit, const std::uint8_t *data, std::uint32_t qwc) {
+    if (unit == 1 && gs::queue::vu_active() && !on_vu_thread() && qwc > 0) {
+        Unit &u = g_units[1];
+        if (gs::queue::g_ee_skip) {
+            if (u.pending.empty() && !u.stalled) {
+                PS2_PROF(ps2::prof::Vif);
+                const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+                const std::size_t count = static_cast<std::size_t>(qwc) * 4u;
+                const std::size_t pos = run_skipped<false>(1, u, words, count);
+                if (pos < count) u.pending.assign(words + pos, words + count);
+                return;
+            }
+        } else if (!u.stalled && !u.dropping && !u.passing) {
+            PS2_PROF(ps2::prof::Vif);
+            g_memo_bad = true;
+            if (qwc <= 512u) {
+                const std::uint32_t w = qwc * 4u;
+                auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 4u + w * 4u));
+                rec[0] = w;
+                std::memcpy(rec + 1, data, w * 4u);
+            } else {
+                gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16u);
+            }
+            const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+            const std::size_t count = static_cast<std::size_t>(qwc) * 4u;
+            if (!run_transfer<false, true>(1, u, words, count)) {
+                const std::size_t old = u.pending.size();
+                u.pending.resize(old + count);
+                std::memcpy(u.pending.data() + old, data, count * 4u);
+                process(1, u, false, true);
+            }
+            return;
+        }
+    }
+    transfer(unit, data, qwc);
+}'''),
+        ('''void transfer_tte_data(int unit, const std::uint32_t words[2], const std::uint8_t *data, std::uint32_t qwc, bool may_unchanging) {
+    if (unit == 1 && gs::queue::vu_active() && !on_vu_thread() && !gs::queue::g_ee_skip && qwc > 0) {
+        Unit &u = g_units[1];
+        if (!u.stalled && u.pending.empty() && !u.dropping && !u.passing) {
+            const std::uint32_t w0 = words[0], w1 = words[1];
+            if (!w0 && !w1 && !may_unchanging) {
+                u.code = 0;
+                transfer_dynamic(unit, data, qwc);
+                return;
+            }''',
+         '''void transfer_tte_data(int unit, const std::uint32_t words[2], const std::uint8_t *data, std::uint32_t qwc, bool may_unchanging) {
+    if (unit == 1 && gs::queue::vu_active() && !on_vu_thread() && qwc > 0) {
+        Unit &u = g_units[1];
+        if (!u.stalled && u.pending.empty() && !u.dropping && !u.passing) {
+            const bool skip = gs::queue::g_ee_skip;
+            const std::uint32_t w0 = words[0], w1 = words[1];'''),
+        ('''                        u.code = w1;
+                        if (is_unpack) u.num = 0;''',
+         '''                        u.code = w1;
+                        if (is_unpack) u.num = 0;
+                        if (skip && is_unpack && (w1 & 0x80008000u) == 0x8000u) {
+                            if (w0) {
+                                auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, 8u));
+                                rec[0] = 1u;
+                                rec[1] = w0;
+                            }
+                            return;
+                        }'''),
+        ('''                        gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16u);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    transfer_tte(unit, words);''',
+         '''                        gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16u);
+                        return;
+                    }
+                }
+            }
+            if (!may_unchanging) {
+                if (!skip && qwc <= 512u) {
+                    PS2_PROF(ps2::prof::Vif);
+                    g_memo_bad = true;
+                    const std::uint32_t w = qwc * 4u;
+                    const std::uint32_t tte_n = w0 ? 2u : (w1 ? 1u : 0u);
+                    auto *rec = reinterpret_cast<std::uint32_t *>(gs::queue::vu().extend(gs::queue::kVif1Records, (1u + tte_n + w) * 4u));
+                    rec[0] = tte_n + w;
+                    std::uint32_t *dst = rec + 1;
+                    if (tte_n == 2u) {
+                        dst[0] = w0;
+                        dst[1] = w1;
+                        dst += 2;
+                    } else if (tte_n == 1u) {
+                        dst[0] = w1;
+                        dst += 1;
+                    }
+                    std::memcpy(dst, data, w * 4u);
+                    if (tte_n) {
+                        const std::uint32_t *tw = tte_n == 2u ? words : words + 1;
+                        const std::size_t tpos = run<false, true>(1, u, tw, tte_n);
+                        if (tpos < tte_n) u.pending.assign(tw + tpos, tw + tte_n);
+                    } else {
+                        u.code = 0;
+                    }
+                    const auto *dwords = reinterpret_cast<const std::uint32_t *>(data);
+                    const std::size_t count = static_cast<std::size_t>(w);
+                    if (!run_transfer<false, true>(1, u, dwords, count)) {
+                        const std::size_t old = u.pending.size();
+                        u.pending.resize(old + count);
+                        std::memcpy(u.pending.data() + old, data, count * 4u);
+                        process(1, u, false, true);
+                    }
+                    return;
+                }
+                if (!w0 && !w1) {
+                    u.code = 0;
+                    transfer_dynamic(unit, data, qwc);
+                    return;
+                }
+            }
+        }
+    }
+    transfer_tte(unit, words);'''),
+    ],
+    'runtime/src/gs/gif.cpp': [
+        ('''bool scan(Path &p, const std::uint8_t *data, std::uint32_t qwc) {
+    bool hit = false;''',
+         '''bool scan(Path &p, const std::uint8_t *data, std::uint32_t qwc) {
+    if (!p.active && qwc) {
+        std::uint64_t d0, d1;
+        std::memcpy(&d0, data, 8);
+        std::memcpy(&d1, data + 8, 8);
+        const std::uint32_t nloop = static_cast<std::uint32_t>(d0) & 0x7FFFu;
+        const std::uint32_t flg = static_cast<std::uint32_t>(d0 >> 58) & 3u;
+        if (flg >= 2u && nloop + 1u == qwc) return false;
+        if (flg == 0u && nloop + 1u == qwc) {
+            const std::uint32_t nreg = static_cast<std::uint32_t>(d0 >> 60) & 0xFu;
+            if (nreg == 1u) {
+                if ((d1 & 0xFu) != 0xEu) return false;
+                bool hit = false;
+                const std::uint8_t *at = data + 16;
+                for (std::uint32_t k = 0; k < nloop; ++k, at += 16) {
+                    const std::uint8_t reg = at[8];
+                    if (reg >= 0x50 && reg <= 0x62) [[unlikely]] {
+                        hit = true;
+                        std::uint64_t value;
+                        std::memcpy(&value, at, 8);
+                        if (reg >= 0x60) gs::signal(reg, value);
+                        else if (reg <= 0x53) gs::note_transfer(reg, value);
+                    }
+                }
+                return hit;
+            }
+        }
+    }
+    bool hit = false;'''),
+    ],
+}
+
+# Wave 5 Core 2 VIF record decode + deferred MPG MRU + Core 0 memo_play + Core 2 GS deferred active bitmask:
+# - vif.cpp: hoist clean state in transfer_record_slice + inline 1/2-word TTE & STMASK dispatch;
+#   2-entry MRU in lookup_deferred_mpg & populate g_last_mpg in cache_deferred_mpg;
+#   hoist g_ee_skip in memo_find & defer out-of-line gif::scan_active(2) in memo_play.
+# - gs/gs.cpp: 32-byte g_def_active[] bitmask for O(active) scans & O(1) free-slot lookup +
+#   word-level set_deferred_bits / any_deferred_in.
+VIF_CORE2_GS_EDITS = {
+    'runtime/src/vif.cpp': [
+        ('''std::uintptr_t lookup_deferred_mpg(std::uint32_t address, std::uint64_t &sig_out, std::uint64_t &pages_out, std::uint8_t &count_out) {
+    const std::uint32_t pc = address & 16383u;
+    if (g_last_mpg[0].fn && g_last_mpg[0].pc == pc) return g_last_mpg[0].fn;
+    if (g_last_mpg[1].fn && g_last_mpg[1].pc == pc) return g_last_mpg[1].fn;
+    std::uint64_t h = 0xCBF29CE484222325ull ^ (static_cast<std::uint64_t>(pc) * 0x9E3779B97F4A7C15ull);
+    for (int i = 0; i < g_def_mpg_count; ++i) {
+        const DeferredMpg &d = g_def_mpg[i];
+        std::uint32_t w0, wm;
+        std::memcpy(&w0, d.src, 4);
+        std::memcpy(&wm, d.src + (d.bytes >> 1), 4);
+        h = (h ^ static_cast<std::uint64_t>(d.src - g_ram)) * 0x100000001B3ull;
+        h = (h ^ (static_cast<std::uint64_t>(d.first) | (static_cast<std::uint64_t>(d.bytes) << 16))) * 0x100000001B3ull;
+        h = (h ^ (static_cast<std::uint64_t>(w0) | (static_cast<std::uint64_t>(wm) << 32))) * 0x100000001B3ull;
+    }
+    sig_out = h;
+    pages_out = g_def_mpg_pages;
+    count_out = static_cast<std::uint8_t>(g_def_mpg_count);
+    const MpgCacheEntry &e = g_mpg_cache[(h ^ (h >> 16) ^ (h >> 32)) & (kMpgCacheSize - 1)];
+    if (e.fn && e.sig == h && e.pages == g_def_mpg_pages && e.address == pc && e.count == count_out) {
+        g_last_mpg[1] = g_last_mpg[0];
+        g_last_mpg[0] = LastMpg{pc, e.fn};
+        return e.fn;
+    }
+    return 0;
+}
+
+void cache_deferred_mpg(std::uint32_t address, std::uint64_t sig, std::uint64_t pages, std::uint8_t count, std::uintptr_t fn) {
+    MpgCacheEntry &e = g_mpg_cache[(sig ^ (sig >> 16) ^ (sig >> 32)) & (kMpgCacheSize - 1)];
+    e = MpgCacheEntry{sig, pages, address & 16383u, count, fn};
+}''',
+         '''std::uintptr_t lookup_deferred_mpg(std::uint32_t address, std::uint64_t &sig_out, std::uint64_t &pages_out, std::uint8_t &count_out) {
+    const std::uint32_t pc = address & 16383u;
+    if (g_last_mpg[0].fn && g_last_mpg[0].pc == pc) return g_last_mpg[0].fn;
+    if (g_last_mpg[1].fn && g_last_mpg[1].pc == pc) {
+        const LastMpg hit = g_last_mpg[1];
+        g_last_mpg[1] = g_last_mpg[0];
+        g_last_mpg[0] = hit;
+        return hit.fn;
+    }
+    std::uint64_t h = 0xCBF29CE484222325ull ^ (static_cast<std::uint64_t>(pc) * 0x9E3779B97F4A7C15ull);
+    for (int i = 0; i < g_def_mpg_count; ++i) {
+        const DeferredMpg &d = g_def_mpg[i];
+        std::uint32_t w0, wm;
+        std::memcpy(&w0, d.src, 4);
+        std::memcpy(&wm, d.src + (d.bytes >> 1), 4);
+        h = (h ^ static_cast<std::uint64_t>(d.src - g_ram)) * 0x100000001B3ull;
+        h = (h ^ (static_cast<std::uint64_t>(d.first) | (static_cast<std::uint64_t>(d.bytes) << 16))) * 0x100000001B3ull;
+        h = (h ^ (static_cast<std::uint64_t>(w0) | (static_cast<std::uint64_t>(wm) << 32))) * 0x100000001B3ull;
+    }
+    sig_out = h;
+    pages_out = g_def_mpg_pages;
+    count_out = static_cast<std::uint8_t>(g_def_mpg_count);
+    const MpgCacheEntry &e = g_mpg_cache[(h ^ (h >> 16) ^ (h >> 32)) & (kMpgCacheSize - 1)];
+    if (e.fn && e.sig == h && e.pages == g_def_mpg_pages && e.address == pc && e.count == count_out) {
+        g_last_mpg[1] = g_last_mpg[0];
+        g_last_mpg[0] = LastMpg{pc, e.fn};
+        return e.fn;
+    }
+    return 0;
+}
+
+void cache_deferred_mpg(std::uint32_t address, std::uint64_t sig, std::uint64_t pages, std::uint8_t count, std::uintptr_t fn) {
+    const std::uint32_t pc = address & 16383u;
+    MpgCacheEntry &e = g_mpg_cache[(sig ^ (sig >> 16) ^ (sig >> 32)) & (kMpgCacheSize - 1)];
+    e = MpgCacheEntry{sig, pages, pc, count, fn};
+    g_last_mpg[1] = g_last_mpg[0];
+    g_last_mpg[0] = LastMpg{pc, fn};
+}'''),
+        ('''inline Memo *memo_find(Memo *set, std::uint32_t target, const Key &k) {
+    for (Memo *m = set; m < set + 4; ++m)
+        if (m->target == target && m->skip == gs::queue::g_ee_skip && m->before == k) return m;
+    return nullptr;
+}''',
+         '''inline Memo *memo_find(Memo *set, std::uint32_t target, const Key &k) {
+    const std::uint8_t skip = gs::queue::g_ee_skip;
+    for (Memo *m = set; m < set + 4; ++m)
+        if (m->target == target && m->skip == skip && m->before == k) return m;
+    return nullptr;
+}'''),
+        ('''bool memo_play(std::uint32_t target, MemoEnd &end) {
+    Unit &u = g_units[1];
+    if (!g_memos || (target & 0x80000000u) || !memo_clean(u)) return false;
+    target &= kRamSize - 16u;
+    const Key before = key_of(u);
+    Memo *const at = memo_find(memo_set(target, before), target, before);
+    if (!at || !at->ready || at->epoch != g_epoch) return false;
+    Memo &m = *at;
+    const MemoBlock *b = g_memo_blocks + m.first_block;
+    const std::uint32_t n = m.blocks;
+    if (m.gen != gs::queue::g_rewritten_gen) {
+        if (memo_rewritten(b, n)) {
+            m.ready = 0;
+            m.same = 0;
+            m.wait = 255;
+            return false;
+        }
+        m.gen = gs::queue::g_rewritten_gen;
+    }
+    bool ok = memo_sample(g_ram + b[0].off, b[0].bytes) == b[0].sample;
+    if (ok && n > 1u) {
+        if (n <= 4u) {
+            for (std::uint32_t r = 1u; r < n && ok; ++r)
+                ok = memo_sample(g_ram + b[r].off, b[r].bytes) == b[r].sample;
+        } else {
+            ok = memo_sample(g_ram + b[n - 1u].off, b[n - 1u].bytes) == b[n - 1u].sample;
+            std::uint32_t r = m.rot;
+            for (std::uint32_t k = 2u; k && ok; --k) {
+                if (++r >= n - 1u) r = 1u;
+                ok = memo_sample(g_ram + b[r].off, b[r].bytes) == b[r].sample;
+            }
+            m.rot = static_cast<std::uint16_t>(r);
+        }
+    }
+    if (ok && !m.rest--) {
+        ok = memo_hash(b, n) == m.hash;
+        m.rest = static_cast<std::uint16_t>(32u + ((m.hash >> 26) & 31u));
+    }
+    if (!ok) {
+        m.ready = 0;
+        m.same = 0;
+        m.wait = 8;
+        return false;
+    }''',
+         '''bool memo_play(std::uint32_t target, MemoEnd &end) {
+    Unit &u = g_units[1];
+    if (!g_memos || (target & 0x80000000u) || u.stalled || !u.pending.empty() || u.dropping || u.passing ||
+        !gs::queue::vu_active() || on_vu_thread())
+        return false;
+    target &= kRamSize - 16u;
+    const Key before = key_of(u);
+    Memo *const at = memo_find(memo_set(target, before), target, before);
+    if (!at || !at->ready || at->epoch != g_epoch || gif::scan_active(2)) return false;
+    Memo &m = *at;
+    const MemoBlock *b = g_memo_blocks + m.first_block;
+    const std::uint32_t n = m.blocks;
+    if (m.gen != gs::queue::g_rewritten_gen) [[unlikely]] {
+        if (memo_rewritten(b, n)) {
+            m.ready = 0;
+            m.same = 0;
+            m.wait = 255;
+            return false;
+        }
+        m.gen = gs::queue::g_rewritten_gen;
+    }
+    bool ok = memo_sample(g_ram + b[0].off, b[0].bytes) == b[0].sample;
+    if (ok && n > 1u) {
+        if (n <= 4u) {
+            for (std::uint32_t r = 1u; r < n && ok; ++r)
+                ok = memo_sample(g_ram + b[r].off, b[r].bytes) == b[r].sample;
+        } else {
+            ok = memo_sample(g_ram + b[n - 1u].off, b[n - 1u].bytes) == b[n - 1u].sample;
+            std::uint32_t r = m.rot;
+            for (std::uint32_t k = 2u; k && ok; --k) {
+                if (++r >= n - 1u) r = 1u;
+                ok = memo_sample(g_ram + b[r].off, b[r].bytes) == b[r].sample;
+            }
+            m.rot = static_cast<std::uint16_t>(r);
+        }
+    }
+    if (ok && !m.rest--) [[unlikely]] {
+        ok = memo_hash(b, n) == m.hash;
+        m.rest = static_cast<std::uint16_t>(32u + ((m.hash >> 26) & 31u));
+    }
+    if (!ok) [[unlikely]] {
+        m.ready = 0;
+        m.same = 0;
+        m.wait = 8;
+        return false;
+    }'''),
+        ('''void transfer_records(const std::uint8_t *payload, std::uint32_t bytes) {
+    const auto *at = reinterpret_cast<const std::uint32_t *>(payload);
+    const std::uint32_t *const end = at + bytes / 4u;
+    while (at < end) {
+        const std::uint32_t count = *at++;
+        if ((count & 0xC0000000u) == 0xC0000000u) {
+            const std::uint32_t cmd = *at++;
+            const std::uint32_t off = *at++;
+            if (g_vu_side.pending.empty() && !g_vu_side.stalled) {
+                execute<true, false>(1, g_vu_side, cmd, reinterpret_cast<const std::uint32_t *>(g_ram + off));
+            } else {
+                transfer_words(&cmd, 1);
+                transfer_words(reinterpret_cast<const std::uint32_t *>(g_ram + off), count & 0x3FFFFFFFu);
+            }
+        } else if (count >> 31) {
+            transfer_words(reinterpret_cast<const std::uint32_t *>(g_ram + *at++), count & 0x7FFFFFFFu);
+        } else if (count & 0x40000000u) {
+            discard_deferred_unpacks();
+            Unit &u = g_vu_side;
+            const std::uint32_t w = count & 0x7FFFu;
+            if (w & kWCycle) u.cycle = *at++;
+            if (w & kWOfst) u.ofst = *at++;
+            if (w & kWDbf) u.dbf = ((count >> 16) & 1u) != 0;
+            if (w & kWTops) u.tops = *at++;
+            if (w & kWBase) u.base = *at++;
+            if (w & kWItops) u.itops = *at++;
+            if (w & kWMode) u.mode = *at++;
+            if (w & kWMark) u.mark = *at++;
+            if (w & kWTop) u.top = *at++;
+            if (w & kWItop) u.itop = *at++;
+            if (w & kWMask) u.mask = *at++;
+            if (w & kWRow) { std::memcpy(u.row, at, 16); at += 4; }
+            if (w & kWCol) { std::memcpy(u.col, at, 16); at += 4; }
+            if (w & kWNum) u.num = *at++;
+            if (w & kWCode) u.code = *at++;
+            if (w & (kWTop | kWItop)) vu::set_tops(u.top, u.itop);
+        } else {
+            transfer_words(at, count);
+            at += count;
+        }
+    }
+    if (g_def_any_non_ram) flush_deferred_unpacks();
+}''',
+         '''static void transfer_record_slice(const std::uint32_t *at, const std::uint32_t *const end) {
+    Unit &u = g_vu_side;
+    bool clean = u.pending.empty() && !u.stalled;
+    auto exec_simple = [&u](std::uint32_t cmd) -> bool {
+        if (!cmd) { u.code = 0; return true; }
+        const std::uint32_t op = cmd >> 24;
+        if (op <= 0x17u) {
+            u.code = cmd;
+            const std::uint32_t imm = cmd & 0xFFFFu;
+            switch (op) {
+            case 0x01: u.cycle = imm; return true;
+            case 0x02: u.ofst = imm & 0x3FFu; u.dbf = false; u.tops = u.base; return true;
+            case 0x03: u.base = imm & 0x3FFu; return true;
+            case 0x04: u.itops = imm & 0x3FFu; return true;
+            case 0x05: u.mode = imm & 3u; return true;
+            case 0x06: gif::set_path3_masked((imm >> 15) & 1u); return true;
+            case 0x07: u.mark = imm; return true;
+            case 0x10: case 0x11: case 0x13: return true;
+            case 0x14: case 0x15: run_vu(1, u, false, imm * 8u); return true;
+            case 0x17: run_vu(1, u, false, vu::tpc(1), true); return true;
+            default: return false;
+            }
+        }
+        return false;
+    };
+    while (at < end) {
+        const std::uint32_t count = *at++;
+        if ((count & 0xC0000000u) == 0xC0000000u) {
+            const std::uint32_t cmd = *at++;
+            const std::uint32_t off = *at++;
+            if (clean) [[likely]] {
+                const auto *ptr = reinterpret_cast<const std::uint32_t *>(g_ram + off);
+                if ((cmd & 0xE0000000u) == 0x60000000u) {
+                    u.code = cmd;
+                    unpack<true>(1, u, false, cmd, ptr);
+                } else if (((cmd >> 24) == 0x50u || (cmd >> 24) == 0x51u)) {
+                    u.code = cmd;
+                    const std::uint32_t imm = cmd & 0xFFFFu;
+                    gif::transfer_ram(2, g_ram + off, imm ? imm : 0x10000u);
+                } else {
+                    execute<true, false>(1, u, cmd, ptr);
+                    clean = !u.stalled;
+                }
+            } else {
+                transfer_words(&cmd, 1);
+                transfer_words(reinterpret_cast<const std::uint32_t *>(g_ram + off), count & 0x3FFFFFFFu);
+                clean = u.pending.empty() && !u.stalled;
+            }
+        } else if (count >> 31) {
+            transfer_words(reinterpret_cast<const std::uint32_t *>(g_ram + *at++), count & 0x7FFFFFFFu);
+            clean = u.pending.empty() && !u.stalled;
+        } else if (count & 0x40000000u) {
+            discard_deferred_unpacks();
+            const std::uint32_t w = count & 0x7FFFu;
+            if (w & kWCycle) u.cycle = *at++;
+            if (w & kWOfst) u.ofst = *at++;
+            if (w & kWDbf) u.dbf = ((count >> 16) & 1u) != 0;
+            if (w & kWTops) u.tops = *at++;
+            if (w & kWBase) u.base = *at++;
+            if (w & kWItops) u.itops = *at++;
+            if (w & kWMode) u.mode = *at++;
+            if (w & kWMark) u.mark = *at++;
+            if (w & kWTop) u.top = *at++;
+            if (w & kWItop) u.itop = *at++;
+            if (w & kWMask) u.mask = *at++;
+            if (w & kWRow) { std::memcpy(u.row, at, 16); at += 4; }
+            if (w & kWCol) { std::memcpy(u.col, at, 16); at += 4; }
+            if (w & kWNum) u.num = *at++;
+            if (w & kWCode) u.code = *at++;
+            if (w & (kWTop | kWItop)) vu::set_tops(u.top, u.itop);
+        } else if (count & 0x20000000u) {
+            const std::uint32_t n = count & 0x1FFFFFFFu;
+            const std::uint32_t off = *at++;
+            transfer_record_slice(g_records + off, g_records + off + n);
+            clean = u.pending.empty() && !u.stalled;
+        } else {
+            if (clean) [[likely]] {
+                if (count == 1u) {
+                    const std::uint32_t cmd = *at++;
+                    if (!exec_simple(cmd)) {
+                        transfer_words(at - 1, 1);
+                        clean = u.pending.empty() && !u.stalled;
+                    }
+                    continue;
+                }
+                if (count == 2u) {
+                    const std::uint32_t w0 = at[0], w1 = at[1];
+                    if (w0 == 0x20000000u) {
+                        u.code = w0;
+                        u.mask = w1;
+                        at += 2;
+                        continue;
+                    }
+                    if (exec_simple(w0)) {
+                        if (!exec_simple(w1)) {
+                            transfer_words(at + 1, 1);
+                            clean = u.pending.empty() && !u.stalled;
+                        }
+                        at += 2;
+                        continue;
+                    }
+                }
+                const std::size_t pos = run<true, false>(1, u, at, count);
+                if (pos < count) {
+                    u.pending.assign(at + pos, at + count);
+                    clean = false;
+                } else if (u.stalled) {
+                    clean = false;
+                }
+            } else {
+                transfer_words(at, count);
+                clean = u.pending.empty() && !u.stalled;
+            }
+            at += count;
+        }
+    }
+}
+
+void transfer_records(const std::uint8_t *payload, std::uint32_t bytes) {
+    const auto *at = reinterpret_cast<const std::uint32_t *>(payload);
+    transfer_record_slice(at, at + bytes / 4u);
+    if (g_def_any_non_ram) flush_deferred_unpacks();
+}'''),
+    ],
+    'runtime/src/gs/gs.cpp': [
+        ('''constexpr int kMaxDeferred = 256;
+DeferredUpload g_deferred[kMaxDeferred];
+std::uint32_t g_def_range[kMaxDeferred]{};   // packed first_block | (end_block << 16), 0 if inactive (1 KB SoA)''',
+         '''constexpr int kMaxDeferred = 256;
+constexpr int kDefMaskWords = kMaxDeferred / 32;
+DeferredUpload g_deferred[kMaxDeferred];
+std::uint32_t g_def_range[kMaxDeferred]{};   // packed first_block | (end_block << 16), 0 if inactive (1 KB SoA)
+std::uint32_t g_def_active[kDefMaskWords]{}; // 32-byte active-slot bitmask for O(active) scans & O(1) free-slot lookup'''),
+        ('''void set_deferred_bits(std::uint32_t first, std::uint32_t count) {
+    const std::uint32_t end = std::min<std::uint32_t>(first + count, 512u);
+    for (std::uint32_t p = first; p < end; ++p) g_deferred_mask[p >> 5] |= 1u << (p & 31u);
+}
+
+void rebuild_deferred_mask() {
+    std::memset(g_deferred_mask, 0, sizeof g_deferred_mask);
+    int hi = 0;
+    if (!g_deferred_count) {
+        g_deferred_hi = 0;
+        return;
+    }
+    for (int i = 0; i < g_deferred_hi; ++i) {
+        if (g_deferred[i].active) {
+            set_deferred_bits(g_deferred[i].first_page, g_deferred[i].page_count);
+            hi = i + 1;
+        }
+    }
+    g_deferred_hi = hi;
+}
+
+bool any_deferred_in(std::uint32_t first, std::uint32_t count) {
+    if (!g_deferred_count || !count) return false;
+    const std::uint32_t end = std::min<std::uint32_t>(first + count, 512u);
+    for (std::uint32_t p = first; p < end; ++p)
+        if (g_deferred_mask[p >> 5] & (1u << (p & 31u))) return true;
+    return false;
+}''',
+         '''void set_deferred_bits(std::uint32_t first, std::uint32_t count) {
+    if (!count || first >= 512u) return;
+    const std::uint32_t last = std::min<std::uint32_t>(first + count, 512u) - 1u;
+    std::uint32_t w = first >> 5;
+    const std::uint32_t end_w = last >> 5;
+    const std::uint32_t lo = ~0u << (first & 31u);
+    const std::uint32_t hi = ~0u >> (31u - (last & 31u));
+    if (w == end_w) {
+        g_deferred_mask[w] |= lo & hi;
+        return;
+    }
+    g_deferred_mask[w] |= lo;
+    while (++w < end_w) g_deferred_mask[w] = ~0u;
+    g_deferred_mask[end_w] |= hi;
+}
+
+void rebuild_deferred_mask() {
+    std::memset(g_deferred_mask, 0, sizeof g_deferred_mask);
+    if (!g_deferred_count) {
+        g_deferred_hi = 0;
+        return;
+    }
+    int hi = 0;
+    const int w_end = (g_deferred_hi + 31) >> 5;
+    for (int w = 0; w < w_end; ++w) {
+        std::uint32_t m = g_def_active[w];
+        if (!m) continue;
+        hi = (w << 5) + (32 - __builtin_clz(m));
+        for (; m; m &= m - 1u) {
+            const int i = (w << 5) | __builtin_ctz(m);
+            set_deferred_bits(g_deferred[i].first_page, g_deferred[i].page_count);
+        }
+    }
+    g_deferred_hi = hi;
+}
+
+bool any_deferred_in(std::uint32_t first, std::uint32_t count) {
+    if (!g_deferred_count || !count || first >= 512u) return false;
+    const std::uint32_t last = std::min<std::uint32_t>(first + count, 512u) - 1u;
+    std::uint32_t w = first >> 5;
+    const std::uint32_t end_w = last >> 5;
+    const std::uint32_t lo = ~0u << (first & 31u);
+    const std::uint32_t hi = ~0u >> (31u - (last & 31u));
+    if (w == end_w) return (g_deferred_mask[w] & lo & hi) != 0u;
+    if (g_deferred_mask[w] & lo) return true;
+    while (++w < end_w)
+        if (g_deferred_mask[w]) return true;
+    return (g_deferred_mask[end_w] & hi) != 0u;
+}'''),
+        ('''void drop_deferred(int idx) {
+    g_deferred[idx].active = false;
+    g_def_range[idx] = 0u;
+    --g_deferred_count;
+}
+
+void materialize_deferred(int idx) {
+    DeferredUpload &u = g_deferred[idx];
+    if (superseded(u)) {
+        drop_deferred(idx);
+        return;
+    }
+    u.active = false;
+    g_def_range[idx] = 0u;
+    --g_deferred_count;''',
+         '''void drop_deferred(int idx) {
+    g_deferred[idx].active = false;
+    g_def_range[idx] = 0u;
+    g_def_active[idx >> 5] &= ~(1u << (idx & 31u));
+    --g_deferred_count;
+}
+
+void materialize_deferred(int idx) {
+    DeferredUpload &u = g_deferred[idx];
+    if (superseded(u)) {
+        drop_deferred(idx);
+        return;
+    }
+    u.active = false;
+    g_def_range[idx] = 0u;
+    g_def_active[idx >> 5] &= ~(1u << (idx & 31u));
+    --g_deferred_count;'''),
+        ('''    int order[kMaxDeferred];
+    int n = 0;
+    for (int i = 0; i < g_deferred_hi; ++i) {
+        const std::uint32_t r = g_def_range[i];
+        if (r && (r & 0xFFFFu) < clamped_end && (r >> 16) > first_block) order[n++] = i;
+    }
+    if (!n) return;
+    if (n > 1) std::sort(order, order + n, [](int a, int b) { return g_deferred[a].seq < g_deferred[b].seq; });
+    for (int i = 0; i < n; ++i) materialize_deferred(order[i]);
+    rebuild_deferred_mask();
+}
+
+void flush_deferred_range(std::uint32_t first, std::uint32_t count) {
+    if (!count) return;
+    const std::uint32_t end = std::min<std::uint32_t>(first + count, 512u);
+    flush_deferred_blocks(first * 32u, end * 32u);
+}
+
+void clear_all_deferred() {
+    for (int i = 0; i < g_deferred_hi; ++i) {
+        g_deferred[i].active = false;
+        g_def_range[i] = 0u;
+    }
+    std::memset(g_deferred_mask, 0, sizeof g_deferred_mask);''',
+         '''    int order[kMaxDeferred];
+    int n = 0;
+    const int w_end = (g_deferred_hi + 31) >> 5;
+    for (int w = 0; w < w_end; ++w) {
+        for (std::uint32_t m = g_def_active[w]; m; m &= m - 1u) {
+            const int i = (w << 5) | __builtin_ctz(m);
+            const std::uint32_t r = g_def_range[i];
+            if ((r & 0xFFFFu) < clamped_end && (r >> 16) > first_block) order[n++] = i;
+        }
+    }
+    if (!n) return;
+    if (n > 1) std::sort(order, order + n, [](int a, int b) { return g_deferred[a].seq < g_deferred[b].seq; });
+    for (int i = 0; i < n; ++i) materialize_deferred(order[i]);
+    rebuild_deferred_mask();
+}
+
+void flush_deferred_range(std::uint32_t first, std::uint32_t count) {
+    if (!count) return;
+    const std::uint32_t end = std::min<std::uint32_t>(first + count, 512u);
+    flush_deferred_blocks(first * 32u, end * 32u);
+}
+
+void clear_all_deferred() {
+    const int w_end = (g_deferred_hi + 31) >> 5;
+    for (int w = 0; w < w_end; ++w) {
+        for (std::uint32_t m = g_def_active[w]; m; m &= m - 1u) {
+            const int i = (w << 5) | __builtin_ctz(m);
+            g_deferred[i].active = false;
+            g_def_range[i] = 0u;
+        }
+        g_def_active[w] = 0u;
+    }
+    std::memset(g_deferred_mask, 0, sizeof g_deferred_mask);'''),
+        ('''    if (any_deferred_in(first_page, page_count)) {
+        bool dropped = false;
+        for (int i = 0; i < g_deferred_hi; ++i) {
+            const std::uint32_t r = g_def_range[i];
+            if (!r || (r & 0xFFFFu) >= end_block || (r >> 16) <= first_block) continue;
+            DeferredUpload &u = g_deferred[i];
+            const bool covered = (full_pages && first_block <= u.first_block && end_block >= u.end_block) ||
+                                 (u.bitbltbuf == buf && u.trxpos == pos && u.trxreg == reg) ||
+                                 (u.first_block == first_block && u.end_block == end_block && u.psm == psm && u.dsax == dsax && u.dsay == dsay && u.rrw == rrw && u.rrh == rrh);
+            if (covered || superseded(u)) {
+                drop_deferred(i);
+                dropped = true;
+            }
+        }
+        if (dropped) rebuild_deferred_mask();
+    }
+    if (g_deferred_count >= kMaxDeferred) {   // a full table first loses what newer uploads wrote over
+        bool dropped = false;
+        for (int i = 0; i < g_deferred_hi; ++i)
+            if (g_def_range[i] && superseded(g_deferred[i])) {
+                drop_deferred(i);
+                dropped = true;
+            }
+        if (dropped) rebuild_deferred_mask();
+    }
+    if (g_deferred_count >= kMaxDeferred) {
+        int oldest = -1;
+        for (int i = 0; i < g_deferred_hi; ++i)
+            if (g_def_range[i] && (oldest < 0 || g_deferred[i].seq < g_deferred[oldest].seq)) oldest = i;
+        if (oldest >= 0) {
+            materialize_deferred(oldest);
+            rebuild_deferred_mask();
+        }
+    }''',
+         '''    if (any_deferred_in(first_page, page_count)) {
+        bool dropped = false;
+        const int w_end = (g_deferred_hi + 31) >> 5;
+        for (int w = 0; w < w_end; ++w) {
+            for (std::uint32_t m = g_def_active[w]; m; m &= m - 1u) {
+                const int i = (w << 5) | __builtin_ctz(m);
+                const std::uint32_t r = g_def_range[i];
+                if ((r & 0xFFFFu) >= end_block || (r >> 16) <= first_block) continue;
+                DeferredUpload &u = g_deferred[i];
+                const bool covered = (full_pages && first_block <= u.first_block && end_block >= u.end_block) ||
+                                     (u.bitbltbuf == buf && u.trxpos == pos && u.trxreg == reg) ||
+                                     (u.first_block == first_block && u.end_block == end_block && u.psm == psm && u.dsax == dsax && u.dsay == dsay && u.rrw == rrw && u.rrh == rrh);
+                if (covered || superseded(u)) {
+                    drop_deferred(i);
+                    dropped = true;
+                }
+            }
+        }
+        if (dropped) rebuild_deferred_mask();
+    }
+    if (g_deferred_count >= kMaxDeferred) {   // a full table first loses what newer uploads wrote over
+        bool dropped = false;
+        const int w_end = (g_deferred_hi + 31) >> 5;
+        for (int w = 0; w < w_end; ++w) {
+            for (std::uint32_t m = g_def_active[w]; m; m &= m - 1u) {
+                const int i = (w << 5) | __builtin_ctz(m);
+                if (superseded(g_deferred[i])) {
+                    drop_deferred(i);
+                    dropped = true;
+                }
+            }
+        }
+        if (dropped) rebuild_deferred_mask();
+    }
+    if (g_deferred_count >= kMaxDeferred) {
+        int oldest = -1;
+        const int w_end = (g_deferred_hi + 31) >> 5;
+        for (int w = 0; w < w_end; ++w) {
+            for (std::uint32_t m = g_def_active[w]; m; m &= m - 1u) {
+                const int i = (w << 5) | __builtin_ctz(m);
+                if (oldest < 0 || g_deferred[i].seq < g_deferred[oldest].seq) oldest = i;
+            }
+        }
+        if (oldest >= 0) {
+            materialize_deferred(oldest);
+            rebuild_deferred_mask();
+        }
+    }'''),
+        ('''    for (int i = 0; i < kMaxDeferred; ++i) {
+        if (!g_def_range[i]) {
+            const std::uint64_t seq = new_seq;
+            g_deferred[i] = DeferredUpload{true, full_pages, static_cast<std::uint16_t>(first_block), static_cast<std::uint16_t>(end_block),
+                                           static_cast<std::uint16_t>(dsax), static_cast<std::uint16_t>(dsay),
+                                           static_cast<std::uint16_t>(rrw), static_cast<std::uint16_t>(rrh),
+                                           psm, first_page, page_count, g_deferred_vblank, seq, buf, pos, reg, data, bytes};
+            g_def_range[i] = first_block | (end_block << 16);
+            if (i + 1 > g_deferred_hi) g_deferred_hi = i + 1;''',
+         '''    for (int w = 0; w < kDefMaskWords; ++w) {
+        const std::uint32_t free_m = ~g_def_active[w];
+        if (!free_m) continue;
+        const int i = (w << 5) | __builtin_ctz(free_m);
+        const std::uint64_t seq = new_seq;
+        g_deferred[i] = DeferredUpload{true, full_pages, static_cast<std::uint16_t>(first_block), static_cast<std::uint16_t>(end_block),
+                                       static_cast<std::uint16_t>(dsax), static_cast<std::uint16_t>(dsay),
+                                       static_cast<std::uint16_t>(rrw), static_cast<std::uint16_t>(rrh),
+                                       psm, first_page, page_count, g_deferred_vblank, seq, buf, pos, reg, data, bytes};
+        g_def_range[i] = first_block | (end_block << 16);
+        g_def_active[w] |= 1u << (i & 31);
+        if (i + 1 > g_deferred_hi) g_deferred_hi = i + 1;'''),
+        ('''            g_transfer.active = false;
+            return true;
+        }
+    }
+    return false;''',
+         '''        g_transfer.active = false;
+        return true;
+    }
+    return false;'''),
+        ('''                std::uint64_t best_seq = 0;
+                for (int i = 0; i < g_deferred_hi; ++i) {
+                    const std::uint32_t r = g_def_range[i];
+                    if (r && (r & 0xFFFFu) < q_end && (r >> 16) > cbp && g_deferred[i].seq > best_seq) {
+                        best = i;
+                        best_seq = g_deferred[i].seq;
+                    }
+                }''',
+         '''                std::uint64_t best_seq = 0;
+                const int w_end = (g_deferred_hi + 31) >> 5;
+                for (int w = 0; w < w_end; ++w) {
+                    for (std::uint32_t m = g_def_active[w]; m; m &= m - 1u) {
+                        const int i = (w << 5) | __builtin_ctz(m);
+                        const std::uint32_t r = g_def_range[i];
+                        if ((r & 0xFFFFu) < q_end && (r >> 16) > cbp && g_deferred[i].seq > best_seq) {
+                            best = i;
+                            best_seq = g_deferred[i].seq;
+                        }
+                    }
+                }'''),
+    ],
+}
+
+# Wave 6B Core 0/2 DMA+VIF L1 I-cache compaction & DMAC hot-path speedups:
+# - dmac.cpp: O(1) LUT channel decode in read()/write() + noinline start() (write: 2,288 -> 464 B),
+#   noinline run_chain_ch1() (6,212 -> 1,696 B), non-MFIFO spr_to_ram() fast path skipping redundant
+#   gs::queue::rewritten() on already-marked g_spr_pages, single-memcpy ch9 toSPR fast path.
+# - vif.cpp: split cold unpack_slow() out of unpack() + noinline execute/run/run_unchanging/run_skipped/
+#   memo_hash/memo_rewritten (transfer_record_slice: 9,524 -> 3,496 B, transfer: 8,964 -> 2,536 B,
+#   unpack: 8,412 -> 1,876 B; vif.o -6.6 KB .text).
+VIF_DMAC_ICACHE_EDITS = {
+    'runtime/src/dmac.cpp': [
+        ('''    if (ch == 9 && bytes <= room) {
+        std::uint32_t sadr = g_ch[9].sadr & (kScratchpadSize - 1);
+        std::uint32_t left = qwc;''',
+         '''    if (ch == 9 && bytes <= room) {
+        std::uint32_t sadr = g_ch[9].sadr & (kScratchpadSize - 1);
+        if (sadr + bytes <= kScratchpadSize) {
+            std::memcpy(g_spr + sadr, data, bytes);
+            g_ch[9].sadr = (sadr + static_cast<std::uint32_t>(bytes)) & (kScratchpadSize - 1);
+            return;
+        }
+        std::uint32_t left = qwc;'''),
+        ('''inline bool spr_page_hit(std::uint32_t off, std::uint32_t bytes) {
+    const std::uint32_t first = off >> 12;
+    const std::uint32_t last = (off + bytes - 1u) >> 12;
+    return ((g_spr_pages[first >> 5] >> (first & 31u)) & 1u) != 0u ||
+           ((g_spr_pages[last >> 5] >> (last & 31u)) & 1u) != 0u;
+}''',
+         '''inline bool spr_page_hit(std::uint32_t off, std::uint32_t bytes) {
+    const std::uint32_t first = off >> 12;
+    const std::uint32_t last = (off + bytes - 1u) >> 12;
+    return ((g_spr_pages[first >> 5] >> (first & 31u)) & 1u) != 0u ||
+           ((g_spr_pages[last >> 5] >> (last & 31u)) & 1u) != 0u;
+}
+inline bool spr_pages_all_set(std::uint32_t off, std::uint32_t bytes) {
+    const std::uint32_t first = off >> 12;
+    const std::uint32_t last = (off + bytes - 1u) >> 12;
+    if (!((g_spr_pages[first >> 5] >> (first & 31u)) & 1u)) return false;
+    if (first == last) return true;
+    for (std::uint32_t p = first + 1u; p <= last; ++p)
+        if (!((g_spr_pages[p >> 5] >> (p & 31u)) & 1u)) return false;
+    return true;
+}'''),
+        ('''    const bool wrap = mfifo_vif1();
+    std::uint32_t madr = c.madr, sadr = c.sadr;''',
+         '''    const bool wrap = mfifo_vif1();
+    std::uint32_t madr = c.madr, sadr = c.sadr;
+#ifdef PS2_PICA
+    if (!wrap && qwc && !(madr & 0x80000000u)) {
+        const std::uint32_t from = sadr & (kScratchpadSize - 1);
+        const std::uint32_t off = madr & (kRamSize - 16u);
+        const std::uint32_t bytes = qwc * 16u;
+        if (from + bytes <= kScratchpadSize && off + bytes <= kRamSize) {
+            std::memcpy(g_ram + off, g_spr + from, bytes);
+            if (!spr_pages_all_set(off, bytes)) [[unlikely]] {
+                gs::queue::rewritten(g_ram + off, bytes);
+                mark_spr_pages(off, bytes);
+            }
+            c.sadr = (c.sadr + bytes) & (kScratchpadSize - 1);
+            return;
+        }
+    }
+#endif'''),
+        ('''#ifdef PS2_PICA
+        if (!wrap && !(at & 0x80000000u)) {
+            gs::queue::rewritten(target(at), n * 16);   // ps2run_3ds_patch.py: the game builds its packets this way
+            mark_spr_pages(at & (kRamSize - 16u), n * 16u);
+        }
+#endif''',
+         '''#ifdef PS2_PICA
+        if (!wrap && !(at & 0x80000000u)) {
+            const std::uint32_t off = at & (kRamSize - 16u);
+            const std::uint32_t bytes = n * 16u;
+            if (!spr_pages_all_set(off, bytes)) [[unlikely]] {
+                gs::queue::rewritten(g_ram + off, bytes);   // ps2run_3ds_patch.py: the game builds its packets this way
+                mark_spr_pages(off, bytes);
+            }
+        }
+#endif'''),
+        ('''void run_chain(int ch) {''',
+         '''#ifdef PS2_PICA
+[[gnu::noinline]] void run_chain_ch1(Channel &c, bool tie) {
+    bool memo_at = false;
+    for (int guard = 0; guard < 1'000'000; ++guard) {
+        const std::uint8_t *tagp = source(c.tadr);
+        std::uint64_t tag;
+        std::memcpy(&tag, tagp, 8);
+        c.chcr = (c.chcr & 0xFFFFu) | (static_cast<std::uint32_t>(tag >> 16) << 16);
+        const std::uint32_t qwc = static_cast<std::uint32_t>(tag) & 0xFFFFu;
+        const std::uint32_t id = static_cast<std::uint32_t>(tag >> 28) & 7u;
+        const bool irq = (tag >> 31) & 1u;
+        const std::uint32_t addr = static_cast<std::uint32_t>(tag >> 32) & 0x7FFFFFF0u;
+        const std::uint32_t addr_full = addr | (static_cast<std::uint32_t>(tag >> 63) << 31);
+        std::uint32_t tte_words[2];
+        std::memcpy(tte_words, tagp + 8, 8);
+        if (!qwc) vif::transfer_tte(1, tte_words);
+        bool end = false;
+        const bool memo_call = id == 5 && !qwc && !(irq && tie) && !(c.chcr & 0x30u);
+        if (memo_at) {
+            const bool ok = !(irq && tie) && (id == 1 || id == 2 || id == 3 || id == 4 || id == 6) && !((c.tadr | (id == 3 || id == 4 ? addr_full : 0u)) & 0x80000000u);
+            if (!ok) {
+                vif::memo_abort();
+                memo_at = false;
+            } else {
+                const bool here = id != 3 && id != 4;
+                vif::memo_block(c.tadr & (kRamSize - 16u), here ? 16u + qwc * 16u : 16u);
+                if (!here && qwc) vif::memo_block(addr_full & (kRamSize - 16u), qwc * 16u);
+            }
+        }
+        std::uint32_t data = c.tadr + 16;
+        switch (id) {
+        case 0: data = addr_full; c.tadr += 16; end = true; break;
+        case 1: c.tadr = data + qwc * 16; break;
+        case 2: c.tadr = addr_full; break;
+        case 3: case 4: data = addr_full; c.tadr += 16; break;
+        case 5: {
+            const std::uint32_t asp = (c.chcr >> 4) & 3u;
+            if (asp < 2) c.asr[asp] = data + qwc * 16;
+            c.chcr = (c.chcr & ~0x30u) | (std::min<std::uint32_t>(asp + 1, 2u) << 4);
+            c.tadr = addr_full;
+            break;
+        }
+        case 6: {
+            const std::uint32_t asp = (c.chcr >> 4) & 3u;
+            if (asp > 0) {
+                c.tadr = c.asr[asp - 1];
+                c.chcr = (c.chcr & ~0x30u) | ((asp - 1) << 4);
+            } else {
+                end = true;
+            }
+            break;
+        }
+        default: end = true; break;
+        }
+        c.madr = data;
+        if (memo_call) {
+            vif::MemoEnd left;
+            if (vif::memo_play(c.tadr, left)) {
+                c.tadr = c.asr[0];
+                c.chcr = (c.chcr & 0xFFCFu) | left.chcr_tag;
+                c.madr = left.madr;
+                if (end || (tie && irq)) break;
+                continue;
+            }
+            memo_at = vif::memo_begin(c.tadr);
+        }
+        if (qwc) {
+            const bool in_spr = (data & 0x80000000u) != 0u;
+            const std::uint32_t off = in_spr ? (data & (kScratchpadSize - 1)) : (data & (kRamSize - 16u));
+            const std::size_t bytes = static_cast<std::size_t>(qwc) * 16u;
+            const std::size_t room = in_spr ? (kScratchpadSize - off) : (kRamSize - off);
+            if (bytes <= room) {
+                const std::uint8_t *src = in_spr ? g_spr + off : g_ram + off;
+                const bool may_unchanging = !in_spr && !spr_page_hit(off, static_cast<std::uint32_t>(bytes));
+                vif::transfer_tte_data(1, tte_words, src, qwc, may_unchanging);
+            } else {
+                vif::transfer_tte(1, tte_words);
+                deliver(1, data, qwc);
+            }
+        }
+        c.madr = data + qwc * 16;
+        if (memo_at && id == 6) {
+            vif::memo_end(vif::MemoEnd{c.chcr & 0xFFFF0000u, c.madr});
+            memo_at = false;
+        }
+        if (vif::stalled(1)) [[unlikely]] {
+            if (memo_at) vif::memo_abort();
+            pause(1, end || (tie && irq));
+            return;
+        }
+        if (end || (tie && irq)) break;
+    }
+    if (memo_at) vif::memo_abort();
+    c.qwc = 0;
+    finish(1);
+}
+#endif
+
+void run_chain(int ch) {'''),
+        ('''#ifdef PS2_PICA
+    static const bool trace_tags1 = std::getenv("PS2_TRACE_DMA1") != nullptr;
+    if (ch == 1 && tte && !mfifo && !trace_tags1) {
+        bool memo_at = false;
+        for (int guard = 0; guard < 1'000'000; ++guard) {
+            const std::uint8_t *tagp = source(c.tadr);
+            std::uint64_t tag;
+            std::memcpy(&tag, tagp, 8);
+            c.chcr = (c.chcr & 0xFFFFu) | (static_cast<std::uint32_t>(tag >> 16) << 16);
+            const std::uint32_t qwc = static_cast<std::uint32_t>(tag) & 0xFFFFu;
+            const std::uint32_t id = static_cast<std::uint32_t>(tag >> 28) & 7u;
+            const bool irq = (tag >> 31) & 1u;
+            const std::uint32_t addr = static_cast<std::uint32_t>(tag >> 32) & 0x7FFFFFF0u;
+            const std::uint32_t addr_full = addr | (static_cast<std::uint32_t>(tag >> 63) << 31);
+            std::uint32_t tte_words[2];
+            std::memcpy(tte_words, tagp + 8, 8);
+            if (!qwc) vif::transfer_tte(1, tte_words);
+            bool end = false;
+            const bool memo_call = id == 5 && !qwc && !(irq && tie) && !(c.chcr & 0x30u);
+            if (memo_at) {
+                const bool ok = !(irq && tie) && (id == 1 || id == 2 || id == 3 || id == 4 || id == 6) && !((c.tadr | (id == 3 || id == 4 ? addr_full : 0u)) & 0x80000000u);
+                if (!ok) {
+                    vif::memo_abort();
+                    memo_at = false;
+                } else {
+                    const bool here = id != 3 && id != 4;
+                    vif::memo_block(c.tadr & (kRamSize - 16u), here ? 16u + qwc * 16u : 16u);
+                    if (!here && qwc) vif::memo_block(addr_full & (kRamSize - 16u), qwc * 16u);
+                }
+            }
+            std::uint32_t data = c.tadr + 16;
+            switch (id) {
+            case 0: data = addr_full; c.tadr += 16; end = true; break;
+            case 1: c.tadr = data + qwc * 16; break;
+            case 2: c.tadr = addr_full; break;
+            case 3: case 4: data = addr_full; c.tadr += 16; break;
+            case 5: {
+                const std::uint32_t asp = (c.chcr >> 4) & 3u;
+                if (asp < 2) c.asr[asp] = data + qwc * 16;
+                c.chcr = (c.chcr & ~0x30u) | (std::min<std::uint32_t>(asp + 1, 2u) << 4);
+                c.tadr = addr_full;
+                break;
+            }
+            case 6: {
+                const std::uint32_t asp = (c.chcr >> 4) & 3u;
+                if (asp > 0) {
+                    c.tadr = c.asr[asp - 1];
+                    c.chcr = (c.chcr & ~0x30u) | ((asp - 1) << 4);
+                } else {
+                    end = true;
+                }
+                break;
+            }
+            default: end = true; break;
+            }
+            c.madr = data;
+            if (memo_call) {
+                vif::MemoEnd left;
+                if (vif::memo_play(c.tadr, left)) {
+                    c.tadr = c.asr[0];
+                    c.chcr = (c.chcr & 0xFFCFu) | left.chcr_tag;
+                    c.madr = left.madr;
+                    if (end || (tie && irq)) break;
+                    continue;
+                }
+                memo_at = vif::memo_begin(c.tadr);
+            }
+            if (qwc) {
+                const bool in_spr = (data & 0x80000000u) != 0u;
+                const std::uint32_t off = in_spr ? (data & (kScratchpadSize - 1)) : (data & (kRamSize - 16u));
+                const std::size_t bytes = static_cast<std::size_t>(qwc) * 16u;
+                const std::size_t room = in_spr ? (kScratchpadSize - off) : (kRamSize - off);
+                if (bytes <= room) {
+                    const std::uint8_t *src = in_spr ? g_spr + off : g_ram + off;
+                    const bool may_unchanging = !in_spr && !spr_page_hit(off, static_cast<std::uint32_t>(bytes));
+                    vif::transfer_tte_data(1, tte_words, src, qwc, may_unchanging);
+                } else {
+                    vif::transfer_tte(1, tte_words);
+                    deliver(1, data, qwc);
+                }
+            }
+            c.madr = data + qwc * 16;
+            if (memo_at && id == 6) {
+                vif::memo_end(vif::MemoEnd{c.chcr & 0xFFFF0000u, c.madr});
+                memo_at = false;
+            }
+            if (vif::stalled(1)) {
+                if (memo_at) vif::memo_abort();
+                pause(1, end || (tie && irq));
+                return;
+            }
+            if (end || (tie && irq)) break;
+        }
+        if (memo_at) vif::memo_abort();
+        c.qwc = 0;
+        finish(1);
+        return;
+    }''',
+         '''#ifdef PS2_PICA
+    static const bool trace_tags1 = std::getenv("PS2_TRACE_DMA1") != nullptr;
+    if (ch == 1 && tte && !mfifo && !trace_tags1) {
+        run_chain_ch1(c, tie);
+        return;
+    }'''),
+        ('''void start(int ch) {''',
+         '''[[gnu::noinline]] void start(int ch) {'''),
+        ('''std::uint32_t read(std::uint32_t a) {
+    switch (a) {
+    case 0x1000E000u: return g_ctrl;
+    case 0x1000E020u: return g_pcr;
+    case 0x1000E030u: return g_sqwc;
+    case 0x1000E040u: return g_rbsr;
+    case 0x1000E050u: return g_rbor;
+    case 0x1000E060u: return g_stadr;
+    default: break;
+    }
+    for (int ch = 0; ch < 10; ++ch) {
+        if (a < kBase[ch] || a >= kBase[ch] + 0x100u) continue;
+        const Channel &c = g_ch[ch];
+        static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
+        if (trace && ch == 4)
+            std::fprintf(stderr, "[dma] ch4 read 0x%02X chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X\\n", a - kBase[ch], c.chcr, c.madr, c.qwc, c.tadr);
+        switch (a - kBase[ch]) {
+        case 0x00: return c.chcr;
+        case 0x10: return c.madr;
+        case 0x20: return c.qwc;
+        case 0x30: return c.tadr;
+        case 0x40: return c.asr[0];
+        case 0x50: return c.asr[1];
+        case 0x80: return c.sadr;
+        default: return 0;
+        }
+    }
+    return 0;
+}''',
+         '''inline int addr_to_ch(std::uint32_t a) {
+    if (a < 0x10008000u || a >= 0x1000D800u || (a & 0x300u)) return -1;
+    static constexpr std::int8_t kSlotToCh[22] = {0, -1, -1, -1, 1, -1, -1, -1, 2, -1, -1, -1, 3, 4, -1, -1, 5, 6, 7, -1, 8, 9};
+    return kSlotToCh[(a - 0x10008000u) >> 10];
+}
+
+std::uint32_t read(std::uint32_t a) {
+    switch (a) {
+    case 0x1000E000u: return g_ctrl;
+    case 0x1000E020u: return g_pcr;
+    case 0x1000E030u: return g_sqwc;
+    case 0x1000E040u: return g_rbsr;
+    case 0x1000E050u: return g_rbor;
+    case 0x1000E060u: return g_stadr;
+    default: break;
+    }
+    const int ch = addr_to_ch(a);
+    if (ch < 0) return 0;
+    const Channel &c = g_ch[ch];
+    static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
+    if (trace && ch == 4)
+        std::fprintf(stderr, "[dma] ch4 read 0x%02X chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X\\n", a & 0xFFu, c.chcr, c.madr, c.qwc, c.tadr);
+    switch (a & 0xFFu) {
+    case 0x00: return c.chcr;
+    case 0x10: return c.madr;
+    case 0x20: return c.qwc;
+    case 0x30: return c.tadr;
+    case 0x40: return c.asr[0];
+    case 0x50: return c.asr[1];
+    case 0x80: return c.sadr;
+    default: return 0;
+    }
+}'''),
+        ('''    for (int ch = 0; ch < 10; ++ch) {
+        if (a < kBase[ch] || a >= kBase[ch] + 0x100u) continue;
+        Channel &c = g_ch[ch];
+        switch (a - kBase[ch]) {
+        case 0x00: {
+            const bool was = c.chcr & 0x100u;
+            c.chcr = v;
+            if (!(v & 0x100u)) {
+                c.paused = false;
+                if (ch == 1) g_mfifo_waiting = false;
+            }
+            if (!was && (v & 0x100u)) start(ch);
+            break;
+        }
+        case 0x10: c.madr = v; break;
+        case 0x20: c.qwc = v & 0xFFFFu; break;
+        case 0x30: c.tadr = v; break;
+        case 0x40: c.asr[0] = v; break;
+        case 0x50: c.asr[1] = v; break;
+        case 0x80: c.sadr = v & (kScratchpadSize - 16); break;
+        default: break;
+        }
+        return;
+    }''',
+         '''    const int ch = addr_to_ch(a);
+    if (ch < 0) return;
+    Channel &c = g_ch[ch];
+    switch (a & 0xFFu) {
+    case 0x00: {
+        const bool was = c.chcr & 0x100u;
+        c.chcr = v;
+        if (!(v & 0x100u)) {
+            c.paused = false;
+            if (ch == 1) g_mfifo_waiting = false;
+        }
+        if (!was && (v & 0x100u)) start(ch);
+        break;
+    }
+    case 0x10: c.madr = v; break;
+    case 0x20: c.qwc = v & 0xFFFFu; break;
+    case 0x30: c.tadr = v; break;
+    case 0x40: c.asr[0] = v; break;
+    case 0x50: c.asr[1] = v; break;
+    case 0x80: c.sadr = v & (kScratchpadSize - 16); break;
+    default: break;
+    }'''),
+    ],
+    'runtime/src/vif.cpp': [
+        ('''    {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
+};''',
+         '''    {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
+};
+
+[[gnu::noinline]] void unpack_slow(int unit, Unit &u, bool dry, std::uint32_t cmd, const std::uint32_t *data,
+                                   std::uint32_t vn, std::uint32_t vl, bool masked, bool usn, std::uint32_t num,
+                                   std::uint32_t cl, std::uint32_t wl);'''),
+        ('''        u.num = 0;
+        return;
+    }
+    std::uint32_t addr = cmd & 0x3FFu;
+    if (unit == 1 && ((cmd >> 15) & 1u)) addr += u.tops;
+    const std::uint32_t components = vn + 1;
+    const std::uint32_t bits = element_bits(vl);''',
+         '''        u.num = 0;
+        return;
+    }
+    unpack_slow(unit, u, dry, cmd, data, vn, vl, masked, usn, num, cl, wl);
+}
+
+[[gnu::noinline]] void unpack_slow(int unit, Unit &u, bool dry, std::uint32_t cmd, const std::uint32_t *data,
+                                   std::uint32_t vn, std::uint32_t vl, bool masked, bool usn, std::uint32_t num,
+                                   std::uint32_t cl, std::uint32_t wl) {
+    std::uint32_t addr = cmd & 0x3FFu;
+    if (unit == 1 && ((cmd >> 15) & 1u)) addr += u.tops;
+    const std::uint32_t components = vn + 1;
+    const std::uint32_t bits = element_bits(vl);'''),
+        ('''template <bool FromVu, bool IsShadow, bool Record = true>
+void execute(int unit, Unit &u, std::uint32_t cmd, const std::uint32_t *data) {''',
+         '''template <bool FromVu, bool IsShadow, bool Record = true>
+[[gnu::noinline]] void execute(int unit, Unit &u, std::uint32_t cmd, const std::uint32_t *data) {'''),
+        ('''template <bool FromVu, bool IsShadow>
+std::size_t run(int unit, Unit &u, const std::uint32_t *words, std::size_t count) {''',
+         '''template <bool FromVu, bool IsShadow>
+[[gnu::noinline]] std::size_t run(int unit, Unit &u, const std::uint32_t *words, std::size_t count) {'''),
+        ('''bool run_unchanging(int unit, Unit &u, const std::uint8_t *data, std::uint32_t qwc) {''',
+         '''[[gnu::noinline]] bool run_unchanging(int unit, Unit &u, const std::uint8_t *data, std::uint32_t qwc) {'''),
+        ('''template <bool Capture>
+std::size_t run_skipped(int unit, Unit &u, const std::uint32_t *words, std::size_t count) {''',
+         '''template <bool Capture>
+[[gnu::noinline]] std::size_t run_skipped(int unit, Unit &u, const std::uint32_t *words, std::size_t count) {'''),
+        ('''std::uint32_t memo_hash(const MemoBlock *b, std::uint32_t n) {''',
+         '''[[gnu::noinline]] std::uint32_t memo_hash(const MemoBlock *b, std::uint32_t n) {'''),
+        ('''bool memo_rewritten(const MemoBlock *b, std::uint32_t n) {''',
+         '''[[gnu::noinline]] bool memo_rewritten(const MemoBlock *b, std::uint32_t n) {'''),
+    ],
+}
+
 def fail(msg):
     print("PATCH NOT APPLIED:", msg)
     raise SystemExit(1)
@@ -9338,7 +11815,7 @@ originals = {}
 texts = {}
 pending = 0
 
-for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items(), *IOPAHEAD_EDITS.items(), *STALE_EDITS.items(), *MOVIE_EDITS.items(), *SPLIT_SKIP_EDITS.items(), *SAMPLE_EDITS.items(), *G3_EDITS.items(), *RT_OPT_EDITS.items(), *UPLOAD_EDITS.items(), *UNCHANGING_WAYS_EDITS.items()):
+for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(), *STACK_EDITS.items(), *NARROW_EDITS.items(), *LOOP_EDITS.items(), *SP_EDITS.items(), *HOT_EDITS.items(), *VIFADDR_EDITS.items(), *VIFREC_EDITS.items(), *IOPAHEAD_EDITS.items(), *STALE_EDITS.items(), *MOVIE_EDITS.items(), *SPLIT_SKIP_EDITS.items(), *SAMPLE_EDITS.items(), *G3_EDITS.items(), *RT_OPT_EDITS.items(), *UPLOAD_EDITS.items(), *UNCHANGING_WAYS_EDITS.items(), *FPU_FINITE_EDITS.items(), *UNCHANGING_SAMPLE_EDITS.items(), *CHAIN_MEMO_EDITS.items(), *UPLOAD_FAST_EDITS.items(), *VIF_CORE0_EDITS.items(), *VIF_CORE2_GS_EDITS.items(), *VIF_DMAC_ICACHE_EDITS.items()):
     rel = key.split('#')[0]   # the part after # only keeps two lists for one file apart
     if rel in texts:
         t = texts[rel]
@@ -9349,7 +11826,7 @@ for key, edits in (*EDITS.items(), *PERF_EDITS.items(), *SPLIT_GS_EDITS.items(),
         except OSError:
             fail("cannot read " + rel)
         # Unwind the later stages in memory so their inputs can be verified.
-        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()), *IOPAHEAD_EDITS.get(rel, ()), *STALE_EDITS.get(rel, ()), *MOVIE_EDITS.get(rel, ()), *SPLIT_SKIP_EDITS.get(rel, ()), *SAMPLE_EDITS.get(rel, ()), *G3_EDITS.get(rel, ()), *RT_OPT_EDITS.get(rel, ()), *UPLOAD_EDITS.get(rel, ()), *UNCHANGING_WAYS_EDITS.get(rel, ()))):
+        for old, new in reversed((*PERF_EDITS.get(rel, ()), *SPLIT_GS_EDITS.get(rel, ()), *STACK_EDITS.get(rel, ()), *NARROW_EDITS.get(rel, ()), *LOOP_EDITS.get(rel, ()), *SP_EDITS.get(rel, ()), *HOT_EDITS.get(rel, ()), *VIFADDR_EDITS.get(rel, ()), *VIFREC_EDITS.get(rel, ()), *IOPAHEAD_EDITS.get(rel, ()), *STALE_EDITS.get(rel, ()), *MOVIE_EDITS.get(rel, ()), *SPLIT_SKIP_EDITS.get(rel, ()), *SAMPLE_EDITS.get(rel, ()), *G3_EDITS.get(rel, ()), *RT_OPT_EDITS.get(rel, ()), *UPLOAD_EDITS.get(rel, ()), *UNCHANGING_WAYS_EDITS.get(rel, ()), *FPU_FINITE_EDITS.get(rel, ()), *UNCHANGING_SAMPLE_EDITS.get(rel, ()), *CHAIN_MEMO_EDITS.get(rel, ()), *UPLOAD_FAST_EDITS.get(rel, ()), *VIF_CORE0_EDITS.get(rel, ()), *VIF_CORE2_GS_EDITS.get(rel, ()), *VIF_DMAC_ICACHE_EDITS.get(rel, ()))):
             if t.count(new) == 1:
                 t = t.replace(new, old)
                 pending -= 1

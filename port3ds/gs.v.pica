@@ -27,10 +27,16 @@
 .fvec amb
 .fvec ldir[3]
 .fvec lcol[3]
+.fvec env[2]
 .fvec bones[72]
 .bool isg3
 .bool isskin
 .bool isortho
+.bool isdir
+.bool isfog
+.bool iseye
+.bool isnrm
+.bool isenv
 
 .constf ones(1.0, 1.0, 1.0, 1.0)
 ; Byte attributes arrive as 0 to 255, not 0 to 1.
@@ -56,10 +62,10 @@
 
 .proc main
     ifu isg3
-        ; independent work first, so a0 is never read right after mova writes it
-        mova a0.xy, g3idx.xy
-        mul r8, g3c.xxxx, g3nrm
         ifu isskin
+            ; independent work after each mova so a0 is never read right after mova writes it
+            mova a0.xy, g3idx.xy
+            mul r13, texs, g3uv
             ; the weighted bone matrices: r4, r5, r6 give x, y and z, each a dot product with (position, 1)
             mul r4, bones[a0.x], g3w.xxxx
             mul r5, bones[a0.x+1], g3w.xxxx
@@ -75,18 +81,24 @@
             mad r4, g3w.wwww, bones[a0.y], r4
             mad r5, g3w.wwww, bones[a0.y+1], r5
             mad r6, g3w.wwww, bones[a0.y+2], r6
-            ; position (w is 1) and normal through them
+            ; position (w is 1) and (when lit or env-mapped) normal through them
             dp4 r0.x, r4, g3pos
             dp4 r0.y, r5, g3pos
             dp4 r0.z, r6, g3pos
-            dp3 r9.x, r4, r8
-            dp3 r9.y, r5, r8
-            dp3 r9.z, r6, r8
+            ifu isnrm
+                mul r8, g3c.xxxx, g3nrm
+                dp3 r9.x, r4, r8
+                dp3 r9.y, r5, r8
+                dp3 r9.z, r6, r8
+            .end
         .else
             ; g3_generic: no bones
             mov r0, g3pos
-            mov r9, r8
+            mul r13, texs, g3uv
             add r10, amb, g3clr
+            ifu isnrm
+                mul r9, g3c.xxxx, g3nrm
+            .end
         .end
         ; clip space through vf28-vf31 -> r1 = (cx, cy, cz, cw)
         mov r1, proj[3]
@@ -100,10 +112,12 @@
             mul r0.xyz, scale.xyz, r3.xyz
             add r0.xyz, offset.xyz, r0.xyz
             max r0.z, -ones.zzzz, r0.zzzz
-            max r2.z, eye.zzzz, r0.zzzz
-            mul r2.x, eye.xxxx, r2.zzzz
-            add r2.x, eye.yyyy, r2.xxxx
-            add r0.x, r0.xxxx, r2.xxxx
+            ifu iseye
+                max r2.z, eye.zzzz, r0.zzzz
+                mul r2.x, eye.xxxx, r2.zzzz
+                add r2.x, eye.yyyy, r2.xxxx
+                add r0.x, r0.xxxx, r2.xxxx
+            .end
             mov r0.w, ones.wwww
         .else
             ; homogeneous clip space directly (no rcp, so PICA200 clips w <= 0 and near/far in hardware)
@@ -115,33 +129,47 @@
             mul r2.w, fogp.zzzz, r1.wwww
             add r2.w, fogp.wwww, r2.wwww
             max r0.z, r2.wwww, r0.zzzz
-            mul r2.z, eye.zzzz, r1.wwww
-            max r2.z, r2.zzzz, r0.zzzz
-            mul r2.x, eye.xxxx, r2.zzzz
-            mad r2.x, r1.wwww, eye.yyyy, r2.xxxx
-            add r0.x, r0.xxxx, r2.xxxx
+            ifu iseye
+                mul r2.z, eye.zzzz, r1.wwww
+                max r2.z, r2.zzzz, r0.zzzz
+                mul r2.x, eye.xxxx, r2.zzzz
+                mad r2.x, r1.wwww, eye.yyyy, r2.xxxx
+                add r0.x, r0.xxxx, r2.xxxx
+            .end
             mov r0.w, r1.wwww
         .end
         mov outpos, r0
         ; colour
-        dp3 r11.x, ldir[0], r9
-        dp3 r11.y, ldir[1], r9
-        dp3 r11.z, ldir[2], r9
-        max r11, g3c.zzzz, r11
-        mad r10, r11.xxxx, lcol[0], r10
-        mad r10, r11.yyyy, lcol[1], r10
-        mad r10, r11.zzzz, lcol[2], r10
+        ifu isdir
+            dp3 r11.x, ldir[0], r9
+            dp3 r11.y, ldir[1], r9
+            dp3 r11.z, ldir[2], r9
+            max r11, g3c.zzzz, r11
+            mad r10, r11.xxxx, lcol[0], r10
+            mad r10, r11.yyyy, lcol[1], r10
+            mad r10, r11.zzzz, lcol[2], r10
+        .end
         min r10, g3c.yyyy, r10
         mul outclr, mat, r10
         ; texture coordinates and fog
-        mul r13, texs, g3uv
+        ifu isenv
+            dp3 r13.x, env[0], r9
+            dp3 r13.y, env[1], r9
+            add r13.x, env[0].wwww, r13.xxxx
+            add r13.y, env[1].wwww, r13.yyyy
+            mul r13, texs, r13
+        .end
         add r13.y, texs.zzzz, r13.yyyy
         mov outtc0, r13
-        mul r12, fogp.xxxx, r1.wwww
-        add r12, fogp.yyyy, r12
-        max r12, g3c.zzzz, r12
-        min r12, g3c.wwww, r12
-        mul outtc1, g3c.wzzz, r12
+        ifu isfog
+            mul r12, fogp.xxxx, r1.wwww
+            add r12, fogp.yyyy, r12
+            max r12, g3c.zzzz, r12
+            min r12, g3c.wwww, r12
+            mul outtc1, g3c.wzzz, r12
+        .else
+            mov outtc1, g3c.zzzz
+        .end
     .else
         mov r3, inpos
         mul outclr, bytes_to_unit, inclr
@@ -151,10 +179,12 @@
         max r3.z, -ones.zzzz, r3.zzzz
         mul r0.xyz, scale.xyz, r3.xyz
         add r0.xyz, offset.xyz, r0.xyz
-        max r2, eye.zzzz, r0.zzzz
-        mul r2, eye.xxxx, r2
-        add r2, eye.yyyy, r2
-        add r0.x, r0.xxxx, r2.xxxx
+        ifu iseye
+            max r2, eye.zzzz, r0.zzzz
+            mul r2, eye.xxxx, r2
+            add r2, eye.yyyy, r2
+            add r0.x, r0.xxxx, r2.xxxx
+        .end
         mov r0.w, r3.w
         mul r1, ones, r3.wwww
         mul outpos.xyz, r1.xyz, r0.xyz

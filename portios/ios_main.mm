@@ -1226,22 +1226,38 @@ enum class SyncSettingsResult { saved, off, cancelled };
     static int shown = 0;
     const CFTimeInterval now = CACurrentMediaTime();
     if (!since) since = now;
+    // How busy the GPU was: ps2::gpu_busy_ms() adds up the GPU's own time (timestamps; a device has them, the Simulator
+    // doesn't), so its growth over a second is the share of that second the GPU spent drawing. Near 100% the GPU is the
+    // limit; a low share with a low frame rate points at the CPU side or pacing. The phone's thermal state is shown too
+    // when it is not normal, as a hot phone slows its GPU down.
     static CFTimeInterval speed_since = 0;
     static std::uint32_t speed_before = 0;
+    static double busy_before = 0.0;
     if (!speed_since) speed_since = now;
     if (now - speed_since >= 1.0) {   // Show speed
         const std::uint32_t presented = g_presented.load();
-        if (!_speed.hidden && g_started.load() && g_gpu_present.load() && !g_paused.load())
-            _speed.text = [NSString stringWithFormat:@"%.0f fps, %dx", (presented - speed_before) / (now - speed_since), g_scale_running];
+        const double busy = g_gpu_present.load() ? ps2::gpu_busy_ms() : 0.0;
+        if (!_speed.hidden && g_started.load() && g_gpu_present.load() && !g_paused.load()) {
+            NSMutableString *text = [NSMutableString stringWithFormat:@"%.0f fps, %dx", (presented - speed_before) / (now - speed_since), g_scale_running];
+            if (busy > 0.0) [text appendFormat:@", GPU %.0f%%", std::min(100.0, (busy - busy_before) / ((now - speed_since) * 10.0))];
+            const NSProcessInfoThermalState heat = NSProcessInfo.processInfo.thermalState;
+            if (heat != NSProcessInfoThermalStateNominal)
+                [text appendString:heat == NSProcessInfoThermalStateFair ? @", warm" : heat == NSProcessInfoThermalStateSerious ? @", hot" : @", too hot"];
+            _speed.text = text;
+        }
         speed_before = presented;
+        busy_before = busy;
         speed_since = now;
     }
     if (now - since >= 5.0) {
+        static double log_busy_before = 0.0;
         const std::uint32_t presented = g_presented.load();
+        const double busy = g_gpu_present.load() ? ps2::gpu_busy_ms() : 0.0;
         if (g_started.load() && !g_paused.load())
-            std::fprintf(stderr, "[ios] %.1f fps shown, sound queued %zu ms, GPU %.1f ms, %dx\n",
+            std::fprintf(stderr, "[ios] %.1f fps shown, sound queued %zu ms, GPU busy %.0f%%, thermal %d, %dx\n",
                          (g_gpu_present.load() ? presented - presented_before : shown) / (now - since), queued_frames() / 48,
-                         g_gpu_present.load() ? ps2::gpu_busy_ms() : 0.0, g_scale_running);
+                         (busy - log_busy_before) / ((now - since) * 10.0), static_cast<int>(NSProcessInfo.processInfo.thermalState), g_scale_running);
+        log_busy_before = busy;
         presented_before = presented;
         since = now;
         shown = 0;

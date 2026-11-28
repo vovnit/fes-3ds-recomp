@@ -9,6 +9,10 @@
 // Arena: entries take consecutive vertices from a pointer that goes round. Space is taken back from entries not drawn in
 // the current or the previous picture (the GPU may still be drawing the previous one); a live entry in the way is stepped
 // over, and after a few steps the batch is drawn the usual way.
+//
+// Around an entry's n vertices lie copies of its first vertex (one, before) and of its last (one after, two if n is odd), so
+// an even number in all. Two entries that follow each other in the arena are then one strip: the triangles between have no
+// area, and the second starts at an even place. Entries made in drawing order usually do follow each other.
 #include "g3cache.hpp"
 
 #include "ps2/memory.hpp"
@@ -29,7 +33,7 @@ namespace {
 
 using u32 = std::uint32_t;
 
-constexpr u32 kSets = 4096;        // two entries each
+constexpr u32 kSets = 2048;        // two entries each
 constexpr u32 kEntries = kSets * 2;
 
 struct Entry {
@@ -39,8 +43,7 @@ struct Entry {
     u32 sig;        // sampled words of its streams
     std::uint16_t n;
     bool used;
-    bool alpha_uniform;
-    std::uint8_t alpha_val;
+    std::uint8_t alpha_min, alpha_max;
     std::int8_t bone_count;                // skin: how many of bones[] its vertices use
     g3::BoneUse bones[g3::kMaxBoneUses];   // skin: each bone's VU address and the palette slot its vertices name
 };
@@ -60,7 +63,8 @@ Counts g_c{};
 std::uint64_t g_next_report = 0;
 
 inline bool in_ram(const std::uint8_t *p, u32 bytes) {
-    return p >= ps2::g_ram && p + bytes <= ps2::g_ram + ps2::kRamSize;
+    const std::uintptr_t off = static_cast<std::uintptr_t>(p - ps2::g_ram);
+    return off <= ps2::kRamSize && bytes <= ps2::kRamSize - off;
 }
 
 inline u32 stream_bytes(const g3::DirectStream &s, u32 n) { return n * (s.vn + 1u) * (4u >> s.vl); }
@@ -76,6 +80,8 @@ u32 sample(const g3::DirectStreams &ds, u32 n) {
     std::memcpy(&d, ds.s[1].src, 4);
     return ((((0x811C9DC5u ^ a) * 0x01000193u ^ b) * 0x01000193u ^ c) * 0x01000193u ^ d) * 0x01000193u;
 }
+
+inline u32 span_of(u32 n) { return n + 2u + (n & 1u); }   // with the copies before and after
 
 inline bool live(const Entry &e) { return e.used && e.picture + 1u >= g_picture; }
 
@@ -94,12 +100,12 @@ u32 take(u32 n, u32 owner) {
             const u32 o = g_cover[v];
             if (!o) continue;
             Entry &e = g_entries[o - 1u];
-            if (!e.used || v < e.start || v >= e.start + e.n) {   // taken by an entry since gone or moved
+            if (!e.used || v + 1u < e.start || v + 1u >= e.start + span_of(e.n)) {   // taken by an entry since gone or moved
                 g_cover[v] = 0;
                 continue;
             }
             if (live(e)) {
-                blocked_end = e.start + e.n;
+                blocked_end = e.start - 1u + span_of(e.n);
                 break;
             }
             drop(e);
@@ -157,37 +163,47 @@ int place(const g3::Input &in, const g3::BatchPlan &plan, g3::Gpu &g, int &fill_
         }
     }
     const u32 n = g.n;
-    ++g_c.batches;
-    g_c.verts += n;
+    const bool stats = g_mode == 2;
+    if (stats) {
+        ++g_c.batches;
+        g_c.verts += n;
+    }
     // Strips with all their streams in PS2 RAM (a skin batch's weights too, not left in VU memory).
-    if (plan.dual || plan.list || !plan.direct || !in.streams || n > 256u || (plan.skin && (!g_skin || !(in.streams->mask & 16u)))) {
-        g_c.no_key += n;
+    if (plan.dual || plan.list || plan.uv_xform || !plan.direct || !in.streams || n > 256u || (plan.skin && (!g_skin || !(in.streams->mask & 16u)))) {
+        if (stats) g_c.no_key += n;
         return -1;
     }
     const g3::DirectStreams &ds = *in.streams;
-    const u32 used = 7u | (plan.lights ? 8u : 0u) | (plan.skin ? 16u : 0u);
-    std::uint64_t key = 0xCBF29CE484222325ull;
-    for (int i = 0; i < 5; ++i) {
-        if (!(used & (1u << i))) continue;
-        const g3::DirectStream &s = ds.s[i];
-        if (!in_ram(s.src, stream_bytes(s, n))) {
-            g_c.no_key += n;
-            return -1;
-        }
-        key = (key ^ (static_cast<std::uint64_t>(s.src - ps2::g_ram) | (static_cast<std::uint64_t>(s.vn) << 32) |
-                      (static_cast<std::uint64_t>(s.vl) << 40) | (static_cast<std::uint64_t>(s.usn) << 48))) * 0x100000001B3ull;
+    u32 h0 = 0x811C9DC5u, h1 = 0x9E3779B9u;
+    auto hash_stream = [&](const g3::DirectStream &s, u32 bytes, u32 idx) -> bool {
+        if (!in_ram(s.src, bytes)) return false;
+        const u32 off = static_cast<u32>(s.src - ps2::g_ram);
+        const u32 fmt = static_cast<u32>(s.vn) | (static_cast<u32>(s.vl) << 8) | (static_cast<u32>(s.usn) << 16) | (idx << 24);
+        h0 = (h0 ^ off) * 0x01000193u;
+        h1 = (h1 ^ fmt) * 0x9E3779B1u ^ (off >> 13);
+        return true;
+    };
+    if (!hash_stream(ds.s[0], n * (plan.pos_w << 2), 0u) ||
+        !hash_stream(ds.s[1], n * (plan.uv_w << 2), 1u) ||
+        !hash_stream(ds.s[2], n << 2, 2u) ||
+        (plan.lights && !hash_stream(ds.s[3], n * plan.nrm_step, 3u)) ||
+        (plan.skin && !hash_stream(ds.s[4], n << 4, 4u))) {
+        if (stats) g_c.no_key += n;
+        return -1;
     }
-    key = (key ^ (static_cast<std::uint64_t>(n) | (static_cast<std::uint64_t>(plan.pos_w) << 16) | (static_cast<std::uint64_t>(plan.uv_w) << 24) |
-                  (static_cast<std::uint64_t>(plan.nrm_step) << 32) | (static_cast<std::uint64_t>(plan.lights) << 40) |
-                  (static_cast<std::uint64_t>(plan.skin) << 41) | (static_cast<std::uint64_t>(in.program) << 48))) * 0x100000001B3ull;
+    const u32 meta0 = n | (plan.pos_w << 12) | (plan.uv_w << 16) | (plan.nrm_step << 20) | (static_cast<u32>(plan.lights) << 24) | (static_cast<u32>(plan.skin) << 25);
+    const u32 meta1 = static_cast<u32>(in.program);
+    h0 = (h0 ^ meta0) * 0x01000193u;
+    h1 = (h1 ^ meta1) * 0x9E3779B1u;
+    const std::uint64_t key = (static_cast<std::uint64_t>(h1) << 32) | h0;
     const u32 sig = sample(ds, n);
 
-    const u32 set = static_cast<u32>((key ^ (key >> 23) ^ (key >> 41)) & (kSets - 1u)) * 2u;
+    const u32 set = ((h0 ^ (h0 >> 12) ^ h1 ^ (h1 >> 16)) & (kSets - 1u)) * 2u;
     Entry *way[2] = {&g_entries[set], &g_entries[set + 1u]};
     for (Entry *e : way) {
         if (!e->used || e->key != key || e->n != n) continue;
         if (e->sig != sig) {   // the data changed under the key: convert again
-            ++g_c.stale;
+            if (stats) ++g_c.stale;
             drop(*e);
             break;
         }
@@ -195,38 +211,41 @@ int place(const g3::Input &in, const g3::BatchPlan &plan, g3::Gpu &g, int &fill_
             // Its vertices name slots: the bones go back into them. If two that shared a slot now differ, this time it is
             // drawn the usual way (the entry may still be in the GPU's hands, so it stays as it is).
             if (!g3::restore_bones(in.mem, e->bones, e->bone_count, g)) {
-                g_c.bones_split += n;
+                if (stats) g_c.bones_split += n;
                 return -1;
             }
-            g_c.skin_hit += n;
+            if (stats) g_c.skin_hit += n;
         } else {
             g.slots = 0;
         }
         e->picture = g_picture;
-        g.alpha_uniform = e->alpha_uniform;
-        g.alpha_val = e->alpha_val;
-        g_c.hit += n;
+        g.alpha_min = e->alpha_min;
+        g.alpha_max = e->alpha_max;
+        if (stats) g_c.hit += n;
         return static_cast<int>(e->start);
     }
     // A new entry: the free way, else the one drawn longest ago (not a live one).
     Entry *e = !way[0]->used ? way[0] : !way[1]->used ? way[1] : way[0]->picture <= way[1]->picture ? way[0] : way[1];
     if (e->used && live(*e)) {
-        g_c.no_room += n;
+        if (stats) g_c.no_room += n;
         return -1;
     }
     const u32 index = static_cast<u32>(e - g_entries);
     if (e->used) drop(*e);
-    const u32 at = take(n, index);
-    if (at == UINT32_MAX) {
-        g_c.no_room += n;
+    const u32 span = span_of(n), room = take(span, index);
+    if (room == UINT32_MAX) {
+        if (stats) g_c.no_room += n;
         return -1;
     }
+    const u32 at = room + 1u;
     fill_rc = g3::gpu_batch_fill(in, g, plan, g_arena + at);
     if (fill_rc != 0) {
-        for (u32 v = at; v < at + n; ++v) g_cover[v] = 0;
+        for (u32 v = room; v < room + span; ++v) g_cover[v] = 0;
         return -1;
     }
-    *e = Entry{key, at, g_picture, sig, static_cast<std::uint16_t>(n), true, g.alpha_uniform, g.alpha_val, 0, {}};
+    g_arena[room] = g_arena[at];
+    for (u32 v = at + n; v < room + span; ++v) g_arena[v] = g_arena[at + n - 1u];
+    *e = Entry{key, at, g_picture, sig, static_cast<std::uint16_t>(n), true, g.alpha_min, g.alpha_max, 0, {}};
     if (plan.skin) {
         const g3::BoneUse *uses;
         const int count = g3::last_bones(uses);
@@ -236,9 +255,9 @@ int place(const g3::Input &in, const g3::BatchPlan &plan, g3::Gpu &g, int &fill_
             std::memcpy(e->bones, uses, static_cast<std::size_t>(count) * sizeof(g3::BoneUse));
         }
     }
-    if (at < g_dirty_lo) g_dirty_lo = at;
-    if (at + n > g_dirty_hi) g_dirty_hi = at + n;
-    g_c.fresh += n;
+    if (room < g_dirty_lo) g_dirty_lo = room;
+    if (room + span > g_dirty_hi) g_dirty_hi = room + span;
+    if (stats) g_c.fresh += n;
     return static_cast<int>(at);
 }
 

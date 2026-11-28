@@ -81,17 +81,25 @@ struct Gpu {
     // with (position, 1). A bone keeps its slot while batches go on using it, so the shader's copy rarely needs sending.
     float bone[kGpuBones * 3][4];
     std::uint32_t bone_gen[kGpuBones]; // generation per slot, bumped when bone[3*s..3*s+2] changes
+    std::uint32_t bone_nonfinite = 0u; // bit per slot set when any word in bone[3*s..3*s+2] is Inf/NaN
     std::uint32_t slots;             // the palette slots this batch's vertices use (bit per slot)
+    // What ambient, light_dir and light_colour were worked out from: light_words words of VU memory from 0x3D0 on (0: nothing yet)
+    // and M[0x3FC]'s x and z. Batches of one model share it.
+    unsigned light_words = 0;
+    std::uint32_t light_x, light_z, light_mem[64];
+    bool has_dir_lights = false;     // true when at least one directional light is active
     unsigned n;
-    bool alpha_uniform;              // true when every vertex in the batch shares alpha_val
-    std::uint8_t alpha_val;
+    std::uint8_t alpha_min, alpha_max;   // prelit vertex alpha range (0-255) across the batch
     GpuVertex v[512];                // a list batch is turned into a strip, up to 2n - 3 vertices (see gpu_batch)
-    std::uint64_t prim2;             // Pass 2 PRIM for dual-texture MatFX (program 43/44)
-    float uv2[256][2];               // Pass 2 transformed UVs for program 43/44
+    std::uint64_t prim2;             // Pass 2 PRIM for dual-texture / EnvMap MatFX
+    float uv2[256][2];               // Pass 2 transformed UVs for dual-texture MatFX (program 43/44)
+    bool env = false;                // Pass 2 EnvMap active: shader computes UV from normal via env_u/env_v
+    float env_u[4]{}, env_v[4]{};    // EnvMap UV projection rows: u = dot(env_u.xyz, n) + env_u.w, v = dot(env_v.xyz, n) + env_v.w
+    float env_coeff = 1.0f;          // EnvMap pass-2 RGB scale (M[965].w)
 };
 
 struct BatchPlan {
-    bool skin, dual, dual_uv1, list, direct, lights;
+    bool skin, dual, dual_uv1, dual_uv2, env, uv_xform, list, direct, lights, normals;
     std::uint32_t top, n, pos_w, uv_w, nrm_step;
 };
 
@@ -105,6 +113,10 @@ enum GpuDecline : int {
     kGpuClipDepth,         // the clipper batch has a vertex beyond its near or far plane
     kGpuDeclines
 };
+
+// Whether a clipper batch with vertices behind the camera may go to the GPU, which clips them itself. Not in stereo: the shader
+// shifts each vertex by its depth, limited near the camera, and between a far vertex and one behind the camera that is not a line.
+extern bool g_behind_on_gpu;
 
 // Two-phase GPU batch API for zero-copy direct-to-ring emission:
 // gpu_batch_setup validates the batch and fills Gpu headers (everything except v[]/slots/alpha);

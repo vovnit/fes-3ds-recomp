@@ -221,8 +221,19 @@ extern "C" void FesOverlapEnd(u8 flags) {
     FES_AT(52);
 }
 
+extern "C" void FesOverlapFlushMidFrame() {
+    FesOverlapEnd(GX_CMDLIST_FLUSH);
+    FesOverlapWait();
+    submitted_halves = 3;
+    FES_AT(38);
+    C3D_FrameBegin(0);
+    FES_AT(39);
+}
+
 // Command words still free this frame, counting the growth expand_recording can still give the recording.
 extern "C" u32 FesOverlapWordsLeft() {
+    if (recording_begin && recording_queue.numEntries >= 28) return 0;
+    if (!recording_begin && display_queue && display_queue->numEntries >= 28) return 0;
     u32 left = gpuCmdBufSize - gpuCmdBufOffset;
     if (recording_begin && recording_words != original_words) left += original_words - recording_words;
     return left;

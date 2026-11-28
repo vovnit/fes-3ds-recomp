@@ -977,7 +977,11 @@ int main() {
     if (R_FAILED(rc)) {
         std::printf("Could not get memory for the game: 0x%08lX\nPress Home to leave.\n", static_cast<unsigned long>(rc));
         std::fflush(stderr);
-        while (aptMainLoop()) gspWaitForVBlank();
+        if (g_link) remote::start();   // the program got too big: another build can still be sent
+        while (aptMainLoop() && !remote::wants_exit()) {
+            remote::poll(0);
+            gspWaitForVBlank();
+        }
     } else {
         std::memset(ps2::g_ram, 0, ps2::kRamSize);
         read_settings("sdmc:/p3fes/args.txt");
@@ -1036,18 +1040,23 @@ int main() {
                 const u64 tick = svcGetSystemTick();
                 const std::uint64_t frame = ps2::frame_count();
                 using namespace ps2::prof;
-                static std::uint64_t last_wait = 0, last_full = 0;
+                static std::uint32_t last_wait = 0, last_full = 0;   // 32-bit counters: they wrap every 16 s, their differences do not
                 static std::uint32_t last_shown = 0;
                 const std::uint32_t shown = ps2::gs::pica::pictures_shown();
-                const std::uint64_t wait = g_ticks[Wait].load(), full = g_ticks[Full].load();
+                const std::uint32_t wait = g_ticks[Wait].load(), full = g_ticks[Full].load();
                 if (last_tick) {
                     const double seconds = static_cast<double>(tick - last_tick) / static_cast<double>(SYSCLOCK_ARM11);
+                    // Out of range for a line or two when the counters restart (a state loaded).
+                    const auto share = [&](std::uint32_t ticks) {
+                        const double percent = 100.0 * ticks / (seconds * SYSCLOCK_ARM11);
+                        return percent <= 110.0 ? percent : 0.0;
+                    };
                     // ee blocked: the game thread waiting for room in the drawing queue; vu idle: the drawing thread with nothing to do
                     std::fprintf(stderr, "[3ds] game at %.0f%% of full speed (%llu frames in %.1f s), %.1f pictures a second, ee blocked %.0f%%, vu idle %.0f%%\n",
                                  100.0 * (frame - last_frame) / (seconds * 59.94), static_cast<unsigned long long>(frame - last_frame), seconds,
                                  (shown - last_shown) / seconds,
-                                 full >= last_full ? 100.0 * static_cast<double>(full - last_full) / (seconds * SYSCLOCK_ARM11) : 0.0,
-                                 wait >= last_wait ? 100.0 * static_cast<double>(wait - last_wait) / (seconds * SYSCLOCK_ARM11) : 0.0);   // the counters restart when a state loads
+                                 share(full - last_full),
+                                 share(wait - last_wait));
                     audio3ds::report(seconds);
                 }
                 last_tick = tick;

@@ -36,11 +36,28 @@ void vu1_CBE8B2DF5F7B4F30(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic (
 void vu1_82FF17C192C71968(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin (064): the MSCNT resume at 0x3C38
 void vu1_83B534FABA285679(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic (042): MSCAL 0 init + first batch
 void vu1_85768FB5F27F6386(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin (064): MSCAL 0 init + first batch
+void vu1_8EDF96004DE4D3DB(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic_ortho (041): MSCAL 0 init + first batch
 void vu1_B81B4869B7719058(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin_ortho (065): MSCAL 0 init + first batch
 void vu1_E57D01C0AE2CD050(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin_ortho (065): MSCNT resume at 0x3138
-void vu1_2AC0382C206276EB(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX (043): MSCAL 0 init + first batch
-void vu1_3E7831392666D4FB(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX + UV1 xform (044): MSCAL 0 init + first batch
-void vu1_E2E9810EA328371C(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX (043/044): MSCNT resume at 0x3798
+void vu1_D6C9E96DDF7A64BE(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX (061/43): MSCAL 0 init + first batch
+void vu1_404F844209C798B4(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX (061/43): MSCNT resume at 0x36F0
+void vu1_3E7831392666D4FB(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX + UV1 xform (097/44): MSCAL 0 init + first batch
+void vu1_E2E9810EA328371C(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX + UV1 xform (097/44): MSCNT resume at 0x3798
+void vu1_3CBCD1CACE9C0F45(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic EnvMap MatFX no-cull (051): MSCAL 0 init + first batch
+void vu1_2AC0382C206276EB(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic EnvMap MatFX (053): MSCAL 0 init + first batch
+void vu1_38906148034287B0(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic EnvMap MatFX (053): MSCNT resume at 0x3808
+void vu1_836938DC3B5661F6(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic no-cull (046): MSCAL 0 init + first batch
+void vu1_EE011B4B647F33EC(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic no-cull (046): MSCNT resume at 0x2AA8
+void vu1_E95004CC58505D65(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX no-cull (059): MSCAL 0 init + first batch
+void vu1_BB1AB50A6342D5EC(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX no-cull (059): MSCNT resume at 0x2768
+void vu1_FE76250EBC723373(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX + UV1 xform no-cull (095): MSCAL 0 init + first batch
+void vu1_BC529FD5BD94C2F8(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic dual-texture MatFX + UV1 xform no-cull (095): MSCNT resume at 0x2810
+void vu1_62CE8CADAD3A599B(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic UV xform (045): MSCAL 0 init + first batch
+void vu1_3FE2F02EB3BCB294(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_generic UV xform (045): MSCNT resume at 0x3A10
+void vu1_D5B5815E722944B2(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin UV xform (066): MSCAL 0 init + first batch
+void vu1_9EA13AFF49362710(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin UV xform (066): MSCNT resume at 0x3CE0
+void vu1_3736B8D0857A8E45(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin_ortho UV xform (102): MSCAL 0 init + first batch
+void vu1_435153320F62CB88(ps2::Vu0Regs &r, std::uint8_t *mem);   // g3_skin_ortho UV xform (102): MSCNT resume at 0x31E0
 void vu1_5CE717CC054A434F(ps2::Vu0Regs &r, std::uint8_t *mem);   // RwIm2D 2D triangle list (MSCAL 0)
 }
 
@@ -57,7 +74,7 @@ struct Stats {
     std::uint64_t batches[2], native[2], declined[2], compared[2], mismatched[2], state_differs[2], gpu[2];
     std::uint64_t gpu_declined[g3::kGpuDeclines];
     std::uint64_t not_modelled[2][4];   // by flags: strip, clipper, guard band clipper, list
-    std::uint64_t direct_hit, direct_miss, ortho_gpu, dual_gpu, im2d_batches;
+    std::uint64_t direct_hit, direct_miss, ortho_gpu, dual_gpu, env_gpu, im2d_batches;
 };
 Stats g_stats{};
 std::vector<std::uint8_t> g_model_out, g_real_out;
@@ -93,20 +110,73 @@ bool same_for_gs(const std::uint8_t *model, std::size_t model_bytes, const std::
     return at == a.size();
 }
 
-int program_of(std::uintptr_t fn, bool &mscal0) {
+inline std::uint64_t vu1_code_u64(std::uint32_t off) {
+    std::uint64_t v;
+    std::memcpy(&v, ps2::g_vu1_code + off, 8);
+    return v;
+}
+
+int program_of(std::uintptr_t fn, std::uint32_t address, bool &mscal0) {
     mscal0 = false;
     if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_CBE8B2DF5F7B4F30)) return 42;
     if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_82FF17C192C71968)) return 64;
     if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_83B534FABA285679)) { mscal0 = true; return 42; }
     if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_85768FB5F27F6386)) { mscal0 = true; return 64; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_8EDF96004DE4D3DB)) { mscal0 = true; return 41; }
     if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_B81B4869B7719058)) { mscal0 = true; return 65; }
     if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_E57D01C0AE2CD050)) return 65;
-    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_2AC0382C206276EB)) { mscal0 = true; return 43; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_D6C9E96DDF7A64BE)) { mscal0 = true; return 43; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_404F844209C798B4)) return 43;
     if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_3E7831392666D4FB)) { mscal0 = true; return 44; }
-    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_E2E9810EA328371C)) {
-        const std::uintptr_t p0 = ps2::vu::program_at(0);
-        if (p0 == reinterpret_cast<std::uintptr_t>(&gen::vu1_2AC0382C206276EB)) return 43;
-        if (p0 == reinterpret_cast<std::uintptr_t>(&gen::vu1_3E7831392666D4FB)) return 44;
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_E2E9810EA328371C)) return 44;
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_3CBCD1CACE9C0F45)) { mscal0 = true; return 51; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_2AC0382C206276EB)) { mscal0 = true; return 53; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_38906148034287B0)) return 53;
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_836938DC3B5661F6)) { mscal0 = true; return 46; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_EE011B4B647F33EC)) return 46;
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_E95004CC58505D65)) { mscal0 = true; return 59; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_BB1AB50A6342D5EC)) return 59;
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_FE76250EBC723373)) { mscal0 = true; return 95; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_BC529FD5BD94C2F8)) return 95;
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_62CE8CADAD3A599B)) { mscal0 = true; return 45; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_3FE2F02EB3BCB294)) return 45;
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_D5B5815E722944B2)) { mscal0 = true; return 66; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_9EA13AFF49362710)) return 66;
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_3736B8D0857A8E45)) { mscal0 = true; return 102; }
+    if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_435153320F62CB88)) return 102;
+    if (fn == 0) {
+        const std::uint32_t pc = address & 16383u;
+        if (pc == 0u || pc == 0x2E68u || pc == 0x28A8u || pc == 0x2B08u || pc == 0x3A68u || pc == 0x2F88u) {
+            const std::uint64_t w0 = vu1_code_u64(0u);
+            if (w0 == 0x805CE72C3F000000ull) {
+                if ((pc == 0u || pc == 0x28A8u) && vu1_code_u64(0xB0u) == 0x000002FF100F0286ull &&
+                    vu1_code_u64(0x130u) == 0x000002FF100F01BCull && vu1_code_u64(0x2898u) == 0x400002FF100F0028ull) {
+                    mscal0 = (pc == 0u);
+                    return 51;
+                }
+                if ((pc == 0u || pc == 0x2B08u) && vu1_code_u64(0xB0u) == 0x000002FF100F02D2ull &&
+                    vu1_code_u64(0x130u) == 0x000002FF100F0208ull && vu1_code_u64(0x2AF8u) == 0x400002FF100F0028ull) {
+                    mscal0 = (pc == 0u);
+                    return 73;
+                }
+                if ((pc == 0u || pc == 0x3A68u) && vu1_code_u64(0xA8u) == 0x000002FF100F047Dull &&
+                    vu1_code_u64(0x110u) == 0x000002FF50040012ull && vu1_code_u64(0x3A58u) == 0x400002FF100F0036ull) {
+                    mscal0 = (pc == 0u);
+                    return 75;
+                }
+            } else if (w0 == 0x0022108701FF03F3ull) {
+                if ((pc == 0u || pc == 0x2E68u) && vu1_code_u64(0xB0u) == 0x000002FF100C0451ull &&
+                    vu1_code_u64(0x130u) == 0x000002FF800906BDull && vu1_code_u64(0x2E58u) == 0x400002FF100F0025ull) {
+                    mscal0 = (pc == 0u);
+                    return 41;
+                }
+                if ((pc == 0u || pc == 0x2F88u) && vu1_code_u64(0xB0u) == 0x000002FF40000010ull &&
+                    vu1_code_u64(0x130u) == 0x000002FF100F0254ull && vu1_code_u64(0x2F78u) == 0x400002FF100F0028ull) {
+                    mscal0 = (pc == 0u);
+                    return 76;
+                }
+            }
+        }
     }
     return 0;
 }
@@ -206,8 +276,9 @@ void report() {
                  static_cast<unsigned long long>(g_stats.compared[1]), static_cast<unsigned long long>(g_stats.mismatched[1]),
                  static_cast<unsigned long long>(g_stats.state_differs[1]));
     if (g_mode == 4)
-        std::fprintf(stderr, "[g3] GPU: generic %llu (dual %llu), skin %llu (ortho %llu, im2d %llu, direct %llu, miss %llu); declined: %llu not modelled, %llu bones, %llu lights, %llu range, %llu prim, %llu clipper depth\n",
+        std::fprintf(stderr, "[g3] GPU: generic %llu (dual %llu, env %llu), skin %llu (ortho %llu, im2d %llu, direct %llu, miss %llu); declined: %llu not modelled, %llu bones, %llu lights, %llu range, %llu prim, %llu clipper depth\n",
                      static_cast<unsigned long long>(g_stats.gpu[0]), static_cast<unsigned long long>(g_stats.dual_gpu),
+                     static_cast<unsigned long long>(g_stats.env_gpu),
                      static_cast<unsigned long long>(g_stats.gpu[1]),
                      static_cast<unsigned long long>(g_stats.ortho_gpu), static_cast<unsigned long long>(g_stats.im2d_batches),
                      static_cast<unsigned long long>(g_stats.direct_hit), static_cast<unsigned long long>(g_stats.direct_miss),
@@ -230,7 +301,7 @@ std::uint64_t g_probe_class[2][4], g_probe_logged = 0;
 void probe_declined(int program, const ps2::Vu0Regs &before, const ps2::Vu0Regs &after) {
     std::uint32_t flags[4];
     std::memcpy(flags, g_mem_before + 0x3FF * 16, 16);
-    const int k = (program == 64 || program == 65) ? 1 : 0;
+    const int k = (program == 64 || program == 65 || program == 66 || program == 73 || program == 75 || program == 76 || program == 102) ? 1 : 0;
     const int c = (flags[0] & 2u) ? ((flags[0] & 8u) ? 1 : 2) : (flags[0] & 4u) ? 3 : 0;
     ++g_probe_class[k][c];
     if (c == 3) {
@@ -291,9 +362,9 @@ bool hook(std::uint32_t address) {
     const std::uintptr_t fn = ps2::vu::program_at(address);
     if (fn == reinterpret_cast<std::uintptr_t>(&gen::vu1_5CE717CC054A434F)) return try_im2d_tris();
     bool mscal0 = false;
-    const int program = program_of(fn, mscal0);
+    const int program = program_of(fn, address, mscal0);
     if (!program) return false;
-    const int k = (program == 64 || program == 65) ? 1 : 0;
+    const int k = (program == 64 || program == 65 || program == 66 || program == 73 || program == 75 || program == 76 || program == 102) ? 1 : 0;
     ps2::Vu0Regs &r = ps2::vu::regs(1);
     if (++g_stats.batches[k] % 20000 == 0) report();
     g_model_ends.clear();
@@ -365,11 +436,12 @@ bool hook(std::uint32_t address) {
             if (g_gpu_mask & 8u) g_gpu.keep_negative = g_gpu.keep_positive = true;
             if (g_gpu_mask & 16u) std::memset(g_gpu.light_colour, 0, sizeof g_gpu.light_colour);
             if (g_gpu_mask & 64u) std::memset(g_gpu.light_dir, 0, sizeof g_gpu.light_dir);
+            if (g_gpu_mask & (16u | 64u)) { g_gpu.light_words = 0; g_gpu.has_dir_lights = false; }
             if (got == 0 && (g_gpu_mask & 128u)) got = -1;   // test aid: leave the batch out
         }
         bool drew = got < 0;
         if (got == 0) {
-            if (!plan.dual && !plan.list && !(g_gpu_mask & 32u)) {
+            if (!plan.dual && !plan.env && !plan.list && !(g_gpu_mask & 32u)) {
                 ps2::gif::release_if_pending();
                 const std::uint64_t saved_prim = ps2::gs::g_state.prim;
                 ps2::gs::g_state.q = 1.0f;
@@ -413,6 +485,28 @@ bool hook(std::uint32_t address) {
                             }
                             drew = ps2::gs::draw_g3(g_gpu);
                         }
+                    } else if (plan.env) {
+                        ps2::vu::kick(1, 959u);
+                        ps2::gif::release_if_pending();
+                        ps2::gs::g_state.q = 1.0f;
+                        ps2::gs::g_state.count = 0;
+                        if ((ps2::gs::g_state.prim & ~7ull) != (g_gpu.prim & ~7ull)) ++ps2::gs::g_setup_generation;
+                        ps2::gs::g_state.prim = g_gpu.prim;
+                        g_gpu.env = false;
+                        if (ps2::gs::draw_g3(g_gpu)) {
+                            ps2::vu::kick(1, 956u);
+                            ps2::gif::release_if_pending();
+                            ps2::gs::g_state.q = 1.0f;
+                            ps2::gs::g_state.count = 0;
+                            if ((ps2::gs::g_state.prim & ~7ull) != (g_gpu.prim2 & ~7ull)) ++ps2::gs::g_setup_generation;
+                            ps2::gs::g_state.prim = g_gpu.prim2;
+                            g_gpu.prim = g_gpu.prim2;
+                            g_gpu.env = true;
+                            g_gpu.material[0] *= g_gpu.env_coeff;
+                            g_gpu.material[1] *= g_gpu.env_coeff;
+                            g_gpu.material[2] *= g_gpu.env_coeff;
+                            drew = ps2::gs::draw_g3(g_gpu);
+                        }
                     } else {
                         ps2::gif::release_if_pending();
                         ps2::gs::g_state.q = 1.0f;
@@ -428,8 +522,9 @@ bool hook(std::uint32_t address) {
             ps2::vif::discard_deferred_unpacks();
             g3::leave_state(program, end, r);
             ++g_stats.gpu[k];
-            if (program == 65) ++g_stats.ortho_gpu;
-            if (program == 43 || program == 44) ++g_stats.dual_gpu;
+            if (program == 41 || program == 65 || program == 76 || program == 102) ++g_stats.ortho_gpu;
+            if (program == 43 || program == 44 || program == 59 || program == 95) ++g_stats.dual_gpu;
+            if (program == 51 || program == 53 || program == 73 || program == 75 || program == 76) ++g_stats.env_gpu;
             return true;
         }
         ps2::vif::flush_deferred_unpacks();

@@ -134,6 +134,8 @@ _ALL_STAGES = (
     "LOOP_EDITS", "SP_EDITS", "HOT_EDITS", "VIFADDR_EDITS", "VIFREC_EDITS",
     "IOPAHEAD_EDITS", "STALE_EDITS", "MOVIE_EDITS", "SPLIT_SKIP_EDITS",
     "SAMPLE_EDITS", "G3_EDITS", "RT_OPT_EDITS", "UPLOAD_EDITS",
+    "UNCHANGING_WAYS_EDITS", "FPU_FINITE_EDITS", "UNCHANGING_SAMPLE_EDITS",
+    "CHAIN_MEMO_EDITS", "UPLOAD_FAST_EDITS", "VIF_CORE0_EDITS", "VIF_CORE2_GS_EDITS", "VIF_DMAC_ICACHE_EDITS",
 )
 _sim = dict(FILES)
 _applied = {}
@@ -277,7 +279,7 @@ with tempfile.TemporaryDirectory() as d:
     # The I/O processor can run on its own core, and the old way stays for other builds.
     system_cpp = read("runtime/src/system.cpp")
     assert "iop_advance(t - g_iop_synced);" in system_cpp and "    iop::run(t - g_iop_synced);" in system_cpp
-    assert "IopGuard guard;" in read("runtime/src/iop/sif.cpp") and "inline void iop_wait() {}" in read("runtime/include/ps2/system.hpp")
+    assert "IopGuard guard;" in read("runtime/src/iop/sif.cpp") and "inline void iop_wait(bool (*)() = nullptr) {}" in read("runtime/include/ps2/system.hpp")
     assert "already patched" in run(d).stdout
     # Upgrade a tree that already has the original 3DS movie decoder.
     ipu = "runtime/src/ipu/ipu.cpp"
@@ -304,4 +306,15 @@ with tempfile.TemporaryDirectory() as d:
     assert "void register_fast_targets(" in read("runtime/src/dispatch.cpp")
     assert "void flush_deferred_pages(" in gs and "int draw_g3_direct(" in gs
     assert "void transfer_tte_data(" in vif
+    assert "clamp_nonfinite(" in fp and "if (!(b & kAbs)) return {sign | kAbs, true};" in fp
+    assert "cleared %u non-finite EE float(s)" in read("runtime/src/kernel.cpp")
+    assert "bool full_check = false" in read("runtime/src/gs/queue.hpp") and "!full_check && known && e.rest && e.sample" in queue
+    assert "unchanging(data, qwc * 16u, qwc <= 128u)" in gif
+    assert "bool memo_play(std::uint32_t target, MemoEnd &end) {" in vif and "kRecordWords = 131072" in vif
+    assert "g_memo_mask_wrote" in vif and "u.mask ^= kMemoMark" not in vif and "kMemos = 2048, kMemoBlocks = 16384" in vif
+    assert "if (vif::memo_play(c.tadr, left)) {" in read("runtime/src/dmac.cpp") and "bool any_rewritten(" in queue
+    assert "bw_s, bh_s, pw_s, ph_s, cols_s" in gs and "chunk_hash == 0x80000000u" in gif
+    assert "spr_page_hit(" in read("runtime/src/dmac.cpp") and "run_skipped<false>(" in vif and "flg >= 2u && nloop + 1u == qwc" in gif
+    assert "transfer_record_slice(" in vif and "g_def_active[kDefMaskWords]" in gs
+    assert "addr_to_ch(" in read("runtime/src/dmac.cpp") and "run_chain_ch1(" in read("runtime/src/dmac.cpp") and "unpack_slow(" in vif
 print("ok   3DS patch applies once, is idempotent, refuses unknown source and leaves desktop paths alone")
